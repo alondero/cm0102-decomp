@@ -39,6 +39,8 @@ C_DIR = RECOVERY / "c"
 BLOCKED_DIR = RECOVERY / "blocked"
 HINTS_DIR = RECOVERY / "hints"
 REGISTRY = RECOVERY / "registry.json"
+# Retained local-only content (never published, unlike disposable CM0102/Analysis).
+LOCAL_FIXTURES = ROOT / "local/fixtures"
 
 TOOLCHAIN = Path(os.environ.get("CMRE_TOOLCHAIN", "C:/ProgramData/mingw64/mingw64/bin"))
 PYTHON_REQUIRED = (3, 13)
@@ -93,6 +95,18 @@ def target_bytes() -> bytes:
     data = TARGET.read_bytes()
     if digest_bytes(data) != TARGET_SHA256:
         raise SystemExit(f"Pinned target hash mismatch: {TARGET}")
+    return data
+
+
+def local_fixture(sha256: str) -> bytes:
+    """Original-derived test input retained outside Git, addressed by its hash."""
+    path = LOCAL_FIXTURES / sha256
+    if not path.is_file():
+        raise SystemExit(f"Missing local-only fixture {sha256} under {path.parent}; "
+                         "see docs/PUBLICATION.md for the local bootstrap")
+    data = path.read_bytes()
+    if digest_bytes(data) != sha256:
+        raise SystemExit(f"Local fixture hash mismatch: {path}")
     return data
 
 

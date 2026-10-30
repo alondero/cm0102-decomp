@@ -1,0 +1,54 @@
+{
+  "schema": "cmre-ledger/1",
+  "va": "0x00545a60",
+  "name": "FUN_00545a60",
+  "input_sha256": "0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86",
+  "address_convention": "preferred-image VA, image base 0x00400000",
+  "category": "application",
+  "module_candidates": [],
+  "extent": {
+    "start": "0x00545a60",
+    "end": "0x00545db4",
+    "bytes": 852,
+    "sha256": "f12d544d94918a24746277fe6cfe0d6621449e4f4a177c1fda6fc0443df84ac8"
+  },
+  "status": {
+    "identified": true,
+    "decompiled": false,
+    "compiled": true,
+    "validated": true,
+    "integrated": false
+  },
+  "boundaries": {
+    "original_callees": [],
+    "imports": []
+  },
+  "hints": null,
+  "lifted": {
+    "source": "recovery/lifted/fn_00545a60.S",
+    "source_sha256": "b22135d4b51681234ad554dea1554e82f3959367b4843714ba0a486025193a33",
+    "harness_version": "1",
+    "harness_sha256": "1c526fb2ebe3ad5af48880b801a22cf39f8a5db714b8fdeaef0b5c198e5ae99c",
+    "toolchain": {
+      "gcc": "gcc.exe (x86_64-posix-seh-rev0, Built by MinGW-Builds project) 15.2.0",
+      "as": "GNU assembler (GNU Binutils) 2.45",
+      "ld": "GNU ld (GNU Binutils) 2.45",
+      "nm": "GNU nm (GNU Binutils) 2.45"
+    },
+    "run_key": "3089c323943aad91",
+    "validation": {
+      "profile": "exact",
+      "cases": 600,
+      "seed": 5528160,
+      "budget": 200000,
+      "outcomes": {
+        "return": 600
+      },
+      "coverage": 0.6613,
+      "import_calls": 0,
+      "code_as_data_cases": 0,
+      "result_digest": "0227f2a370a38f722500410173b7d4a94421110bcbecb05682dadb94e57a975d"
+    },
+    "byte_fallbacks": []
+  }
+}

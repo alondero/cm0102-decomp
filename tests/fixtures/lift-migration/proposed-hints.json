@@ -1,0 +1,529 @@
+{
+  "lift_jump_tables": {
+    "0x00545a9d": {
+      "bytes": "ff24952c5b5400",
+      "index_range": [
+        0,
+        1
+      ],
+      "table_sha256": "27699035e1349c98d37f03358e6c6ec6f45693866067dd3f475917d717ad515b",
+      "evidence": "MOVSX bytearg1; DEC ECX; unsigned CMP ECX,22h/JA excludes all but0..34. XOR EDX,EDX then MOV DL from pinned35-byte map whose complete values are0/1."
+    },
+    "0x00545abf": {
+      "bytes": "ff2495585b5400",
+      "index_range": [
+        0,
+        1
+      ],
+      "table_sha256": "27699035e1349c98d37f03358e6c6ec6f45693866067dd3f475917d717ad515b",
+      "evidence": "MOVSX bytearg1; DEC ECX; unsigned CMP ECX,22h/JA excludes all but0..34. XOR EDX,EDX then MOV DL from pinned35-byte map whose complete values are0/1."
+    },
+    "0x00545ad6": {
+      "bytes": "ff248d845b5400",
+      "index_range": [
+        0,
+        34
+      ],
+      "table_sha256": "f7a28b205f7d1d3767fc8a9ec559083f4bd7b1135c3f18d7492958774d618769",
+      "evidence": "MOVSX bytearg1; DEC ECX; unsigned CMP ECX,22h/JA excludes all but0..34. The actual dword lookup index remains bounded ECX0..34."
+    },
+    "0x00545af0": {
+      "bytes": "ff248d105c5400",
+      "index_range": [
+        0,
+        34
+      ],
+      "table_sha256": "95ddc13cdaccc0dc065eda749ad1d5117356f4b6323c9b7cdd059bcc403a2ce6",
+      "evidence": "MOVSX bytearg1; DEC ECX; unsigned CMP ECX,22h/JA excludes all but0..34. The actual dword lookup index remains bounded ECX0..34."
+    },
+    "0x00545b0d": {
+      "bytes": "ff248d9c5c5400",
+      "index_range": [
+        0,
+        34
+      ],
+      "table_sha256": "2e1ec0b6d5946af97e88de94e84571ad0708be2ff7c981157ecd86c4ae108d7b",
+      "evidence": "MOVSX bytearg1; DEC ECX; unsigned CMP ECX,22h/JA excludes all but0..34. The actual dword lookup index remains bounded ECX0..34."
+    },
+    "0x00545b1f": {
+      "bytes": "ff248d285d5400",
+      "index_range": [
+        0,
+        34
+      ],
+      "table_sha256": "f3a250b11d95a757173c106b7b0e813894df8754764f464e444a05a8bdcbd9ab",
+      "evidence": "MOVSX bytearg1; DEC ECX; unsigned CMP ECX,22h/JA excludes all but0..34. The actual dword lookup index remains bounded ECX0..34."
+    }
+  },
+  "fixtures": [
+    {
+      "regs": {
+        "eax": 305419896,
+        "ecx": 591751049,
+        "edx": 878082202,
+        "ebx": 1164413355,
+        "esp": 1450744508,
+        "ebp": 1737075661,
+        "esi": 2023406814,
+        "edi": 2309737967,
+        "eflags": 1538
+      },
+      "stack": [
+        2781020160,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "arena_template": 0,
+      "arena_writes": {},
+      "globals": {},
+      "import_seed": 0
+    },
+    {
+      "regs": {
+        "eax": 305419896,
+        "ecx": 591751049,
+        "edx": 878082202,
+        "ebx": 1164413355,
+        "esp": 1450744508,
+        "ebp": 1737075661,
+        "esi": 2023406814,
+        "edi": 2309737967,
+        "eflags": 1538
+      },
+      "stack": [
+        2781020160,
+        3,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "arena_template": 0,
+      "arena_writes": {},
+      "globals": {},
+      "import_seed": 0
+    },
+    {
+      "regs": {
+        "eax": 305419896,
+        "ecx": 591751049,
+        "edx": 878082202,
+        "ebx": 1164413355,
+        "esp": 1450744508,
+        "ebp": 1737075661,
+        "esi": 2023406814,
+        "edi": 2309737967,
+        "eflags": 1538
+      },
+      "stack": [
+        2781020161,
+        3,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "arena_template": 0,
+      "arena_writes": {},
+      "globals": {},
+      "import_seed": 0
+    },
+    {
+      "regs": {
+        "eax": 305419896,
+        "ecx": 591751049,
+        "edx": 878082202,
+        "ebx": 1164413355,
+        "esp": 1450744508,
+        "ebp": 1737075661,
+        "esi": 2023406814,
+        "edi": 2309737967,
+        "eflags": 1538
+      },
+      "stack": [
+        2781020172,
+        3,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "arena_template": 0,
+      "arena_writes": {},
+      "globals": {},
+      "import_seed": 0
+    },
+    {
+      "regs": {
+        "eax": 305419896,
+        "ecx": 591751049,
+        "edx": 878082202,
+        "ebx": 1164413355,
+        "esp": 1450744508,
+        "ebp": 1737075661,
+        "esi": 2023406814,
+        "edi": 2309737967,
+        "eflags": 1538
+      },
+      "stack": [
+        2781020160,
+        4,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "arena_template": 0,
+      "arena_writes": {},
+      "globals": {},
+      "import_seed": 0
+    },
+    {
+      "regs": {
+        "eax": 305419896,
+        "ecx": 591751049,
+        "edx": 878082202,
+        "ebx": 1164413355,
+        "esp": 1450744508,
+        "ebp": 1737075661,
+        "esi": 2023406814,
+        "edi": 2309737967,
+        "eflags": 1538
+      },
+      "stack": [
+        2781020161,
+        4,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "arena_template": 0,
+      "arena_writes": {},
+      "globals": {},
+      "import_seed": 0
+    },
+    {
+      "regs": {
+        "eax": 305419896,
+        "ecx": 591751049,
+        "edx": 878082202,
+        "ebx": 1164413355,
+        "esp": 1450744508,
+        "ebp": 1737075661,
+        "esi": 2023406814,
+        "edi": 2309737967,
+        "eflags": 1538
+      },
+      "stack": [
+        2781020162,
+        4,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "arena_template": 0,
+      "arena_writes": {},
+      "globals": {},
+      "import_seed": 0
+    },
+    {
+      "regs": {
+        "eax": 305419896,
+        "ecx": 591751049,
+        "edx": 878082202,
+        "ebx": 1164413355,
+        "esp": 1450744508,
+        "ebp": 1737075661,
+        "esi": 2023406814,
+        "edi": 2309737967,
+        "eflags": 1538
+      },
+      "stack": [
+        2781020160,
+        5,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "arena_template": 0,
+      "arena_writes": {},
+      "globals": {},
+      "import_seed": 0
+    },
+    {
+      "regs": {
+        "eax": 305419896,
+        "ecx": 591751049,
+        "edx": 878082202,
+        "ebx": 1164413355,
+        "esp": 1450744508,
+        "ebp": 1737075661,
+        "esi": 2023406814,
+        "edi": 2309737967,
+        "eflags": 1538
+      },
+      "stack": [
+        2781020161,
+        5,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "arena_template": 0,
+      "arena_writes": {},
+      "globals": {},
+      "import_seed": 0
+    },
+    {
+      "regs": {
+        "eax": 305419896,
+        "ecx": 591751049,
+        "edx": 878082202,
+        "ebx": 1164413355,
+        "esp": 1450744508,
+        "ebp": 1737075661,
+        "esi": 2023406814,
+        "edi": 2309737967,
+        "eflags": 1538
+      },
+      "stack": [
+        2781020180,
+        5,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "arena_template": 0,
+      "arena_writes": {},
+      "globals": {},
+      "import_seed": 0
+    },
+    {
+      "regs": {
+        "eax": 305419896,
+        "ecx": 591751049,
+        "edx": 878082202,
+        "ebx": 1164413355,
+        "esp": 1450744508,
+        "ebp": 1737075661,
+        "esi": 2023406814,
+        "edi": 2309737967,
+        "eflags": 1538
+      },
+      "stack": [
+        2781020160,
+        6,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "arena_template": 0,
+      "arena_writes": {},
+      "globals": {},
+      "import_seed": 0
+    },
+    {
+      "regs": {
+        "eax": 305419896,
+        "ecx": 591751049,
+        "edx": 878082202,
+        "ebx": 1164413355,
+        "esp": 1450744508,
+        "ebp": 1737075661,
+        "esi": 2023406814,
+        "edi": 2309737967,
+        "eflags": 1538
+      },
+      "stack": [
+        2781020161,
+        6,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "arena_template": 0,
+      "arena_writes": {},
+      "globals": {},
+      "import_seed": 0
+    },
+    {
+      "regs": {
+        "eax": 305419896,
+        "ecx": 591751049,
+        "edx": 878082202,
+        "ebx": 1164413355,
+        "esp": 1450744508,
+        "ebp": 1737075661,
+        "esi": 2023406814,
+        "edi": 2309737967,
+        "eflags": 1538
+      },
+      "stack": [
+        2781020160,
+        7,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "arena_template": 0,
+      "arena_writes": {},
+      "globals": {},
+      "import_seed": 0
+    },
+    {
+      "regs": {
+        "eax": 305419896,
+        "ecx": 591751049,
+        "edx": 878082202,
+        "ebx": 1164413355,
+        "esp": 1450744508,
+        "ebp": 1737075661,
+        "esi": 2023406814,
+        "edi": 2309737967,
+        "eflags": 1538
+      },
+      "stack": [
+        2781020161,
+        7,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "arena_template": 0,
+      "arena_writes": {},
+      "globals": {},
+      "import_seed": 0
+    },
+    {
+      "regs": {
+        "eax": 305419896,
+        "ecx": 591751049,
+        "edx": 878082202,
+        "ebx": 1164413355,
+        "esp": 1450744508,
+        "ebp": 1737075661,
+        "esi": 2023406814,
+        "edi": 2309737967,
+        "eflags": 1538
+      },
+      "stack": [
+        2781020160,
+        9,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "arena_template": 0,
+      "arena_writes": {},
+      "globals": {},
+      "import_seed": 0
+    },
+    {
+      "regs": {
+        "eax": 305419896,
+        "ecx": 591751049,
+        "edx": 878082202,
+        "ebx": 1164413355,
+        "esp": 1450744508,
+        "ebp": 1737075661,
+        "esi": 2023406814,
+        "edi": 2309737967,
+        "eflags": 1538
+      },
+      "stack": [
+        2781020161,
+        9,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "arena_template": 0,
+      "arena_writes": {},
+      "globals": {},
+      "import_seed": 0
+    }
+  ],
+  "fixture_provenance": {
+    "source": "Original-only 4128-case grid;16 fixtures cover all62 instructions.",
+    "path": "CM0102/Analysis/cmre/diagnostics/engine-wide-staging-20261015/helper-originals1/receipt.json"
+  },
+  "notes": "Staged parent-owned exact table declarations; canonical adoption is blocked by accepted-lift render drift."
+}

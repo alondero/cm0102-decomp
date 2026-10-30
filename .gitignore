@@ -2,7 +2,10 @@
 /CM0102/
 /tools/
 /NUL
-/.codex/
+/.codex/*
+!/.codex/hooks.json
+# Retained original-derived fixtures, addressed by hash (cmre.env.local_fixture).
+/local/
 /.claude/*
 !/.claude/settings.json
 !/.claude/skills/

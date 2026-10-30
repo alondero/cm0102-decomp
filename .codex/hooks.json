@@ -1,0 +1,18 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Bash|apply_patch)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "py -3.13 \"$(git rev-parse --show-toplevel)/cmre/guard.py\" --codex",
+            "commandWindows": "powershell.exe -NoProfile -NonInteractive -Command \"py -3.13 ((git rev-parse --show-toplevel) + '/cmre/guard.py') --codex; exit $LASTEXITCODE\"",
+            "timeout": 10,
+            "statusMessage": "Checking CM0102 preservation rules"
+          }
+        ]
+      }
+    ]
+  }
+}

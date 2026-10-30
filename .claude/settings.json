@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(py -3.13 -m cmre:*)",
+      "Bash(py -3.13 -m pytest:*)",
+      "PowerShell(py -3.13 -m cmre:*)",
+      "PowerShell(py -3.13 -m pytest:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "py -3.13 \"$CLAUDE_PROJECT_DIR/cmre/guard.py\""
+          }
+        ]
+      }
+    ]
+  }
+}
