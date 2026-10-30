@@ -1,0 +1,13 @@
+/CM0102/
+/recovery/ledger/
+/recovery/lifted/
+/recovery/blocked/
+/recovery/hints/
+*.exe
+*.dll
+*.pdb
+*.obj
+*.o
+*.stackdump
+__pycache__/
+*.pyc
