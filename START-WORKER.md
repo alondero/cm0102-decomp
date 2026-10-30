@@ -6,3 +6,5 @@
 4. Report pass or WIP with specific evidence to the integrator. A reviewer inspects the source independently; only the integrator accepts, manages shared records, and performs the parent closing check.
 
 The proprietary binary and analysis must remain in the authoritative local checkout. The content in this Git repository is incomplete and is not the tool runtime. A separate worktree may be used for coordination or tooling, but do not run independent recovery claims or acceptance from it until the worktree adapter issue is complete. Creating separate worktrees and linking only `CM0102/Analysis` would split other authoritative state and is unsafe.
+
+From any coordination worktree, `./worker.ps1 -AuthoritativeCheckout F:/src/cm0102-decompiled -Shard 1 -Owner worker-unique` checks the local target hash and previews that shard using the authoritative checkout. Add `-Action Claim` to make a real three-function claim there. The worker must then edit and test the claimed files in that checkout under the ownership rules above. This helper does not make recovery state worktree-isolated.
