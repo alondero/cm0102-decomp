@@ -1,13 +1,24 @@
+# Supplied game, analysis, and runtime artifacts stay local.
 /CM0102/
-/recovery/ledger/
-/recovery/lifted/
-/recovery/blocked/
-/recovery/hints/
+/tools/
+/NUL
+/.codex/
+/.claude/*
+!/.claude/settings.json
+!/.claude/skills/
+!/.claude/agents/
+/CLAUDE.local.md
+__pycache__/
+*.pyc
+*.stackdump
 *.exe
 *.dll
 *.pdb
 *.obj
 *.o
-*.stackdump
-__pycache__/
-*.pyc
+
+# Generated recovery records and test inputs require publication review.
+/recovery/ledger/
+/recovery/lifted/
+/recovery/blocked/
+/recovery/hints/

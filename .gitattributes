@@ -1,3 +1,8 @@
+# Recovery records hash exact source bytes; keep text files LF-normalized.
+recovery/** text eol=lf
+cmre/** text eol=lf
+tests/** text eol=lf
+docs/STATUS.md text eol=lf
 *.py text eol=lf
 *.c text eol=lf
 *.md text eol=lf

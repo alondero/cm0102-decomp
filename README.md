@@ -1,9 +1,19 @@
-# CM 01/02 recovery coordination
+# Championship Manager 01/02 faithful recovery
 
-Coordinate faithful recovery of version 3.9.68. The authoritative local checkout contains the original executable, analysis, generated recovery records, and the tools required for validation. These remain local. This repository has a fresh history and must never receive game assets, original executable bytes, dumps, Ghidra exports, lifted instructions, local analysis, credentials, or diagnostic snapshots.
+This project recovers the official 3.9.68 executable into buildable source that preserves its behavior and bugs. A validated standalone game precedes any modern port. The pinned original has SHA-256 `0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86`; its preferred image base is `0x00400000`.
 
-The pinned input has SHA-256 `0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86`. See [the execution plan](PLAN.md) and GitHub issues for the remaining work. This repository alone does not provide the proprietary inputs or the local recovery state.
+## Local workspace and repository
 
-Each function has one stable owner shard. Workers use the authoritative checkout, a unique claim, and bounded assignments; a single integrator reviews and accepts serially. Separate worktrees are not yet safe for normal recovery commands: the local evidence, claims, failure counters, and ledgers do not all share the same state. The worktree infrastructure issue must be completed and tested before claiming otherwise.
+The authoritative recovery checkout is on the same machine as the supplied game and local analysis. Its agents follow the local `AGENTS.md` and `docs/agent/PLAYBOOK.md`. Use `py -3.13` for Python. The executable, supplied assets, raw analysis, generated lifts, recovery records, hints, and evidence remain local and are not distributed by this repository.
 
-The checked-in source and tooling are an initial manually reviewed subset, not a complete or independently runnable snapshot. The two `fn_007a16*`/`fn_007a1710` memory-status files are unaccepted drafts; their local work records contain outstanding import and stack obligations. The authoritative checkout remains the source of truth for all acceptance records and validation. Additional files require review before publication; see the source migration issue.
+This private repository contains the coordination plan and an initial reviewed subset of C and tooling. It is not a complete or independently runnable copy of the local workspace: substantial source and tooling still require publication review. A clean Git status does not mean those local-only or unreviewed files are backed up or synchronized. See [issue #22](https://github.com/alondero/cm0102-decomp/issues/22) for the remaining migration.
+
+The local authoritative checkout also uses a Git exclude rule that hides untracked files by default. Review a file and its contents before explicitly adding it; never publish supplied assets, raw executable bytes, original instruction streams, local analysis, or credentials. The prior local Git history is retained separately and must not be pushed to this repository.
+
+## Parallel work
+
+See [PLAN.md](PLAN.md), [START-WORKER.md](START-WORKER.md), and the [issues](https://github.com/alondero/cm0102-decomp/issues). Eight stable shards divide function ownership. Workers claim bounded batches in the authoritative checkout, independent reviewers inspect them, and one integrator accepts results serially. The coordination worktrees use `worker.ps1` to reach the authoritative checkout; they do not yet isolate recovery state. The [worktree coordination issue](https://github.com/alondero/cm0102-decomp/issues/1) tracks that gap.
+
+## Local checks
+
+From the authoritative checkout, start a parent session with `py -3.13 scripts/cmre_session.py start`. The C workflow uses `py -3.13 -m cmre next --c`, `cmre brief`, `cmre test --c`, and `cmre accept --c`. Close the session with `py -3.13 scripts/cmre_session.py check --parent RECEIPT`; both pytest and `cmre verify` must pass. The local `docs/ROADMAP.md` defines the runtime, integration, subsystem, and standalone parity gates. Accepted C, lifts, composed calls, and live integration are separate measures.
