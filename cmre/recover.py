@@ -172,7 +172,7 @@ def explain_c(va: int, case_index: int | None, overrides: dict | None = None, *,
     """One C case side by side (or the original's stop summary), under the function's C profile."""
     source = Path(source) if source is not None else env.C_DIR / f"fn_{va:08x}.c"
     profile = profile or c_profile(va)
-    opts = difftest.Options.for_function(va, overrides)
+    opts = difftest.Options.for_function(va, overrides, tier="c")
     opts.inputs = c_inputs(va)
     lifted = lift.discover(va)
     returns = _semantic_contract(va, source.read_text(encoding="utf-8"))[0] if profile == "semantic" else "int"
@@ -309,7 +309,7 @@ def test_c(va: int, overrides: dict | None = None, fresh: bool = False, *, sourc
     profile = profile or c_profile(va)
     if profile not in C_PROFILES:
         raise SystemExit(f"Unknown C profile {profile}; use one of {', '.join(C_PROFILES)}")
-    opts = difftest.Options.for_function(va, overrides)
+    opts = difftest.Options.for_function(va, overrides, tier="c")
     opts.inputs = c_inputs(va)
     lifted = lift.discover(va)
     source_bytes = source.read_bytes()
@@ -395,7 +395,7 @@ def accept(va: int, tier: str = "lifted", *, refresh: bool = False, profile: str
         return True, {"status": "legacy-recorded", "note": "recovered by a legacy hand-built ledger"}
     if tier == "c" and not existing:
         return False, {"status": "needs-lifted", "note": "accept the lifted tier first"}
-    initial_options = difftest.Options.for_function(va).__dict__
+    initial_options = difftest.Options.for_function(va, tier=tier).__dict__
     profile = (profile or c_profile(va)) if tier == "c" else None
     first = test_lifted(va) if tier == "lifted" else test_c(va, profile=profile)
     if first["status"] != "pass":
@@ -410,7 +410,7 @@ def accept(va: int, tier: str = "lifted", *, refresh: bool = False, profile: str
                        "second": {"status": second["status"], "digests": _digests(second)}}
     if (first["key"] != second["key"] or first["execution_identity"] != second["execution_identity"]
             or second["execution_identity"] != execution_identity()
-            or initial_options != difftest.Options.for_function(va).__dict__
+            or initial_options != difftest.Options.for_function(va, tier=tier).__dict__
             or (tier == "c" and env.digest(env.C_DIR / f"fn_{va:08x}.c") != second["source_sha256"])):
         return False, {**first, "status": "input-drift"}
     if tier == "lifted":
@@ -442,6 +442,7 @@ def accept(va: int, tier: str = "lifted", *, refresh: bool = False, profile: str
         record = dict(existing)
         record["status"] = {**record["status"], "decompiled": True}
         record["c"] = _tier_record(first, env.ROOT / first["source"])
+        record["hints"] = env.rel(env.HINTS_DIR / f"fn_{va:08x}.json") if (env.HINTS_DIR / f"fn_{va:08x}.json").exists() else None
     ledger.write_json(path, record)
     bp = ledger.blocked_path(va)
     if bp.exists():

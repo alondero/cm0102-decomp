@@ -54,6 +54,39 @@ Docs-only work can preserve an observed failing baseline and report it; it
 cannot label that session green. Keep failing contracts intact. Finish through
 the parent [playbook](PLAYBOOK.md#3-close-the-session).
 
+## Separate lifted and C input evidence
+
+Issue #23 exposed fixture edits made for C that changed the lifted random stream
+and invalidated four accepted lifts. Top-level hints remain shared; `c_hints`
+overrides input shapes and fixture metadata for C only. It cannot override test
+policy or original-instruction bindings. Run caches hash the effective tier
+inputs, and whole-inventory job receipts hash the complete hint file. Changing
+C-only hints therefore cannot reuse stale C evidence or disturb lifted inputs.
+
+C acceptance refreshes the record's hints path too. Previously it inherited that
+path from the lifted record, so a legacy `hints: null` does not by itself prove
+that C ran without fixtures. Compare retained hint identities and per-tier run
+evidence instead.
+
+The local resolution keeps the original C fixtures intact under `c_hints`:
+
+| Function | Lifted inputs | C inputs and status |
+| --- | --- | --- |
+| `fn_005a90b0` | Original `ecx: ptr`, without C fixtures | Eight fixtures; unaccepted coverage-limited candidate |
+| `fn_005ab510` | Default random inputs | Six fixtures; revalidate its accepted C tier |
+| `fn_00666720` | Default random inputs | One fixture; revalidate its accepted C tier |
+| `fn_005e5df0` | Original first 17 fixtures | All 40 fixtures; unaccepted self-interior-call candidate |
+
+Original hint files are retained under `CM0102/Analysis/cmre/issue-23/` locally.
+The latter candidate's C case 19 (lifted case 151 with all 40 fixtures) sets a
+virtual slot to preferred-image VA `0x005e5df1`, inside the entry instruction at
+VA `0x005e5df0`, for binary SHA-256
+`0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86`. The original executes
+there and faults; the recovered VM stops at its watched-region escape guard.
+ADR 0002 currently exempts the function's own code from semantic indirect stops.
+Splitting inputs preserves this failing C case; it does not validate that candidate
+or change the indirect-stop policy. Resolve that boundary before C acceptance.
+
 Session lifecycle and evidence-packet reporting live in `scripts/cmre_session.py`
 and `cmre/evidence.py`. Their focused regressions are
 `py -3.13 -m pytest scripts/tests/test_cmre_session.py tests/test_session_runner.py tests/test_cmre_evidence.py tests/test_cmre_cli.py`.

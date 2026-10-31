@@ -4,6 +4,7 @@ The synthetic helper call is test scaffolding, not a recovered source claim.
 Both original entries are LEA/RET getters in the pinned executable.
 """
 from types import SimpleNamespace
+import json
 
 import pytest
 
@@ -39,6 +40,15 @@ def test_composed_c_executes_recovered_callee_at_both_optimizations(sources):
     for value in result["builds"].values():
         assert value["entries"]["fn_004671b0"]["observed_other_selected_entries"] == ["fn_004671c0"]
         assert all(int(a, 16) >= env.LINK_BASE for a in value["compiled_symbols"].values())
+
+
+def test_composed_c_uses_c_tier_input_shapes(sources):
+    (env.HINTS_DIR / f'fn_{A:08x}.json').write_text(json.dumps({
+        'ecx': 'small', 'c_hints': {'ecx': 'ptr'},
+    }))
+    result = composition.test(campaign.create('tier-inputs', [A, B]), {'cases': 12})
+    assert result['status'] == 'pass', result
+    assert result['options']['fn_004671b0']['hints'] == {'ecx': 'ptr'}
 
 
 def test_changed_selected_callee_fails_composed_corpus(sources):

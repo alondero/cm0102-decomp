@@ -169,6 +169,15 @@ Fixture replay follows the recorded input policy too: v2 clears DF after fixture
 selection, while v1 replays the captured flags unchanged. Saved fixture bytes stay
 intact; policy normalization changes neither the other inputs nor the RNG stream.
 
+Hints at the top level apply to both tiers. Put C-only input shapes, fixtures and
+their provenance in `"c_hints": {...}` within the same hint file. These fields
+override shared inputs for C tests, explanations, acceptance and composition;
+they do not participate in lifted case generation or its RNG stream. Overrides
+replace each named field as a whole, including `fixtures` and `globals`. They
+cannot change coverage thresholds, case counts, budgets, seeds or lift bindings.
+Remove `auto` when claiming the file. After changing shared hints, test both the
+lift and any accepted C tier; a C pass alone does not renew lifted evidence.
+
 Asymmetric instruction-budget exhaustion blocks acceptance, including when the
 original returns and C exhausts its budget. Investigate the exact case or raise
 both execution budgets through evidenced hints; do not treat an inconclusive

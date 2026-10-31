@@ -7,7 +7,7 @@ import random
 
 import pytest
 
-from cmre import difftest, emu, image
+from cmre import difftest, emu, env, image, recover
 
 
 def input_fixture():
@@ -27,6 +27,83 @@ def options(hints=None):
     opts = difftest.Options.for_function(0x00450A70)
     opts.hints = hints or {}
     return opts
+
+
+def test_c_only_fixtures_leave_lifted_cases_and_rng_unchanged():
+    va = 0x00450A70
+    baseline = difftest.Options.for_function(va)
+    data = input_fixture()
+    path = env.HINTS_DIR / f'fn_{va:08x}.json'
+    path.write_text(json.dumps({'c_hints': {'fixtures': [data], 'ecx': 'ptr'}}))
+    lifted = difftest.Options.for_function(va)
+    native = difftest.Options.for_function(va, tier='c')
+    assert lifted == baseline
+    assert native.hints == {'fixtures': [data], 'ecx': 'ptr'}
+    rng_a, rng_b = random.Random(va), random.Random(va)
+    templates = difftest.arena_templates()
+    for _ in range(40):
+        assert difftest.make_case(rng_a, lifted, [], templates) == difftest.make_case(rng_b, baseline, [], templates)
+    assert rng_a.getstate() == rng_b.getstate()
+    rng_c = random.Random(va)
+    assert any(difftest.make_case(rng_c, native, [], templates).import_seed == data['import_seed']
+               for _ in range(40))
+
+
+def test_c_hints_overlay_shared_inputs_without_changing_policy():
+    va = 0x00450A70
+    path = env.HINTS_DIR / f'fn_{va:08x}.json'
+    path.write_text(json.dumps({'ecx': 'small', 'args': ['ptr'], 'cases': 120,
+                                'c_hints': {'ecx': 'ptr'}}))
+    lifted = difftest.Options.for_function(va)
+    native = difftest.Options.for_function(va, {'cases': 20}, tier='c')
+    assert lifted.hints == {'ecx': 'small', 'args': ['ptr'], 'cases': 120}
+    assert native.hints == {'ecx': 'ptr', 'args': ['ptr'], 'cases': 120}
+    assert lifted.cases == 120 and native.cases == 20
+    assert native.inputs == lifted.inputs == 'v1'  # tier selection is not an input-policy change
+
+
+@pytest.mark.parametrize('extra', [
+    {'min_coverage': 0.1}, {'cases': 1}, {'seed': 1}, {'budget': 1}, {'discovery': 0},
+    {'c_hints': {}}, {'auto': True}, {'lift_original_calls': {}},
+    {'original_x87': {}}, {'lift_jump_tables': {}}, {'fixtures': [{}]},
+])
+@pytest.mark.parametrize('worker', [False, True])
+def test_c_hints_cannot_hide_policy_bindings_or_invalid_fixtures(extra, worker):
+    with pytest.raises(ValueError):
+        difftest.validate_hints({'c_hints': extra}, worker=worker)
+
+
+@pytest.mark.parametrize('extra', [None, [], 'fixtures'])
+def test_c_hints_must_be_an_object(extra):
+    with pytest.raises(ValueError, match='c_hints'):
+        difftest.validate_hints({'c_hints': extra})
+
+
+def test_c_fixture_validation_uses_the_effective_argument_count():
+    data = input_fixture()
+    data['stack'] = [0] * 12
+    difftest.validate_hints({'arg_count': 12, 'c_hints': {'fixtures': [data]}}, worker=True)
+    with pytest.raises(ValueError, match='fixture'):
+        difftest.validate_hints({'arg_count': 12, 'c_hints': {'arg_count': 10, 'fixtures': [data]}})
+
+
+def test_c_explanation_uses_the_same_tier_hints_as_c_validation(monkeypatch):
+    va = 0x004671B0
+    path = env.HINTS_DIR / f'fn_{va:08x}.json'
+    path.write_text(json.dumps({'c_hints': {'ecx': 'struct', 'struct_size': 128}}))
+    expected = difftest.Options.for_function(va, tier='c').hints
+    seen = []
+    original_run = difftest.run
+    def run(*args, **kwargs):
+        seen.append(args[5].hints)
+        return original_run(*args, **kwargs)
+    monkeypatch.setattr(difftest, 'run', run)
+    assert recover.test_c(va, {'cases': 10}, fresh=True)['status'] == 'pass'
+    assert seen == [expected, expected]
+    def explain(*args, **kwargs):
+        return args[5].hints
+    monkeypatch.setattr(difftest, 'explain', explain)
+    assert recover.explain_c(va, 0) == expected
 
 
 def test_default_case_and_rng_stream_are_unchanged():

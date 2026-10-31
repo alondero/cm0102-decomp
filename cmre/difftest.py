@@ -53,8 +53,13 @@ class Options:
     inputs: str = "v1"  # set by the caller from the record's policy, never by hints
 
     @classmethod
-    def for_function(cls, va: int, overrides: dict | None = None) -> "Options":
+    def for_function(cls, va: int, overrides: dict | None = None, *, tier: str = "lifted") -> "Options":
+        if tier not in ("lifted", "c"):
+            raise ValueError(f"Unknown hint tier: {tier}")
         hints = load_hints(va)
+        c_hints = hints.pop("c_hints", {})
+        if tier == "c":
+            hints.update(c_hints)
         validate_hints(overrides or {})
         merged = {**DEFAULTS, **{k: hints[k] for k in DEFAULTS if k in hints}, **(overrides or {})}
         return cls(seed=hints.get("seed", va), hints=hints, **merged)
@@ -71,7 +76,8 @@ def validate_hints(hints: dict, *, worker: bool = False) -> None:
     """Validate inputs before execution; task workers cannot change test policy."""
     metadata = {"notes", "fixture_provenance", "input_probe", "input_probe_sha256", "fixture_evidence"}
     policy = set(DEFAULTS) | {"seed"}
-    allowed = policy | set(emu.REG_NAMES[:8]) | metadata | {"args", "struct_size", "globals", "fixtures", "auto", "lift_jump_tables", "original_x87", "lift_original_calls"}
+    input_fields = set(emu.REG_NAMES[:8]) | metadata | {"args", "arg_count", "struct_size", "globals", "fixtures"}
+    allowed = policy | input_fields | {"auto", "lift_jump_tables", "original_x87", "lift_original_calls", "c_hints"}
     if not isinstance(hints, dict) or set(hints) - allowed:
         raise ValueError("hints must be an object containing only supported fields")
     if worker and set(hints) & (policy - {"arg_count"}):
@@ -132,6 +138,13 @@ def validate_hints(hints: dict, *, worker: bool = False) -> None:
         templates = (bytes(emu.ARENA_SIZE),) * ARENA_TEMPLATES
         for fixture in fixtures:
             _fixture_case(fixture, templates, hints.get("arg_count", DEFAULTS["arg_count"]))
+    if "c_hints" in hints:
+        c_hints = hints["c_hints"]
+        if not isinstance(c_hints, dict) or set(c_hints) - input_fields:
+            raise ValueError("c_hints can override input shapes and metadata only, not acceptance policy or bindings")
+        # Validate the effective C inputs, including inherited arg_count. Bindings
+        # and thresholds stay shared; a nested override cannot bypass worker rules.
+        validate_hints({**{k: v for k, v in hints.items() if k != "c_hints"}, **c_hints}, worker=worker)
 
 
 def _pointer(rng: random.Random) -> int:

@@ -146,7 +146,7 @@ def test(manifest: dict, overrides: dict | None = None) -> dict:
     if any(any(ins.mnemonic.startswith('f') for ins in item.insns.values())
            and campaign._id(va) not in x87_contracts for va, item in lifted.items()):
         raise ValueError('experimental composition excludes x87 instructions without a dedicated parent contract')
-    options = {va: difftest.Options.for_function(va, overrides) for va in selected}
+    options = {va: difftest.Options.for_function(va, overrides, tier="c") for va in selected}
     if any(o.cases <= 0 or o.budget <= 0 or not 0 < o.min_coverage <= 1 for o in options.values()):
         raise ValueError("positive cases/budget and coverage in (0, 1] are required")
     builds = {}
@@ -195,7 +195,7 @@ def test(manifest: dict, overrides: dict | None = None) -> dict:
             changed.append(source.name + ':x87-contract')
         if recover.c_dependencies(source) != dependencies[source.name]:
             changed.append(source.name + ':dependencies')
-        if difftest.Options.for_function(va, overrides).__dict__ != options[va].__dict__:
+        if difftest.Options.for_function(va, overrides, tier="c").__dict__ != options[va].__dict__:
             changed.append(source.name + ':test-inputs')
     return {"schema": "cmre-composition-report/1", "input_sha256": env.TARGET_SHA256,
             "campaign": manifest, "source_sha256": identities,
