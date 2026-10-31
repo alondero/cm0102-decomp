@@ -1,0 +1,141 @@
+# Same-machine isolated C recovery workers
+
+One authoritative checkout owns the local game, pinned inventory, hints, queue,
+task leases and attempts, review receipts and acceptance ledger. Separate Git
+worktrees own worker C edits and ignored evidence/report snapshots. The coordinator
+brokers access to local assets; game files are neither copied into worker trees
+nor added to Git. No directory junctions are needed or supported.
+
+This lane uses the existing bounded C task gate: one accepted lifted function,
+no accepted C tier, at most 600 inventory body bytes, unchanged semantic comparison
+at O0/O2. Larger functions and harness work continue in the authoritative checkout.
+It coordinates trusted same-user local processes, not hostile filesystem access.
+The integrator owns the parent preflight and closing check; workers inherit that
+receipt and do not start independent sessions.
+
+## Bootstrap and claim (coordinator shell)
+
+First make the reviewed tooling available in the worker's Git revision through
+the repository's publication workflow. Bootstrap requires byte-identical `cmre/`
+Python modules and `recovery/include/` files. It pins each tree's HEAD and tooling,
+the common Git directory, the official target SHA-256 and all inventory hashes.
+Different branch histories are allowed when the tooling is identical. Keep these
+inputs frozen until workers finish. Normalizing line endings changes their hashes;
+use the repository's existing line-ending configuration consistently.
+
+```powershell
+git worktree add -b recovery-worker-a ../cm0102-worker-a HEAD
+git worktree add -b recovery-worker-b ../cm0102-worker-b HEAD
+py -3.13 -m cmre worktree bootstrap ../cm0102-worker-a
+py -3.13 -m cmre worktree bootstrap ../cm0102-worker-b
+py -3.13 -m cmre worktree claim ../cm0102-worker-a fn_X --owner worker-a --seconds 3600
+py -3.13 -m cmre worktree claim ../cm0102-worker-b fn_Y --owner worker-b --seconds 3600
+```
+
+Use distinct functions and owner names. Claims share `cmre work claims` with
+same-checkout workers; duplicates are rejected. Each claim also has a task token
+retained only by the coordinator. Its packet, including the complete original
+instruction evidence, is copied to the worker's ignored
+`CM0102/Analysis/cmre/worktree/fn_X/packet.json`. Read that packet, the inherited
+contract and the C workflow. Never stage packets or report snapshots.
+
+Worker bindings and a hash-pinned authoritative packet live under ignored analysis
+storage. Submission and review check the worker packet against that retained copy.
+Bootstrap
+retries retain the existing binding and claims. A changed HEAD or tooling snapshot
+requires a fresh worker tree after existing workers have stopped and outstanding
+claims have expired or been reconciled; bootstrap never resets attempts.
+
+## Translate and validate (worker shell)
+
+Write only `recovery/c/fn_X.c`, preserving behaviour from the packet's original
+instructions, then run:
+
+```powershell
+py -3.13 -m cmre worktree test fn_X
+```
+
+This invokes the bound coordinator's Python tooling with separate process state
+and without inherited writer credentials or lock-path overrides. It checks the
+snapshot and live claim, imports only the fixed C file into task staging, reserves
+an attempt durably, and runs the original C differential gate. A JSON result names
+the ignored worker report and task ID. Failure exits nonzero. Ordinary `cmre test`,
+`accept` and machine jobs are not worker commands; workers have no local game or
+authoritative recovery state.
+
+Disjoint worker processes can test concurrently. Metadata updates use short queue
+locks; each function and each worker tree excludes overlapping operations. The
+five-attempt ceiling includes interrupted attempts and previous task fingerprints,
+owners and worker roots. Existing queue failures and task attempts are combined
+using durable event identities, so completed task failures are counted once.
+Changing hints, restarting a process or using a fresh tree cannot erase that budget.
+Ownership is checked again after execution, while the queue lock covers the short
+submission commit. Expired or replaced claims cannot produce a passing submission.
+
+## Review and serial acceptance (coordinator shell)
+
+Review the worker C source against its packet's original listing and its matching
+report. The reviewer returns the exact source/report SHA-256 values and a concrete
+instruction-evidence justification. Record those values, then publish locally:
+
+```powershell
+py -3.13 -m cmre worktree review ../cm0102-worker-a fn_X --reviewer reviewer-a --reason "Instruction evidence and ABI reviewed" --source-sha256 SOURCE_HASH --report-sha256 REPORT_HASH
+py -3.13 -m cmre worktree publish ../cm0102-worker-a fn_X
+```
+
+Review checks both worker copies and authoritative staged evidence. Publication
+checks the review's hashes and input fingerprint again, imports reviewed source
+into the canonical `recovery/c/fn_X.c`, then calls the existing `cmre accept --c`
+gate under the single OS-owned writer lease. Concurrent acceptance and machine
+writers fail with lock contention. Worker reports alone never establish recovery.
+Other functions' reviewed acceptances do not invalidate a worker's function inputs.
+
+To request an edit after a passing submission:
+
+```powershell
+py -3.13 -m cmre worktree revise ../cm0102-worker-a fn_X --reason "Describe the instruction or ABI discrepancy"
+py -3.13 -m cmre worktree claim ../cm0102-worker-a fn_X --owner worker-a --seconds 3600
+```
+
+Revision invalidates review and retains all attempts. The worker edits and tests
+again; a new review is required. A successful publication releases its queue claim.
+`publish` is local acceptance, not a Git push. Only canonical reviewed authored
+source may enter the normal publication scan/commit workflow. Task staging under
+`recovery/c/tasks/` is ignored, as are evidence, bindings, reports and generated
+records. Stage explicit reviewed paths and run `cmre publication scan` as usual.
+
+## Interruption and retry
+
+An OS lock is released when its owning process terminates. Stop the old worker
+before retrying, wait for its lease to expire, then claim the same function again.
+The coordinator changes the token, marks a reserved unfinished task attempt
+interrupted and retains the report history and budget. The old token and stale
+worker snapshots cannot submit. A live claim is never stolen.
+
+If validation completed before report export was interrupted, repeat the worker's
+`worktree test fn_X`: it reconciles the existing successful task without another
+execution or attempt, including a fifth-attempt success. To explicitly restore
+missing or damaged packet/report snapshots from their pinned authoritative copies,
+run `py -3.13 -m cmre worktree sync WORKER fn_X` in the coordinator. Ordinary test
+and review commands reject altered snapshots. Sync never changes worker C source,
+the successful candidate hash, its review requirements or the attempt budget.
+
+If publication was interrupted, rerun the same `worktree publish`. The underlying
+task publication journal reconciles accepted source against the ledger or restores
+the retained previous source. Conflicting external edits require investigation.
+Do not delete task directories, bindings, claims or reports to retry. After five
+attempts, stop translation and investigate the recorded evidence in the coordinator.
+
+## Validation evidence
+
+`tests/test_cmre_worktrees.py` exercises shared-checkout collisions, concurrent
+disjoint actual Git worktrees in separate processes, killed-process lock release,
+reserved-attempt recovery, expiry, stale source/report/tooling/input identities,
+path redirection, pin mismatches, revision and five-attempt persistence.
+Its small synthetic gates test coordination, not game semantics.
+`tests/test_cmre_worktrees_integration.py` creates a real Git worker and isolated
+local coordinator, validates against the pinned original at preferred-image VA
+`0x004671b0`, records review and performs real O0/O2 C acceptance. The target is
+SHA-256 `0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86`.
+That test leaves the production ledger and recovery counts unchanged and checks
+that no game or generated analysis paths are tracked by Git.

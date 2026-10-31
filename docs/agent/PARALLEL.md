@@ -51,8 +51,10 @@ Follow [C.md](C.md) for the translation itself; return `fn_X pass|wip: <detail>`
 
 ## Limits
 
-- One working tree. Git worktrees lack the ignored local game and analysis
-  assets, so agents share this checkout and separate by file ownership.
+- Shared-checkout workers separate by file ownership. Same-machine isolated
+  worktrees use the coordinator-mediated bounded C lane in [WORKTREES.md](WORKTREES.md).
+  Workers receive ignored evidence snapshots and brokered validation; they never
+  junction the recovery directory or own a separate acceptance ledger.
 - `cmre test --c` takes no lock; CPU is the limit (24 logical processors here).
   Leave headroom for the integrator's acceptance reruns and do not add
   translators during a machine job.
