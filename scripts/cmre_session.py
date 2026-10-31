@@ -252,10 +252,20 @@ class Journal:
         temporary.replace(self.path)
 
     def execute(self, args: tuple[str, ...]) -> int:
+        from cmre import env, session_evidence
+
         argv = [sys.executable, "-m", *args]
         step = {"command": ["py", "-3.13", "-m", *args], "started": now(),
                 "log": f"{len(self.data['steps']) + 1:02d}-{args[0]}.log", "state": "starting"}
         self.data["steps"].append(step)
+        if args == ('pytest',):
+            step['inputs_before'] = session_evidence.identity(ROOT)
+            previous = session_evidence.find(self.path.parent.parent, step['inputs_before'], self.path)
+            if previous:
+                step.update(state='finished', exit_code=0, ended=now(), evidence='reused', reused_from=previous)
+                self.save()
+                print(f"Reused full pytest: {previous['receipt']} step {previous['step']}", flush=True)
+                return 0
         self.save()
         print("Running: " + " ".join(step["command"]), flush=True)
         child_env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1", NO_COLOR="1")
@@ -286,6 +296,12 @@ class Journal:
             finally:
                 process.stdout.close()
         step.update(state="finished", ended=now(), exit_code=code)
+        if args == ('pytest',):
+            step.update(inputs_after=session_evidence.identity(ROOT), evidence='executed',
+                        log_sha256=env.digest(self.path.parent / step['log']))
+            if step['inputs_after'] != step['inputs_before']:
+                step.update(exit_code=2, detail='Declared test inputs changed during pytest; evidence is inconclusive')
+                code = 2
         self.save()
         print(f"Exit: {code}", flush=True)
         return code
@@ -313,7 +329,7 @@ def main(argv=None) -> int:
     modes.add_parser("start", help="one full parent preflight")
     check = modes.add_parser("check", help="full parent closing gate")
     check.add_argument("--parent", type=Path, help="bind progress to this preflight, not another session's")
-    run = modes.add_parser("run", help="supervised machine job with full preflight")
+    run = modes.add_parser("run", help="supervised job with doctor/status and current full pytest evidence")
     run.add_argument("command", nargs=argparse.REMAINDER)
     resume = modes.add_parser("resume", help="reuse a completed preflight; no tests")
     checkpoint = modes.add_parser("checkpoint", help="prepare bounded continuation context; no closing gate")

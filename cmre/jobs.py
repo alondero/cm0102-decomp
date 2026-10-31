@@ -120,6 +120,13 @@ def describe(receipt: str | None = None) -> dict:
         if not path.is_relative_to(root.resolve()):
             raise ValueError('Job receipt must be under CM0102/Analysis/cmre/jobs')
     data = json.loads(path.read_text(encoding='utf-8'))
+    from . import validation
+    if data.get('schema') == validation.SCHEMA:
+        data = validation._load_results(path)
+        return {'receipt': env.rel(path), 'kind': data['kind'], 'recorded_state': data['state'],
+                **validation.summary(data),
+                'first_failures': [{'tier': k, 'detail': v['detail']} for k, v in data['results'].items()
+                                   if not v['ok']][:5]}
     results = dict(data['results'])
     for item in path.with_suffix('').glob('*.json'):
         results[item.stem] = json.loads(item.read_text(encoding='utf-8'))

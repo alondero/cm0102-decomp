@@ -8,7 +8,7 @@ the selected workflow holds its procedure. Acceptance policy:
 ## 1. Preflight
 
 Run `py -3.13 scripts/cmre_session.py start` once per parent session (doctor,
-status, pytest; prints a receipt path). Workers inherit it. If pytest fails,
+status, full pytest or exact-input receipt reuse; prints a receipt path). Workers inherit it. If pytest fails,
 record the failing node IDs: a recovery continuation starts with that defect;
 an explicitly requested docs/tooling task may proceed and report it. Note
 existing `git status --short` changes and leave unrelated work alone.
@@ -64,7 +64,9 @@ establish throughput. The parent reviews source evidence and accepts serially.
   ad-hoc `py -c` probes. If you need the same probe twice, add it to `cmre`
   with a test (tooling task) rather than a script under `CM0102/Analysis/`.
 - Harness modules (`HARNESS_MODULES` in `cmre/recover.py`) are frozen during a
-  recovery session: a change there forces a full revalidation (1–2 hours).
+  recovery session. For tooling changes, inspect `cmre revalidate --plan`, batch
+  fixes and follow [HARNESS.md](HARNESS.md). Global/unknown impact requires the
+  full inventory; bounded input dispatch needs an explicit compatibility receipt.
 - Report progress as the `Progress since` line from the closing check.
 - Reuse the parent preflight receipt across continuations and workers. Use
   function tests within a batch and one closing check at the parent boundary;
@@ -91,6 +93,8 @@ write). Green means both pytest and verify exited 0; it prints accepted-C
 progress against that parent, even if another session started later. A failed
 baseline may be bound for a tooling fix; it cannot be reused as a green preflight.
 The legacy command without `--parent` still selects the latest successful start.
+Matching completed full pytest evidence may be reused; changed declared inputs
+invalidate it. Integrity always runs. Differential inventory evidence is separate.
 On failure report exact failures and
 whether they existed at preflight. Commit only when requested; never push.
 
