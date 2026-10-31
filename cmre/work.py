@@ -54,7 +54,9 @@ def identity(va):
             **{k: env.digest(p) if p.is_file() else None for k, p in files.items()}}
 
 
-def update(va, state, reason, retry_when="", blocker="", *, report=None):
+def update(va, state, reason, retry_when="", blocker="", *, report=None, event_id=None):
+    if event_id is not None and (not isinstance(event_id, str) or not event_id or report is None):
+        raise ValueError('Report events require a nonempty identity and report')
     if state not in STATES or not reason.strip():
         raise ValueError("A supported state and a nonempty reason are required")
     if state in ("harness-blocker", "evidence-needed") and not retry_when.strip():
@@ -66,6 +68,8 @@ def update(va, state, reason, retry_when="", blocker="", *, report=None):
         data = read()
         key = f"fn_{va:08x}"
         old = data["functions"].get(key, {})
+        if event_id is not None and event_id in old.get('report_events', {}):
+            return old
         attempts = old.get("attempts", 0) + (report is not None)
         failures = old.get("failures", 0) + (report is not None and report["status"] != "pass")
         record = {"state": state, "reason": reason, "retry_when": retry_when,
@@ -80,6 +84,10 @@ def update(va, state, reason, retry_when="", blocker="", *, report=None):
             record["last_report"] = old["last_report"]
         if "first_failure" in old:
             record["first_failure"] = old["first_failure"]
+        if old.get('report_events') or event_id is not None:
+            record['report_events'] = dict(old.get('report_events', {}))
+            if event_id is not None:
+                record['report_events'][event_id] = report['status']
         data["functions"][key] = record
         coordination.atomic_json(path(), data)
     return record

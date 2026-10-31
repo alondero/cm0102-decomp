@@ -5,6 +5,7 @@ only publication invokes acceptance. State and failure evidence survive restarts
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import math
 import re
@@ -313,7 +314,7 @@ def _metrics(value: dict | None) -> dict:
 
 
 def submit(task_id: str, owner: str, token: str, *, outcome: str = "candidate",
-           summary: str = "", metrics: dict | None = None) -> dict:
+           summary: str = "", metrics: dict | None = None, ownership_guard=None) -> dict:
     """Validate fixed staged source and journal a bounded attempt; never accept."""
     if outcome not in ("candidate", "failed", "evidence-needed", "harness-defect") or not isinstance(summary, str) or len(summary) > 4000:
         raise ValueError("Invalid submission outcome/summary")
@@ -340,11 +341,19 @@ def submit(task_id: str, owner: str, token: str, *, outcome: str = "candidate",
                 report = recover.test_c(int(manifest["va"], 16), source=candidate)
                 if env.digest(candidate) != candidate_hash:
                     raise ValueError("Candidate changed during validation")
-                validate_current(manifest)
-                report_path = task_dir(task_id) / f"report-{attempt['number']}.json"
-                coordination.atomic_json(report_path, report)
-                attempt.update(status="pass" if report["status"] == "pass" else "failed",
-                               report_path=env.rel(report_path), report_sha256=env.digest(report_path))
+                # External queue ownership is checked and held only for this
+                # short commit, so disjoint workers may execute concurrently.
+                with ownership_guard() if ownership_guard else nullcontext():
+                    _lease(manifest, owner, token)
+                    validate_current(manifest)
+                    report_path = task_dir(task_id) / f"report-{attempt['number']}.json"
+                    coordination.atomic_json(report_path, report)
+                    attempt.update(status="pass" if report["status"] == "pass" else "failed",
+                                   report_path=env.rel(report_path), report_sha256=env.digest(report_path))
+                    if attempt['status'] == 'pass':
+                        manifest['status'] = 'submitted'
+                        manifest['lease'] = None
+                    save(manifest)
             except BaseException as exc:
                 attempt.update(status="failed", error=f"{type(exc).__name__}: {exc}")
                 manifest["status"] = "exhausted" if len(manifest["attempts"]) >= MAX_ATTEMPTS else "claimed"

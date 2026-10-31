@@ -702,6 +702,8 @@ def main(argv=None) -> int:
     boundaries.add_commands(sub)
     from . import publication
     publication.add_commands(sub)
+    from . import worktrees
+    worktrees.add_commands(sub)
     a = p.parse_args(argv)
     from .coordination import BusyError, writer
     try:
