@@ -411,7 +411,7 @@ def _revalidate_guarded(va: int, refresh: bool = False) -> tuple[int, str]:
         return va, msg
 
 
-def cmd_revalidate(a) -> int:
+def _legacy_revalidate(a) -> int:
     from . import ledger, jobs
 
     vas = [e.va for e in ledger.cmre_entries()][: a.n]
@@ -435,6 +435,61 @@ def cmd_revalidate(a) -> int:
     count = len(job.data['functions'])
     print(f"revalidated {count}: {count - job.failures} ok, {job.failures} need attention")
     return 1 if job.failures else 0
+
+
+def cmd_revalidate(a) -> int:
+    from . import ledger, validation
+
+    if a.retry_failed and not a.resume:
+        raise ValueError('--retry-failed requires --resume')
+    if a.n < 0 or a.jobs < 1:
+        raise ValueError('Selection and worker count must be nonnegative/positive')
+    if a.resume and a.reuse:
+        raise ValueError('Select either --resume or --reuse')
+    # Existing jobs retain their schema and strict resume contract.
+    if getattr(a, 'resume', None):
+        schema = validation.receipt_schema(Path(a.resume))
+        if schema != validation.SCHEMA:
+            if schema != 'cmre-job/2':
+                raise ValueError('Unsupported resume schema; use current dependency-aware evidence or legacy schema-2 jobs')
+            if a.plan or a.audit or a.compatibility or a.output:
+                raise ValueError('Legacy --resume retains its original contract; use --reuse with a dependency-aware receipt')
+            return _legacy_revalidate(a)
+    vas = [e.va for e in ledger.cmre_entries()][:a.n]
+    data = validation.plan(vas, refresh=a.refresh,
+                           resume=a.resume, reuse=a.reuse, retry_failed=a.retry_failed,
+                           audit=a.audit, compatibility=a.compatibility)
+    if a.plan:
+        if a.output:
+            from . import coordination
+            coordination.atomic_json(Path(a.output), data)
+        print(json.dumps(data if a.json else validation.summary(data), indent=2))
+        return 0
+    if a.output:
+        raise ValueError('--output requires --plan')
+    print('Validation plan: ' + json.dumps(validation.summary(data)), flush=True)
+    run = validation.Run(data)
+    print(f'Job receipt: {run.path}', flush=True)
+    pending = [(k, v) for k, v in data['items'].items() if v['action'] == 'execute']
+    pool = None
+    identity_hash = validation.digest(data['identity'])
+    try:
+        if a.jobs == 1:
+            results = ((k, validation.execute(v, identity_hash, a.refresh)) for k, v in pending)
+        else:
+            pool = ProcessPoolExecutor(max_workers=a.jobs)
+            futures = {pool.submit(validation.execute, v, identity_hash, a.refresh): k for k, v in pending}
+            results = ((futures[f], f.result()) for f in as_completed(futures))
+        for key, result in results:
+            run.record(key, result)
+            if not result['ok']:
+                print(f"fn_{key} FAIL {result['detail']}", flush=True)
+    finally:
+        if pool:
+            pool.shutdown(wait=True, cancel_futures=True)
+        run.finish()
+    print(json.dumps(run.data['summary'], indent=2))
+    return 1 if run.data['summary']['failed'] or run.data.get('identity_drift') or run.data['state'] != 'finished' else 0
 
 
 def cmd_verify(a) -> int:
@@ -573,14 +628,29 @@ def main(argv=None) -> int:
     s.add_argument("--batch", action="store_true", help="every function blocked by `batch`")
     s.set_defaults(func=cmd_unblock)
     sub.add_parser("verify", help="integrity of all ledgers (the green gate)").set_defaults(func=cmd_verify)
-    s = sub.add_parser("revalidate", help="re-test accepted lifted records with the current harness")
+    s = sub.add_parser("revalidate", help="plan/revalidate accepted tiers with dependency-aware evidence reuse")
     s.add_argument("-n", type=int, default=10**9)
     s.add_argument("--refresh", action="store_true", help="re-accept passing records under the current harness")
     s.add_argument("--jobs", type=int, default=4)
-    s.add_argument('--resume', help='resume a matching item receipt; keep original selection options')
+    s.add_argument('--resume', help='resume legacy jobs or reuse dependency-aware tier receipts')
     s.add_argument('--retry-failed', action='store_true',
                    help='with --resume: new receipt, retry failed/changed items and retain identity-matched successes')
+    s.add_argument('--plan', action='store_true', help='show impact without differential execution or acceptance')
+    s.add_argument('--json', action='store_true', help='include every tier and invalidation reason in plan output')
+    s.add_argument('--output', help='save the complete --plan as a local JSON receipt')
+    s.add_argument('--reuse', help='prior dependency-aware receipt (default: latest); retains failures')
+    s.add_argument('--audit', action='store_true', help='execute the whole selection without evidence reuse')
+    s.add_argument('--compatibility', help='explicit reviewed bounded harness transition receipt')
     s.set_defaults(func=cmd_revalidate)
+    s = sub.add_parser('validation-compatibility', help='review a bounded input-dispatch harness transition')
+    for name in ('before', 'after', 'regressions', 'reviewer', 'reason', 'output'):
+        s.add_argument('--' + name, required=True)
+    from . import validation_compat
+    s.set_defaults(func=validation_compat.command)
+    s = sub.add_parser('validation-benchmark', help='measure bounded revalidation in copied local inputs')
+    s.add_argument('functions', nargs='+', help='one to eight accepted C function IDs')
+    from . import validation_benchmark
+    s.set_defaults(func=validation_benchmark.command)
     s = sub.add_parser('job', help='compact machine-job progress from durable item receipts')
     s.add_argument('action', choices=('status',))
     s.add_argument('receipt', nargs='?', help='defaults to the newest job receipt')
@@ -637,7 +707,7 @@ def main(argv=None) -> int:
     try:
         # A command owns publication for its whole process pool. Supervised
         # children inherit the lease; unrelated direct CLI writers cannot join.
-        if a.command in {'accept', 'block', 'unblock', 'batch', 'revalidate'} or (
+        if a.command in {'accept', 'block', 'unblock', 'batch', 'revalidate', 'validation-compatibility', 'validation-benchmark'} or (
                 a.command == 'status' and a.write):
             with writer():
                 return a.func(a)

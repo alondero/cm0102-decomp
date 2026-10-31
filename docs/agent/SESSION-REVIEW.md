@@ -49,7 +49,10 @@ The runner supervises `batch` and `revalidate`; direct CLI invocations retain
 their existing behaviour and do not acquire its lock. A forcibly killed runner
 can leave a receipt marked running; inspect the recorded child PID and log before
 restarting. A successful batch can include blocked functions. Large jobs repeat
-preflight so a stale earlier pass cannot launch work after a regression.
+preflight so a stale earlier pass cannot launch work after a regression. The
+issue #24 runner retains doctor/status and reuses full pytest only through a
+completed successful step whose declared inputs and log hash still match;
+see [HARNESS.md](HARNESS.md#reusing-full-pytest) for the current contract.
 
 Deferred: repair shared struct inference with the existing tests, then perform
 full revalidation before expanding recovery. A guard-parser repair should cover

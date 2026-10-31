@@ -12,7 +12,7 @@
    | Change | Required validation |
    | --- | --- |
    | Instructions, skills, session runner, guard, CLI routing, queue, tests | Focused checks and parent session gate; no blanket revalidation for these files alone |
-   | Module in `HARNESS_MODULES` | Focused regression, full pytest, and complete revalidation below |
+   | Module in `HARNESS_MODULES` | Focused regression, full pytest, and dependency-aware inventory gate below; global/unknown changes select everything |
    | Acceptance/ledger semantics or C build inputs outside that list | Determine and validate affected records explicitly; file-list exclusion does not prove unchanged evidence |
 
    Behaviour-changing code stays fixed during revalidation. A comparison can
@@ -23,29 +23,62 @@
    retain every intermediate failure. Tooling/reporting changes follow their
    own row above and do not trigger inventory refresh merely because they are
    Python files. Never bypass a required revalidation to improve throughput.
-4. For a behaviour-module change, after full pytest passes:
+4. Inspect impact before launching differential work. Batch necessary fixes,
+   then freeze execution/build/acceptance inputs for the final run:
 
    ```powershell
+   py -3.13 -m cmre revalidate --refresh --plan --json --output CM0102/Analysis/cmre/validation-plan.json
    py -3.13 scripts/cmre_session.py run revalidate --refresh --jobs 16
    ```
 
-   Completion: the **whole** accepted inventory passes, not a sampled `-n` run.
-   `DRIFT` or `SKIP refresh` needs resolution before continuing. C records need
-   their C tier checked and re-accepted too. `cmre verify` checks ledger integrity;
-   it does not check the current harness identity or substitute for revalidation.
+   Completion: every accepted lifted and C tier has current executed or explicitly
+   reusable evidence, with zero failed, inconclusive or pending tiers. A sampled
+   `-n` run is never the inventory gate. The plan lists effective options, profiles,
+   optimizations, compiler-selected dependencies, invalidation reasons, previous
+   failures, measured item costs and affected recorded compositions. Missing
+   dependency coverage selects execution and remains inconclusive if unresolved.
+   Revalidate affected compositions separately with `compose-test`; single-function
+   results confer no composed-call or live-integration claim. `cmre verify` remains
+   an independent ledger-integrity check.
    When a support-header change makes doctor reject existing C dependencies,
    first revalidate and re-accept the **unchanged** canonical C sources with
    `recover.accept(va, 'c', refresh=True)`. Preserve their previous receipts and
    source hashes; never remove C records to bypass doctor. This refresh enables
    the supervised run and does not replace the whole inventory gate. The refresh
-   job independently validates each existing C tier, even if its lifted hash is
-   current, and preserves the original lifted baseline.
-   After a complete pass with failures, resolve them and run the same supervised
-   command with `--resume RECEIPT --retry-failed`. This creates a new whole-inventory
-   receipt retaining the original failures. Successful items are reused only
-   when their source, hints, ledger, build and harness identities still match;
-   changed successful items are rerun too, with their previous receipts retained.
-   A changed harness or global execution identity requires a new full pass.
+   job independently validates each C tier and preserves its lifted baseline.
+   Default revalidation reuses the latest dependency-aware receipt. Use `--reuse
+   RECEIPT` to choose one explicitly. `--resume RECEIPT` executes pending or
+   invalidated successful tiers and retains completed failures without retrying
+   them; the command remains failing while any retained failure is present.
+   Add `--retry-failed` to explicitly execute failed tiers while retaining matching
+   successes and original receipts. `--audit` explicitly reruns the whole selection,
+   including previous failures. Schema-2
+   receipts retain their original strict `--resume` contract. Migration can reuse
+   an accepted tier's current run report only after recomputing its exact key
+   from execution identity, effective options, source and selected build inputs.
+   An unchanged repeat performs no new differential executions. C-only hints
+   preserve unchanged lifted evidence; shared hints invalidate both tiers.
+   Header dependencies are compiler-selected at both C optimizations; new include
+   availability conservatively invalidates C coverage. Old results keep their
+   original identities and receipt locations. Refresh never silently relabels them.
+   Plans store hashes of effective fixture payloads and acceptance evidence,
+   retaining original hint/report paths instead of copying large corpora into
+   every item. Schema-1 prototype validation receipts remain local history;
+   schema-2 can migrate exact current accepted run reports without executing them.
+   Plans and final receipts include numeric whole-workspace `counts` for accepted
+   C/legacy functions and bytes, lifted/inclusive recovery and live integration.
+   These are independent of the selected validation tiers. Final receipts retain
+   `counts_before` and a fresh closing `counts` snapshot. Historical receipts that
+   lack counts report unknown values rather than inventing zeroes.
+   Compiler environment and workspace changes invalidate reuse. Volatile macros,
+   computed macro names and external include-availability tests are preprocessed
+   again; unchanged source hashes alone do not prove their generated inputs.
+
+   Global emulation, comparison, imports, ABI, compiler or execution-policy changes
+   require a full pass. Use `--audit` at milestone/integration boundaries to execute
+   every selected tier regardless of reuse. The only bounded compatibility lane is
+   reviewed input-dispatch/validation changes; see the procedure below. File-list
+   exclusion or equal hints alone cannot establish compatibility.
 5. Only after revalidation finishes successfully, run
    `py -3.13 -m cmre unblock --batch` to requeue machine-made blocks. Agent blocks
    remain. Then return to [BATCH.md](BATCH.md) if recovery is the requested task.
@@ -53,6 +86,58 @@
 Docs-only work can preserve an observed failing baseline and report it; it
 cannot label that session green. Keep failing contracts intact. Finish through
 the parent [playbook](PLAYBOOK.md#3-close-the-session).
+
+## Bounded input-dispatch compatibility
+
+Keep a complete dependency-aware receipt from before the change and save a complete
+after-change `--plan --output` file. Add focused positive and negative regressions
+for the actual dispatch change, including changed seeds/policies/builds/fixtures
+and a comparison near miss. Run full pytest through the session runner, then:
+
+```powershell
+py -3.13 -m cmre validation-compatibility --before BEFORE_RECEIPT --after AFTER_PLAN --regressions SESSION_RECEIPT --reviewer REVIEWER --reason "Reviewed scope and equivalence argument" --output CM0102/Analysis/cmre/compatibility.json
+py -3.13 -m cmre revalidate --refresh --plan --compatibility CM0102/Analysis/cmre/compatibility.json --reuse BEFORE_RECEIPT --json
+```
+
+Review the resulting scope before using the same options in the supervised run.
+The compatibility receipt pins both harness versions, all global identities,
+complete selection, original evidence, test receipt and justification. Creation
+rechecks every proposed unaffected tier's effective inputs and compiler-selected
+build. The AST guard permits only hint selection/validation and tier dispatch;
+changed comparison, RNG generation, thresholds, emulation or other execution code
+rejects compatibility. Changed effective inputs/builds remain selected for execution.
+Unknown transitions use a full sweep. Retain both original receipts.
+The allowed AST transformations intentionally describe this proven dispatch lane;
+extending the grammar requires its own equivalence evidence and regressions.
+Generalizing arbitrary AST rewrites would broaden the evidence claim without proof.
+
+## Reusing full pytest
+
+The runner records declared inputs before and after full pytest, including code,
+tests, authored files, recovery inputs, local fixtures, target/inventory, packages,
+Python, tool binaries and relevant environment. A later start, supervised run or
+closing check reuses only a completed successful full-suite step with equal inputs
+and an intact log. New/changed/deleted dependencies invalidate reuse; old receipts
+without coverage and focused runs cannot seed it. Doctor/status and `cmre verify`
+still run independently. Keep full pytest, differential validation and integrity
+as separate claims in the final report.
+
+## Measuring the work saved
+
+`cmre validation-benchmark fn_005ab510 fn_00666720` copies the selected accepted
+sources, hints, headers and ledgers into retained ignored analysis storage. It
+executes a cold control, an unchanged repeat and a C-only fixture edit; remaining
+seed/source/header/global-scope scenarios measure impact selection only. Canonical
+inputs, acceptance and recovery counts are unchanged. JSON receipts record elapsed
+time, differential executions, reuse rate and validation/recovery time separately.
+
+The issue #24 measurement on those two #23 accepted functions used six differential
+executions in 16.89 s cold, zero in 0.10 s unchanged (100% reuse), and two in 5.12 s
+after a C-only fixture edit (75% tier reuse). Both optimizations passed; lifted
+evidence remained reusable. Impact-only controls selected two tiers for a shared
+seed, one for C source, two for the shared header and all four for a global-scope
+audit. These small-corpus timings are measurements, not whole-inventory forecasts.
+The retained local report is linked by `CM0102/Analysis/cmre/issue-24-benchmark.log`.
 
 ## Separate lifted and C input evidence
 

@@ -25,7 +25,9 @@ def test_resume_preserves_selection_and_results(isolated):
 
 def _revalidate_selection(monkeypatch, tmp_path, vas):
     from types import SimpleNamespace
-    from cmre import ledger
+    from cmre import cli, ledger
+    # These tests exercise the retained schema-2 worker/resume contract.
+    monkeypatch.setattr(cli, 'cmd_revalidate', cli._legacy_revalidate)
     monkeypatch.setenv('CMRE_COORDINATION_PATH', str(tmp_path / 'command.lock'))
     monkeypatch.setattr(ledger, 'cmre_entries', lambda: [SimpleNamespace(va=va) for va in vas])
 

@@ -94,6 +94,28 @@ def test_refresh_rewrites_record_with_current_harness(sandbox):
     assert env.ANALYSIS.is_relative_to(sandbox)
 
 
+def test_existing_current_reports_migrate_without_new_differential_execution(sandbox, monkeypatch):
+    from cmre import difftest, validation
+
+    monkeypatch.setattr(env, 'C_DIR', sandbox / 'c')
+    env.C_DIR.mkdir()
+    assert recover.accept(VA)[0]
+    (env.C_DIR / f'fn_{VA:08x}.c').write_text(
+        '#include "cmre.h"\nCM_THISCALL void *cm_fn_004671b0(void *self) { return (u8 *)self + 0x20; }\n')
+    assert recover.accept(VA, 'c')[0]
+    monkeypatch.setattr(difftest, 'run', lambda *a, **kw: pytest.fail('migration reran differential tests'))
+    monkeypatch.setattr(recover, 'c_dependencies', lambda *a: pytest.fail('unchanged compiler-selected build was repeated'))
+    plan = validation.plan([VA])
+    assert {i['action'] for i in plan['items'].values()} == {'reuse'}
+    for item in plan['items'].values():
+        assert item['previous']['origin']['report'].endswith('report.json')
+    # A changed C input must not hit the accepted report's exact key.
+    (env.HINTS_DIR / f'fn_{VA:08x}.json').write_text('{"c_hints": {"ecx": "ptr"}}')
+    changed = validation.plan([VA])
+    assert changed['items'][f'{VA:08x}-lifted']['action'] == 'reuse'
+    assert changed['items'][f'{VA:08x}-c']['action'] == 'execute'
+
+
 @pytest.mark.parametrize('source_drift', [False, True])
 @pytest.mark.parametrize('stale_lifted', [False, True])
 def test_inventory_refresh_validates_c_without_erasing_its_lifted_baseline(sandbox, monkeypatch, source_drift, stale_lifted):
