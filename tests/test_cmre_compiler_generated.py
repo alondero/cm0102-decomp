@@ -33,3 +33,11 @@ def test_coverage_reports_compiler_generated_separately():
     summary = queue.coverage_summary()
     assert summary["compiler_generated_functions"] > 3000
     assert summary["compiler_generated_body_bytes"] > 0
+
+
+def test_classification_requires_image_metadata():
+    # Reads its caller's EBP but is in no unwind map or scope table and is never referenced.
+    assert queue.compiler_generated(0x009452B2) is None
+    # Null-filter entries of `_except_handler3` scope tables, not C++ unwind actions.
+    assert queue.compiler_generated(0x00946323) == "seh-finally"
+    assert queue.compiler_generated(0x00946419) == "seh-finally"

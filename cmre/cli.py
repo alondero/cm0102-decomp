@@ -71,7 +71,7 @@ def cmd_status(a) -> int:
               f"{s['recovered_body_bytes']}/{s['inventory_body_bytes']} body bytes ({s['recovered_percent']}%)")
         print(f"  legacy {s['legacy_functions']}  lifted {s['lifted_functions']}  c-tier {s['c_tier_functions']}  "
               f"blocked {s['blocked_functions']}  integrated {s['integrated_functions']}")
-        print(f"  compiler-generated (unwind funclets, import thunks; outside the C queue) "
+        print(f"  compiler-generated (metadata-proven funclets and import thunks; outside the C queue) "
               f"{s['compiler_generated_functions']} functions, {s['compiler_generated_body_bytes']} bytes")
         if s['source_unmapped_functions']:
             print(f"  {s['source_unmapped_functions']} accepted C/legacy functions absent from inventory; "
@@ -628,6 +628,8 @@ def main(argv=None) -> int:
     lift_migration.add_commands(sub)
     from . import shards
     shards.add_commands(sub)
+    from . import boundaries
+    boundaries.add_commands(sub)
     from . import publication
     publication.add_commands(sub)
     a = p.parse_args(argv)

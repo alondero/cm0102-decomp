@@ -31,8 +31,10 @@ class Inventory:
     def next_entry_after(self, va: int) -> int:
         import bisect
 
+        from . import image
+
         i = bisect.bisect_right(self.entries_sorted, va)
-        return self.entries_sorted[i] if i < len(self.entries_sorted) else env.IMAGE_BASE + 0x566000
+        return self.entries_sorted[i] if i < len(self.entries_sorted) else image.primary().text.end
 
 
 def _check_pins() -> None:

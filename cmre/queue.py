@@ -52,14 +52,20 @@ def frontier(limit: int = 10, max_bytes: int | None = None, min_bytes: int = 0, 
     return items[:limit]
 
 
-@functools.cache
 def compiler_generated(va: int) -> str | None:
-    """`unwind-funclet`, `import-thunk`, or None for code a C translation owns.
+    """`unwind-funclet`, `seh-finally`, `import-thunk`, or None for code a C translation owns.
 
-    An unwind funclet uses EBP as a memory base before setting EBP: it runs in its
-    parent's frame and is regenerated when the parent's C++ is recovered. A thunk
-    is a single indirect JMP through an import slot.
+    Only image metadata proves the kind (`cmre.generated`); `generated_shape` is the
+    unproven shape heuristic, kept to report entries whose shape and proof disagree.
     """
+    from . import generated
+
+    return generated.kind(va)
+
+
+@functools.cache
+def generated_shape(va: int) -> str | None:
+    """Shape heuristic: EBP used as a memory base before being set, or one import JMP."""
     f = inventory.load().functions.get(va)
     if f is None or f.body_bytes > GENERATED_MAX_BYTES:
         return None

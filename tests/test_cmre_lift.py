@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from cmre import build, env, image, lift
+from cmre import build, env, image, inventory, lift
 
 
 @pytest.fixture
@@ -63,3 +63,13 @@ def test_problems_block_instead_of_guessing():
 
 def test_render_is_deterministic():
     assert lift.render(lift.discover(0x00449590)) == lift.render(lift.discover(0x00449590))
+
+
+def test_last_inventory_entry_region_ends_at_text_end():
+    # 0x009660D0 is the last pinned entry; .text ends at 0x00967000, not image base + 0x566000.
+    inv = inventory.load()
+    last = inv.entries_sorted[-1]
+    assert last == 0x009660D0
+    assert inv.next_entry_after(last) == image.primary().text.end == 0x00967000
+    lifted = lift.discover(last)
+    assert lifted.instruction_bytes == inv.functions[last].body_bytes, lifted.problems
