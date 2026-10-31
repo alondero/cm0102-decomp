@@ -1,0 +1,56 @@
+#include "cmre.h"
+
+/* Preferred-image VA 0x00601880, base 0x00400000, CM0102 3.9.68.
+   SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+   Load the key once before the fifty-entry loop. The result replaces only AL,
+   retaining the address high bytes (or the diagnostic reporter's high bytes). */
+extern u32 CM_CDECL cm_fn_00944cff(u32, u32, u32, void *, void *);
+extern char *CM_CDECL cm_fn_0090d130(void);
+extern u32 CM_CDECL cm_fn_00944c9f(u32, u32, ...);
+extern u32 CM_CDECL cm_fn_005e8290(const char *, const char *, u32);
+#define D(a) (*(volatile u32 *)(u32)(a))
+#define W(a) (*(volatile u16 *)(u32)(a))
+#define B(a) (*(volatile u8 *)(u32)(a))
+
+u32 CM_THISCALL cm_fn_00601880(u32 self, u32 key, u32 person)
+{
+    u8 scratch[512];
+    u32 filename = (u32)scratch, extension = (u32)scratch + 256;
+    u32 line, index, value, count, base, slot, table, result, column;
+    char *version;
+    if (!person) {
+        index = (u32)(s32)(s16)W(0x00b77c7a);
+        person = D(0x00b74c26 + index * 768u);
+        if (!person) {
+            filename = (u32)scratch + 256; extension = (u32)scratch;
+            line = 0xd2a;
+            goto error;
+        }
+    }
+    value = D(person);
+    count = D(0x00ae2364);
+    index = value - count + 16u;
+    if ((s32)index < 0) { line = 0xd36; goto error; }
+    count = D(self + 4) - 1u;
+    if ((s32)index > (s32)count) { line = 0xd36; goto error; }
+    if (!key) { line = 0xd3d; goto error; }
+    base = D(self);
+    slot = B(base + index * 42735u + 0x9a69);
+    if (slot == 1) slot = 0;
+    slot = (u32)(s32)(s8)slot;
+    result = base + slot * 7885u;
+    table = result + index * 42735u + 0x1e05;
+    value = D(key);
+    result &= 0xffffff00u;
+    for (column = 0; column < 50; ++column) {
+        if (D(table + column * 4u) == value) return result | column;
+    }
+    return result | 0xffu;
+error:
+    cm_fn_00944cff(0x009cf11c, 0, 0, (void *)filename, (void *)extension);
+    version = cm_fn_0090d130();
+    cm_fn_00944c9f(0x00ae24d0, 0x009870e8, version, filename, extension, line);
+    result = cm_fn_005e8290((const char *)0x009870e0, (const char *)0x00ae24d0, 0);
+    D(0x00b67a34) = 0;
+    return result | 0xffu;
+}

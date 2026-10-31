@@ -1,0 +1,72 @@
+/* Faithful C translation for preferred-image VA 0x0081b0e0 (pinned image base 0x00400000). */
+#include "cmre.h"
+
+u8 CM_CDECL cm_fn_0081b0e0(u32 mask, u32 selector)
+{
+    if (mask == 0x1u && selector == 0) return 0;
+    if (mask == 0x2u && selector == 0) return 1;
+    if (mask == 0x4u && selector == 0) return 2;
+    if (mask == 0x8u && selector == 0) return 3;
+    if (mask == 0x10u && selector == 0) return 4;
+    if (mask == 0x20u && selector == 0) return 5;
+    if (mask == 0x40u && selector == 0) return 6;
+    if (mask == 0x80u && selector == 0) return 7;
+    if (mask == 0x100u && selector == 0) return 8;
+    if (mask == 0x200u && selector == 0) return 9;
+    if (mask == 0x400u && selector == 0) return 10;
+    if (mask == 0x800u && selector == 0) return 11;
+    if (mask == 0x1000u && selector == 0) return 12;
+    if (mask == 0x2000u && selector == 0) return 13;
+    if (mask == 0x4000u && selector == 0) return 14;
+    if (mask == 0x8000u && selector == 0) return 15;
+    if (mask == 0x10000u && selector == 0) return 16;
+    if (mask == 0x20000u && selector == 0) return 17;
+    if (mask == 0x40000u && selector == 0) return 18;
+    if (mask == 0x80000u && selector == 0) return 19;
+    if (mask == 0x100000u && selector == 0) return 20;
+    if (mask == 0x200000u && selector == 0) return 21;
+    if (mask == 0x400000u && selector == 0) return 22;
+    if (mask == 0x800000u && selector == 0) return 23;
+    if (mask == 0x1000000u && selector == 0) return 24;
+    if (mask == 0x2000000u && selector == 0) return 25;
+    if (mask == 0x4000000u && selector == 0) return 26;
+    if (mask == 0x8000000u && selector == 0) return 27;
+    if (mask == 0x10000000u && selector == 0) return 28;
+    if (mask == 0x20000000u && selector == 0) return 29;
+    if (mask == 0x40000000u && selector == 0) return 30;
+    if (mask == 0x80000000u && selector == 0) return 31;
+    if (mask == 0 && selector == 0x1u) return 32;
+    if (mask == 0 && selector == 0x2u) return 33;
+    if (mask == 0 && selector == 0x4u) return 34;
+    if (mask == 0 && selector == 0x8u) return 35;
+    if (mask == 0 && selector == 0x10u) return 36;
+    if (mask == 0 && selector == 0x20u) return 37;
+    if (mask == 0 && selector == 0x40u) return 38;
+    if (mask == 0 && selector == 0x80u) return 39;
+    if (mask == 0 && selector == 0x100u) return 40;
+    if (mask == 0 && selector == 0x200u) return 41;
+    if (mask == 0 && selector == 0x400u) return 42;
+    if (mask == 0 && selector == 0x800u) return 43;
+    if (mask == 0 && selector == 0x1000u) return 44;
+    if (mask == 0 && selector == 0x2000u) return 45;
+    if (mask == 0 && selector == 0x4000u) return 46;
+    if (mask == 0 && selector == 0x8000u) return 47;
+    if (mask == 0 && selector == 0x10000u) return 48;
+    if (mask == 0 && selector == 0x20000u) return 49;
+    if (mask == 0 && selector == 0x40000u) return 50;
+    if (mask == 0 && selector == 0x80000u) return 51;
+    if (mask == 0 && selector == 0x100000u) return 52;
+    if (mask == 0 && selector == 0x200000u) return 53;
+    if (mask == 0 && selector == 0x400000u) return 54;
+    if (mask == 0 && selector == 0x800000u) return 55;
+    if (mask == 0 && selector == 0x1000000u) return 56;
+    if (mask == 0 && selector == 0x2000000u) return 57;
+    if (mask == 0 && selector == 0x4000000u) return 58;
+    if (mask == 0 && selector == 0x8000000u) return 59;
+    if (mask == 0 && selector == 0x10000000u) return 60;
+    if (mask == 0 && selector == 0x20000000u) return 61;
+    if (mask == 0 && selector == 0x40000000u) return 62;
+    if (mask == 0 && selector == 0x80000000u) return 63;
+    if (mask == 0x80000000u && selector == 3) return 0x40;
+    return 0xff;
+}

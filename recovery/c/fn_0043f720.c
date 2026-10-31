@@ -1,0 +1,1 @@
+/* WIP: VA 0x0043F720 calls __ftol at 0x0043F759 and 0x0043F770 with a live ST0 value. The plain-C boundary has no way to pass that x87 value into the original helper without changing behavior. No test has been run. */

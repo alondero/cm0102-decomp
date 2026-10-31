@@ -422,6 +422,52 @@ def write_receipt(directory: Path, commit: str, findings, index: OriginalIndex, 
     return path
 
 
+MANIFEST = "STATUS.tsv"
+
+
+def manifest_rows(c_dir: Path, ledger_dir: Path, index: OriginalIndex) -> list[tuple[str, str, str]]:
+    """(function, status, sha256) for each recovered C file that may be published.
+
+    Accepted means the local ledger accepted exactly these bytes; wip means the
+    file is not accepted (held, work in progress or unrecorded). Files with
+    original instruction listings or bytes, and accepted files whose bytes differ
+    from the accepted hash, are left out and stay local. The ledger's names and
+    module paths are never written to the manifest.
+    """
+    rows = []
+    for source in sorted(Path(c_dir).glob("fn_*.c")):
+        data = source.read_bytes()
+        if scan_blob(env.rel(source), data, index):
+            continue
+        function, digest = source.stem, hashlib.sha256(data).hexdigest()
+        ledger = Path(ledger_dir) / f"{function}.json"
+        accepted = json.loads(ledger.read_text(encoding="utf-8")).get("c") if ledger.exists() else None
+        if accepted is None:
+            rows.append((function, "wip", digest))
+        elif accepted.get("source_sha256") == digest:
+            rows.append((function, "accepted", digest))
+    return rows
+
+
+def write_manifest(path: Path, rows) -> None:
+    lines = ["function\tstatus\tsha256"] + [f"{function}\t{status}\t{digest}" for function, status, digest in rows]
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+
+def manifest_command(a) -> int:
+    index = OriginalIndex.build()
+    source = Path(a.source) if a.source else env.ROOT
+    c_dir = source / "recovery/c"
+    rows = manifest_rows(c_dir, source / "recovery/ledger", index)
+    out = Path(a.out) if a.out else c_dir / MANIFEST
+    write_manifest(out, rows)
+    published = {status: sum(1 for _, s, _ in rows if s == status) for status in ("accepted", "wip")}
+    total = len(list(c_dir.glob("fn_*.c")))
+    print(f"wrote {env.rel(out)}: {published['accepted']} accepted, {published['wip']} wip; "
+          f"{total - len(rows)} function file(s) kept local")
+    return 0
+
+
 def command(a) -> int:
     index = OriginalIndex.build()
     print(f"index: {len(index.files)} supplied files, {len(index.values)} blocks, identity {index.identity()[:12]}")
@@ -472,3 +518,7 @@ def add_commands(sub) -> None:
     s.add_argument("ref")
     s.add_argument("--remote", default="origin")
     s.set_defaults(func=verify_remote)
+    s = actions.add_parser("manifest", help="write recovery/c/STATUS.tsv: accepted and wip functions that may be published")
+    s.add_argument("--source", help="checkout whose recovery/c and ledger are read (default: this checkout)")
+    s.add_argument("--out", help="manifest file to write (default: recovery/c/STATUS.tsv beside the sources)")
+    s.set_defaults(func=manifest_command)

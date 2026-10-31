@@ -6,3 +6,10 @@ docs/STATUS.md text eol=lf
 *.py text eol=lf
 *.c text eol=lf
 *.md text eol=lf
+# Accepted recovered C is hashed byte-for-byte; never normalise its line endings.
+recovery/c/** -text -eol
+# Frozen legacy sources are hashed byte-for-byte by their records.
+recovery/lang/** -text -eol
+recovery/date/** -text -eol
+recovery/crt/** -text -eol
+recovery/rng/** -text -eol

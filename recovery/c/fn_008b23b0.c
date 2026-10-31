@@ -1,0 +1,34 @@
+#include "cmre.h"
+/* Preferred-image VA 0x008b23b0, base 0x00400000, CM0102 3.9.68;
+   SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86. */
+extern u32 CM_THISCALL cm_fn_008b4cd0(u32, u32);
+extern u32 CM_THISCALL cm_fn_008b2880(u32, u32, u32);
+extern u32 CM_CDECL cm_fn_00944cff(u32, u32, u32, u32, u32);
+extern u32 CM_CDECL cm_fn_0090d130(void);
+extern u32 CM_CDECL cm_fn_00944c9f(u32, u32, ...);
+extern u32 CM_CDECL cm_fn_005e8290(u32, u32, u32);
+
+u32 CM_THISCALL cm_fn_008b23b0(u32 self, u32 value, u32 source)
+{
+    volatile u8 scratch[0x200];
+    u32 destination = cm_fn_008b4cd0(self, value);
+    u32 result, text, i, club;
+    if (destination == 0) {
+        cm_fn_00944cff(0x00a8ccd0, 0, 0,
+                       (u32)(scratch + 0x100), (u32)scratch);
+        text = cm_fn_0090d130();
+        cm_fn_00944c9f(0x00ae24d0, 0x009870e8, text,
+                       (u32)(scratch + 0x100), (u32)scratch, 0x31a);
+        result = cm_fn_005e8290(0x009870e0, 0x00ae24d0, 0);
+        CM_GLOBAL(volatile u32, 0x00b67a34) = 0;
+        return result;
+    }
+    for (i = 0; i != 13; ++i) {
+        *(volatile u32 *)destination = *(volatile u32 *)source;
+        source += 4u;
+        destination += 4u;
+    }
+    *(volatile u16 *)destination = *(volatile u16 *)source;
+    club = *(volatile u32 *)(value + 0x39u);
+    return cm_fn_008b2880(self, club, value);
+}

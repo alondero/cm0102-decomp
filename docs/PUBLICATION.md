@@ -72,7 +72,9 @@ These are intentionally absent from the repository:
 | `local/fixtures/` | Retained original-derived test inputs. |
 | `recovery/ledger`, `lifted`, `blocked`, `hints` | Generated records holding original instructions and evidence. |
 | `recovery/lang`, `date`, `crt`, `rng` ledgers, tests and `cm_rng.dll` | Frozen legacy records with embedded original bytes; their clean sources are published separately. |
-| 106 `recovery/c` files with inline original instruction streams | Not authored translation. |
+| 71 accepted `recovery/c` function files with inline original instruction streams | Not authored translation; the scanner reports them as `instruction-listing`. |
+| `recovery/c/contracts/`, `recovery/c/tasks/` | Worker job files holding original bytes and prompts. |
+| `docs/NEXT-SESSION-PROMPT.md`, `.claude/settings.local.json`, `.agents/hooks.json` | Session state and personal tool endpoints. |
 
 ## Clean same-machine setup
 
@@ -100,7 +102,22 @@ forbids junctioning the whole recovery directory. Until it lands:
 | Batch | State |
 |---|---|
 | Publication scanner, guard push gate, `cmre` harness, tests, scripts, `cmre.h` | Published in this batch. Files with uncommitted work from other sessions were held back and will follow from those sessions. |
-| Agent workflow (`AGENTS.md`, `CLAUDE.md`, `docs/agent`, skills and agents) | Next batch. |
-| Accepted plain C in `recovery/c` with a status manifest | Pending review; excludes the 106 inline-instruction files and marks held and WIP sources. Six of the seven files published earlier are byte-identical to their accepted sources. `fn_00945956.c` was withdrawn: its accepted bytes end in a stray CRLF that `eol=lf` normalisation changes, so it returns after an LF-clean re-acceptance. |
-| Clean legacy sources (`recovery/lang`, `date`, `crt`, `rng`) | Pending review; ledgers, byte-bearing tests and `cm_rng.dll` stay local. |
-| Other `docs/` | Pending review against the game-text rule. |
+| Agent workflow (`AGENTS.md`, `CLAUDE.md`, `docs/agent`, `.claude/agents`, `.claude/skills`, `.agents/skills`) | Published. Local settings and hook endpoints stay local. |
+| Accepted plain C in `recovery/c` with a status manifest | Published: 3,200 accepted functions and 296 WIP or held functions, each listed in `recovery/c/STATUS.tsv` with its status and the hash of its exact bytes. The 71 accepted functions with inline instruction listings stay local. Worker `contracts/` and `tasks/` folders stay local. |
+| Clean legacy sources (`recovery/lang`, `date`, `crt`, `rng`) | Published: 46 `.c`, `.h`, `.S` and `.inc` files that pass the scanner. Ledgers, byte-bearing tests and `cm_rng.dll` stay local. |
+| Other `docs/` | Published after the scanner and a search for machine-specific paths. Personal paths were replaced with placeholders, and `NEXT-SESSION-PROMPT.md` stays local. |
+
+### Exact bytes for recovered C
+
+`.gitattributes` stores `recovery/c/**` byte-for-byte (`-text -eol`). Accepted
+hashes cover the exact file bytes, and 572 accepted functions use CRLF line
+endings, so line-ending normalisation would make the published copy differ from
+what was accepted. This is why `fn_00945956.c` was withdrawn in the earlier batch
+and returns in this one without re-acceptance.
+
+### Status manifest
+
+`py -3.13 -m cmre publication manifest` writes `recovery/c/STATUS.tsv` with three
+columns: function, status (`accepted` or `wip`) and the SHA-256 of the published
+bytes. It scans each file first, so a file with original instructions is left
+out. The ledger's names and module paths are never written to it.
