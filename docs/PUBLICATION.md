@@ -78,13 +78,13 @@ These are intentionally absent from the repository:
 
 ## Clean same-machine setup
 
-A fresh clone holds the tooling but none of the local inputs. Measured on
-2026-10-30 by cloning this batch and linking only `CM0102/` and `local/` from
-the authoritative checkout: collection succeeds and the scanner, guard and
-hermetic harness tests pass, but tests that read live records fail for lack of
-`recovery/c` sources, `recovery/registry.json` and `recovery/ledger` records.
-Those, with `recovery/lifted`, `blocked`, `hints` and the legacy records, are
-the remaining local inputs.
+A fresh clone holds the tooling and the published sources but none of the local
+inputs. Measured on 2026-10-31 by cloning `origin/main` and linking only
+`CM0102/` and `local/` from the authoritative checkout: the full suite runs
+with 1,218 tests passing and 17 failing. Every failure needs a live record that
+is not published: `recovery/ledger`, `recovery/lifted`, `recovery/hints` or
+`recovery/registry.json`. Those, with `recovery/blocked` and the legacy ledgers,
+are the remaining local inputs.
 
 Linking writable records from the authoritative checkout into a clone would
 split claims, failure counts and acceptance state. Providing them with pinned
