@@ -12,11 +12,20 @@ from . import coordination, env, ledger, validation as v
 
 @contextmanager
 def copied_workspace(root: Path, vas: list[int]):
-    names = ('ROOT', 'ANALYSIS', 'RUNS', 'C_DIR', 'LIFTED_DIR', 'HINTS_DIR', 'LEDGER_DIR')
+    names = ('ROOT', 'ANALYSIS', 'RUNS', 'C_DIR', 'LIFTED_DIR', 'HINTS_DIR', 'LEDGER_DIR', 'REGISTRY')
     original = {name: getattr(env, name) for name in names}
     root.mkdir(parents=True)
     shutil.copytree(env.ROOT / 'recovery/include', root / 'recovery/include')
     try:
+        # Coverage reads the frozen legacy records too. Copy their metadata so
+        # counts describe this isolated workspace without junctioning recovery.
+        legacy = [env.REGISTRY, *(env.ROOT / name for name in ledger.registry()['current'])]
+        for source in legacy:
+            relative = source.resolve().relative_to(env.ROOT.resolve())
+            destination = root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        env.REGISTRY = root / original['REGISTRY'].resolve().relative_to(original['ROOT'].resolve())
         for name, directory, suffix in [('C_DIR', 'c', '.c'), ('LIFTED_DIR', 'lifted', '.S'),
                                         ('HINTS_DIR', 'hints', '.json'), ('LEDGER_DIR', 'ledger', '.json')]:
             target = root / 'recovery' / directory

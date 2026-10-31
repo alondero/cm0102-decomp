@@ -457,7 +457,8 @@ def cmd_revalidate(a) -> int:
             return _legacy_revalidate(a)
     vas = [e.va for e in ledger.cmre_entries()][:a.n]
     data = validation.plan(vas, refresh=a.refresh,
-                           reuse=a.resume or a.reuse, audit=a.audit, compatibility=a.compatibility)
+                           resume=a.resume, reuse=a.reuse, retry_failed=a.retry_failed,
+                           audit=a.audit, compatibility=a.compatibility)
     if a.plan:
         if a.output:
             from . import coordination

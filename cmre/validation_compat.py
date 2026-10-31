@@ -91,7 +91,7 @@ def create(before_path: Path, after_path: Path, regression: Path, reviewer: str,
     selection = [f'{e.va:08x}' for e in entries]
     if before['functions'] != selection or after['functions'] != selection:
         raise ValueError('Compatibility review must cover the complete accepted inventory')
-    tiers = {f'{e.va:08x}-{tier}' for e in entries
+    tiers = {str(validation.TierKey(e.va, tier)) for e in entries
              for tier in (('lifted', 'c') if e.record.get('c') else ('lifted',))}
     if set(after['items']) != tiers:
         raise ValueError('Compatibility plan must cover every accepted tier')

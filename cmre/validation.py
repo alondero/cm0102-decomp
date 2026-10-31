@@ -5,6 +5,7 @@ records alone. Old evidence keeps its original execution identity and location.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import functools
 import json
 import os
@@ -13,13 +14,46 @@ import re
 import time
 import uuid
 
-from . import coordination, difftest, env, ledger, recover
+from . import coordination, difftest, env, ledger, queue, recover
 
 SCHEMA = 'cmre-validation/2'
 BUILD_ENVIRONMENT = ('CPATH', 'C_INCLUDE_PATH', 'CPLUS_INCLUDE_PATH', 'GCC_EXEC_PREFIX',
                      'COMPILER_PATH', 'LIBRARY_PATH', 'SOURCE_DATE_EPOCH', 'GCC_COMPARE_DEBUG',
                      'DEPENDENCIES_OUTPUT', 'SUNPRO_DEPENDENCIES')
 LOCAL_IDENTITY_FIELDS = {'components', 'planner', 'dispatch_sources', 'workspace', 'build_environment'}
+COUNT_KEYS = ('inventory_functions', 'inventory_body_bytes', 'legacy_functions', 'legacy_body_bytes',
+              'source_functions', 'source_body_bytes', 'c_tier_functions', 'c_tier_body_bytes',
+              'lifted_functions', 'recovered_functions', 'recovered_body_bytes', 'integrated_functions')
+
+
+@dataclass(frozen=True)
+class TierKey:
+    va: int
+    tier: str
+
+    def __post_init__(self):
+        if not 0 <= self.va <= 0xffffffff or self.tier not in {'lifted', 'c'}:
+            raise ValueError('Expected a 32-bit function VA and lifted/c tier')
+
+    def __str__(self) -> str:
+        return f'{self.va:08x}-{self.tier}'
+
+    @property
+    def function(self) -> str:
+        return f'fn_{self.va:08x}'
+
+    @classmethod
+    def parse(cls, value: str) -> TierKey:
+        match = re.fullmatch(r'([0-9a-f]{8})-(lifted|c)', value)
+        if not match:
+            raise ValueError('Invalid validation tier key')
+        return cls(int(match[1], 16), match[2])
+
+
+def coverage_counts() -> dict:
+    """Actual whole-workspace recovery/integration counts, separate from selection."""
+    coverage = queue.coverage_summary()
+    return {key: coverage[key] for key in COUNT_KEYS}
 
 
 def digest(value) -> str:
@@ -72,7 +106,7 @@ def worker_identity() -> dict:
     return global_identity()
 
 
-def _file(path: Path) -> str | None:
+def _file_digest(path: Path) -> str | None:
     return env.digest(path) if path.is_file() else None
 
 
@@ -111,7 +145,7 @@ def snapshot(va: int, tier: str, previous: dict | None = None, *, execution: dic
     options = effective_options(va, tier)
     source = (env.C_DIR / f'fn_{va:08x}.c' if tier == 'c'
               else env.LIFTED_DIR / f'fn_{va:08x}.S')
-    source_hash = _file(source)
+    source_hash = _file_digest(source)
     if source_hash is None:
         raise ValueError(f'Missing accepted {tier} source: {source}')
     accepted = {k: record[tier].get(k) for k in ('source_sha256', 'run_key', 'harness_sha256')}
@@ -128,7 +162,7 @@ def snapshot(va: int, tier: str, previous: dict | None = None, *, execution: dic
         prior = (previous or {}).get('build', {}) or _accepted_build(va, record[tier], execution)
         files = prior.get('files', {})
         if (files and (previous is None or previous.get('include_members') == members)
-                and all(_file(env.ROOT / name) == sha for name, sha in files.items())
+                and all(_file_digest(env.ROOT / name) == sha for name, sha in files.items())
                 and files.get(env.rel(source)) == source_hash and _cacheable_build(files)):
             dependencies = prior
         else:
@@ -209,9 +243,14 @@ def accepted_report(va: int, tier: str, dependencies: dict, execution: dict) -> 
 
 
 def plan(vas: list[int], *, refresh: bool = False, reuse: str | None = None,
+         resume: str | None = None, retry_failed: bool = False,
          audit: bool = False, compatibility: str | None = None) -> dict:
     started = time.monotonic()
-    path, prior = _prior(reuse)
+    if resume and reuse:
+        raise ValueError('Select either resume or reuse')
+    if retry_failed and not resume:
+        raise ValueError('Retry failed requires an explicit resume receipt')
+    path, prior = _prior(resume or reuse)
     identity = global_identity()
     execution = {k: v for k, v in identity.items() if k not in LOCAL_IDENTITY_FIELDS}
     execution['headers'] = {env.rel(p): env.digest(p) for p in sorted((env.ROOT / 'recovery/include').rglob('*')) if p.is_file()}
@@ -229,7 +268,7 @@ def plan(vas: list[int], *, refresh: bool = False, reuse: str | None = None,
     for va in vas:
         record = read(ledger.record_path(va))
         for tier in ('lifted', 'c') if record.get('c') else ('lifted',):
-            key = f'{va:08x}-{tier}'
+            key = str(TierKey(va, tier))
             old = prior.get('results', {}).get(key, {})
             adopted = None
             reason = []
@@ -255,12 +294,18 @@ def plan(vas: list[int], *, refresh: bool = False, reuse: str | None = None,
             if current != before:
                 reason.extend('changed ' + k for k in sorted(set(before) | set(current or {}))
                               if before.get(k) != (current or {}).get(k))
+            action = 'execute' if reason else 'reuse'
+            if old.get('ok') is False and not retry_failed and not audit:
+                action = 'retain-failure'
+                reason.append('previous failure retained; use --resume with --retry-failed to retry')
             items[key] = {'va': va, 'tier': tier, 'dependencies': current,
-                          'action': 'execute' if reason else 'reuse', 'reasons': reason,
+                          'action': action, 'reasons': reason,
                           'previous': old or None,
                           'estimated_seconds': old.get('elapsed_seconds')}
     composed = composition_impact(items, identity)
     return {'schema': SCHEMA, 'kind': 'revalidate', 'identity': identity, 'refresh': refresh,
+            'retry_failed': retry_failed, 'resume_from': str(path) if resume else None,
+            'counts': coverage_counts(), 'counts_scope': 'whole accepted workspace; independent of validation selection',
             'functions': [f'{va:08x}' for va in vas], 'items': items,
             'reuse_from': str(path) if path else None,
             'compatibility': ({'path': str(Path(compatibility).resolve()), 'sha256': env.digest(Path(compatibility))}
@@ -274,7 +319,7 @@ def plan(vas: list[int], *, refresh: bool = False, reuse: str | None = None,
 def composition_impact(items: dict, identity: dict) -> list[dict]:
     """Account for recorded compositions without representing single-C as composed proof."""
     result = []
-    changed = {'fn_' + k.split('-')[0] for k, v in items.items() if v['action'] == 'execute'}
+    changed = {TierKey.parse(k).function for k, v in items.items() if v['action'] == 'execute'}
     for path in sorted((env.ANALYSIS / 'cmre/compositions').glob('*.json')):
         try:
             report = read(path)
@@ -288,13 +333,13 @@ def composition_impact(items: dict, identity: dict) -> list[dict]:
             if report.get('composition_sha256') != env.digest(Path(__file__).with_name('composition.py')):
                 reasons.append('composition implementation changed or unknown')
             for name, sha in report.get('source_sha256', {}).items():
-                if _file(env.C_DIR / name) != sha:
+                if _file_digest(env.C_DIR / name) != sha:
                     reasons.append('changed member source ' + name)
             if not report.get('source_dependencies') or not report.get('options'):
                 reasons.append('composition dependency coverage unavailable')
             for build_inputs in report.get('source_dependencies', {}).values():
                 for name, sha in build_inputs.get('files', {}).items():
-                    if _file(env.ROOT / name) != sha:
+                    if _file_digest(env.ROOT / name) != sha:
                         reasons.append('changed composed build input ' + name)
             for function, options in report.get('options', {}).items():
                 if difftest.Options.for_function(int(function.removeprefix('fn_'), 16), tier='c').__dict__ != options:
@@ -311,7 +356,9 @@ def summary(data: dict) -> dict:
     items = data['items']
     results = data.get('results', {})
     return {'selected_functions': len(data['functions']), 'selected_tiers': len(items),
+            'counts': data.get('counts'), 'counts_scope': data.get('counts_scope', 'not recorded in this historical receipt'),
             'reused': sum(v['action'] == 'reuse' for v in items.values()),
+            'retained_failures': sum(v['action'] == 'retain-failure' for v in items.values()),
             'execute': sum(v['action'] == 'execute' for v in items.values()),
             'passed': 0 if data.get('identity_drift') else sum(v['ok'] for v in results.values()),
             'failed': sum(not v['ok'] for v in results.values()),
@@ -384,9 +431,10 @@ def execute(item: dict, identity: dict | str, refresh: bool) -> dict:
 class Run:
     def __init__(self, data: dict):
         self.path = env.ANALYSIS / 'cmre/jobs' / f'{time.time_ns()}-revalidate-{uuid.uuid4().hex[:8]}.json'
-        self.data = {**data, 'state': 'running', 'started': time.time(), 'results': {}}
+        self.data = {**data, 'state': 'running', 'started': time.time(), 'results': {},
+                     'counts_before': dict(data['counts'])}
         for key, item in data['items'].items():
-            if item['action'] == 'reuse':
+            if item['action'] in {'reuse', 'retain-failure'}:
                 # Keep the result's original identity; the new plan records why
                 # reuse is allowed. Never replace an old hash with a new one.
                 self.data['results'][key] = item['previous']
@@ -421,5 +469,6 @@ class Run:
             self.data['identity_drift'] = True
             self.data['state'] = 'incomplete'
         self.data['ended'] = time.time()
+        self.data['counts'] = coverage_counts()
         self.data['summary'] = summary(self.data)
         self.save()

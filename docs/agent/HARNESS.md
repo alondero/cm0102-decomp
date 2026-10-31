@@ -47,8 +47,12 @@
    the supervised run and does not replace the whole inventory gate. The refresh
    job independently validates each C tier and preserves its lifted baseline.
    Default revalidation reuses the latest dependency-aware receipt. Use `--reuse
-   RECEIPT` to choose one explicitly; `--resume RECEIPT --retry-failed` also works
-   and preserves interrupted completions and all original failures. Schema-2
+   RECEIPT` to choose one explicitly. `--resume RECEIPT` executes pending or
+   invalidated successful tiers and retains completed failures without retrying
+   them; the command remains failing while any retained failure is present.
+   Add `--retry-failed` to explicitly execute failed tiers while retaining matching
+   successes and original receipts. `--audit` explicitly reruns the whole selection,
+   including previous failures. Schema-2
    receipts retain their original strict `--resume` contract. Migration can reuse
    an accepted tier's current run report only after recomputing its exact key
    from execution identity, effective options, source and selected build inputs.
@@ -61,6 +65,11 @@
    retaining original hint/report paths instead of copying large corpora into
    every item. Schema-1 prototype validation receipts remain local history;
    schema-2 can migrate exact current accepted run reports without executing them.
+   Plans and final receipts include numeric whole-workspace `counts` for accepted
+   C/legacy functions and bytes, lifted/inclusive recovery and live integration.
+   These are independent of the selected validation tiers. Final receipts retain
+   `counts_before` and a fresh closing `counts` snapshot. Historical receipts that
+   lack counts report unknown values rather than inventing zeroes.
    Compiler environment and workspace changes invalidate reuse. Volatile macros,
    computed macro names and external include-availability tests are preprocessed
    again; unchanged source hashes alone do not prove their generated inputs.
@@ -98,6 +107,9 @@ build. The AST guard permits only hint selection/validation and tier dispatch;
 changed comparison, RNG generation, thresholds, emulation or other execution code
 rejects compatibility. Changed effective inputs/builds remain selected for execution.
 Unknown transitions use a full sweep. Retain both original receipts.
+The allowed AST transformations intentionally describe this proven dispatch lane;
+extending the grammar requires its own equivalence evidence and regressions.
+Generalizing arbitrary AST rewrites would broaden the evidence claim without proof.
 
 ## Reusing full pytest
 

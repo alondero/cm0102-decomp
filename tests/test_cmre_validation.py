@@ -1,15 +1,21 @@
 """Impact selection and reuse must save work without hiding changed evidence."""
 import copy
 import json
-from pathlib import Path
 
 import pytest
 
-from cmre import env, ledger, recover, validation as v, validation_compat as compat
+from cmre import env, ledger, queue, recover, validation as v, validation_compat as compat
 
 
 @pytest.fixture
 def corpus(tmp_path, monkeypatch):
+    monkeypatch.setattr(queue, 'coverage_summary', lambda: {
+        'inventory_functions': 2, 'inventory_body_bytes': 20,
+        'legacy_functions': 0, 'legacy_body_bytes': 0,
+        'source_functions': 2, 'source_body_bytes': 20,
+        'c_tier_functions': 2, 'c_tier_body_bytes': 20,
+        'lifted_functions': 2, 'recovered_functions': 2,
+        'recovered_body_bytes': 20, 'integrated_functions': 0})
     monkeypatch.setattr(env, 'ROOT', tmp_path)
     monkeypatch.setattr(env, 'ANALYSIS', tmp_path / 'analysis')
     for name, suffix in [('C_DIR', 'c'), ('HINTS_DIR', 'hints'), ('LIFTED_DIR', 'lifted'), ('LEDGER_DIR', 'ledger')]:
@@ -161,7 +167,7 @@ def test_interruption_reuses_completed_success_retains_failures(corpus, monkeypa
     assert selected(again) == set(plan['items']) - {key}
     failed = complete(again, monkeypatch, fail='00000002-c')
     before = failed.path.read_bytes()
-    retry = v.plan([1, 2], reuse=str(failed.path))
+    retry = v.plan([1, 2], resume=str(failed.path), retry_failed=True)
     assert selected(retry) == {'00000002-c'}
     assert failed.path.read_bytes() == before
     assert retry['items']['00000002-c']['previous']['detail'] == 'mismatch'
@@ -234,15 +240,45 @@ def test_bounded_dispatch_transition_and_material_comparison_near_miss():
         compat.bounded(_identity(old), {**_identity(new), 'components': _identity(new)['components'] | {'emu.py': 'changed'}})
 
 
-def test_issue_23_dispatch_is_bounded():
-    # Exact authored pre/post sources are available in Git; no original game
-    # artifacts or local receipts are embedded in this regression.
+def test_issue_23_dispatch_is_bounded(monkeypatch):
+    # Synthetic authored AST fixtures represent the dispatch and metadata
+    # edits. They work without historical commits, including shallow clones.
     import subprocess
-    root = Path(__file__).resolve().parents[1]
-    old = {n: subprocess.run(['git', 'show', f'2afed72^:cmre/{n}'], cwd=root, capture_output=True, check=True).stdout.decode()
-           for n in ('difftest.py', 'recover.py')}
-    new = {n: (root / 'cmre' / n).read_bytes().decode() for n in old}
-    compat.bounded(_identity(old['difftest.py'], old['recover.py']), _identity(new['difftest.py'], new['recover.py']))
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **kw: pytest.fail('dispatch regression must not read git history'))
+    before_options = '''class Options:
+    @classmethod
+    def for_function(cls, va, overrides=None):
+        hints = load_hints(va)
+        return cls(seed=hints.get('seed', va), hints=hints)
+def validate_hints(hints):
+    allowed = {'seed', 'ecx'}
+    if set(hints) - allowed:
+        raise ValueError('unsupported hints')
+def compare(a, b):
+    return a == b
+'''
+    after_options = before_options.replace(
+        'def for_function(cls, va, overrides=None):',
+        "def for_function(cls, va, overrides=None, *, tier='lifted'):").replace(
+        'hints = load_hints(va)',
+        "hints = load_hints(va)\n        c_hints = hints.pop('c_hints', {})\n        if tier == 'c':\n            hints.update(c_hints)").replace(
+        "{'seed', 'ecx'}", "{'seed', 'ecx', 'c_hints'}")
+    before_recover = '''def test_c(va, overrides=None):
+    options = difftest.Options.for_function(va, overrides)
+    return compare(options)
+def accept(va, tier):
+    initial_options = difftest.Options.for_function(va).__dict__
+    record = {'c': validate(initial_options)}
+    return record
+'''
+    after_recover = before_recover.replace(
+        'for_function(va, overrides)', "for_function(va, overrides, tier='c')").replace(
+        'for_function(va)', 'for_function(va, tier=tier)').replace(
+        '    return record', "    record['hints'] = hint_path\n    return record")
+    compat.bounded(_identity(before_options, before_recover), _identity(after_options, after_recover))
+    with pytest.raises(ValueError, match='comparison'):
+        compat.bounded(_identity(before_options, before_recover),
+                       _identity(after_options.replace('a == b', 'True'), after_recover))
 
 
 def test_reviewed_compatibility_rechecks_complete_scope_and_keeps_original_identity(corpus, monkeypatch):
@@ -298,3 +334,109 @@ def test_plan_cli_executes_no_differentials(corpus, monkeypatch, capsys):
     data = json.loads(capsys.readouterr().out)
     assert data['items']['00000001-c']['action'] == 'execute'
     assert data['items']['00000001-c']['dependencies']['optimizations'] == ['-O0', '-O2']
+
+
+@pytest.mark.parametrize('retry_failed', [False, True])
+def test_cli_resume_requires_explicit_failure_retry(corpus, monkeypatch, capsys, retry_failed):
+    from types import SimpleNamespace
+    from cmre import cli
+
+    first = complete(v.plan([1, 2]), monkeypatch, fail='00000002-c')
+    original = first.path.read_bytes()
+    monkeypatch.setattr(ledger, 'cmre_entries', lambda: [SimpleNamespace(va=va) for va in (1, 2)])
+    args = SimpleNamespace(n=10**9, jobs=1, plan=True, json=True, output=None, refresh=False,
+                           reuse=None, resume=str(first.path), retry_failed=retry_failed,
+                           audit=False, compatibility=None)
+    assert cli.cmd_revalidate(args) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert selected(plan) == ({'00000002-c'} if retry_failed else set())
+    assert plan['items']['00000002-c']['action'] == ('execute' if retry_failed else 'retain-failure')
+    if not retry_failed:
+        run = v.Run(plan)
+        run.finish()
+        assert run.data['results']['00000002-c'] == first.data['results']['00000002-c']
+        assert run.data['summary']['failed'] == 1
+        assert run.data['summary']['pending'] == 0
+        assert run.data['summary']['new_differential_executions'] == 0
+        monkeypatch.setattr(v, 'execute', lambda *a: pytest.fail('resume retried a retained failure'))
+        args.plan = False
+        assert cli.cmd_revalidate(args) == 1
+    assert first.path.read_bytes() == original
+
+
+def test_numeric_coverage_counts_are_snapshots_in_plan_and_final_receipt(corpus, monkeypatch):
+    from cmre import queue
+
+    # Real coverage adapter, with its established ledger/inventory aggregation
+    # supplied at the boundary. Counts describe the whole workspace, not -n.
+    counts = {'inventory_functions': 20, 'inventory_body_bytes': 2000,
+              'legacy_functions': 2, 'legacy_body_bytes': 200,
+              'source_functions': 7, 'source_body_bytes': 700,
+              'c_tier_functions': 5, 'c_tier_body_bytes': 500,
+              'lifted_functions': 12, 'recovered_functions': 14,
+              'recovered_body_bytes': 1400, 'integrated_functions': 3}
+    monkeypatch.setattr(queue, 'coverage_summary', lambda: dict(counts))
+    plan = v.plan([1])
+    assert plan['counts'] == counts
+    assert v.summary(plan)['counts'] == counts
+    run = v.Run(plan)
+    before = dict(counts)
+    counts['integrated_functions'] = 4
+    run.finish()
+    assert run.data['counts_before'] == before
+    assert run.data['counts'] == counts
+    assert v.read(run.path)['summary']['counts']['integrated_functions'] == 4
+
+
+def test_historical_receipts_report_missing_counts_as_unknown(corpus):
+    historical = v.plan([1])
+    historical.pop('counts')
+    historical.pop('counts_scope')
+    result = v.summary(historical)
+    assert result['counts'] is None
+    assert result['counts_scope'] == 'not recorded in this historical receipt'
+
+
+def test_interrupted_resume_keeps_completed_failures_and_runs_only_pending(corpus, monkeypatch):
+    plan = v.plan([1, 2])
+    first = v.Run(plan)
+    monkeypatch.setattr(v, 'execute_item', lambda va, tier, refresh: (va == 1, 'pass' if va == 1 else 'mismatch'))
+    for key in ('00000001-c', '00000002-c'):
+        first.record(key, v.execute(plan['items'][key], plan['identity'], False))
+    original = first.path.read_bytes()
+    resumed = v.plan([1, 2], resume=str(first.path))
+    assert selected(resumed) == {'00000001-lifted', '00000002-lifted'}
+    assert resumed['items']['00000001-c']['action'] == 'reuse'
+    assert resumed['items']['00000002-c']['action'] == 'retain-failure'
+    retry = v.plan([1, 2], resume=str(first.path), retry_failed=True)
+    assert selected(retry) == {'00000001-lifted', '00000002-lifted', '00000002-c'}
+    assert first.path.read_bytes() == original
+
+
+def test_changed_failure_waits_for_retry_while_changed_success_is_invalidated(corpus, monkeypatch):
+    first = complete(v.plan([1, 2]), monkeypatch, fail='00000002-c')
+    for va in (1, 2):
+        (env.HINTS_DIR / f'fn_{va:08x}.json').write_text('{"c_hints": {"ecx": "ptr"}}')
+    resumed = v.plan([1, 2], resume=str(first.path))
+    assert selected(resumed) == {'00000001-c'}
+    assert resumed['items']['00000002-c']['action'] == 'retain-failure'
+    assert selected(v.plan([1, 2], resume=str(first.path), retry_failed=True)) == {'00000001-c', '00000002-c'}
+    assert selected(v.plan([1, 2], resume=str(first.path), audit=True)) == set(resumed['items'])
+
+
+def test_retry_requires_a_resume_receipt(corpus):
+    with pytest.raises(ValueError, match='explicit resume'):
+        v.plan([1], retry_failed=True)
+
+
+@pytest.mark.parametrize('value', ['00000001-c', '00000002-lifted'])
+def test_tier_key_round_trip(value):
+    key = v.TierKey.parse(value)
+    assert str(key) == value
+    assert key.function == f'fn_{key.va:08x}'
+
+
+@pytest.mark.parametrize('value', ['1-c', '00000001-unknown', '00000001-c-extra'])
+def test_invalid_tier_keys_are_rejected(value):
+    with pytest.raises(ValueError, match='tier key'):
+        v.TierKey.parse(value)
