@@ -467,6 +467,11 @@ def cmd_revalidate(a) -> int:
         return 0
     if a.output:
         raise ValueError('--output requires --plan')
+    if not a.audit and any('global execution/harness identity changed or unavailable' in item['reasons']
+                           for item in data['items'].values() if item['action'] == 'execute'):
+        raise ValueError('Unproven global harness change: inspect revalidate --plan first; '
+                         'supply a verified --compatibility receipt or explicitly choose --audit. '
+                         'No differential execution started.')
     print('Validation plan: ' + json.dumps(validation.summary(data)), flush=True)
     run = validation.Run(data)
     print(f'Job receipt: {run.path}', flush=True)
@@ -642,9 +647,11 @@ def main(argv=None) -> int:
     s.add_argument('--audit', action='store_true', help='execute the whole selection without evidence reuse')
     s.add_argument('--compatibility', help='explicit reviewed bounded harness transition receipt')
     s.set_defaults(func=cmd_revalidate)
-    s = sub.add_parser('validation-compatibility', help='review a bounded input-dispatch harness transition')
+    s = sub.add_parser('validation-compatibility', help='review a bounded harness compatibility proof')
     for name in ('before', 'after', 'regressions', 'reviewer', 'reason', 'output'):
         s.add_argument('--' + name, required=True)
+    s.add_argument('--observer-before', help='retained pre-change emu.py for exact storage proof')
+    s.add_argument('--comparison', help='completed original/O0/O2 old-new real-case comparison')
     from . import validation_compat
     s.set_defaults(func=validation_compat.command)
     s = sub.add_parser('validation-benchmark', help='measure bounded revalidation in copied local inputs')

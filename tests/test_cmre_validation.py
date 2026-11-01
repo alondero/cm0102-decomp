@@ -59,6 +59,187 @@ def selected(plan):
     return {key for key, item in plan['items'].items() if item['action'] == 'execute'}
 
 
+def test_observation_bridge_preserves_origin_and_checks_planned_inputs(corpus, monkeypatch, tmp_path):
+    first = complete(v.plan([1, 2]), monkeypatch)
+    original = first.path.read_bytes()
+    corpus['harness'] = 'buffer-storage-only'
+    from cmre.observation_compat import Scope
+    monkeypatch.setattr(compat, 'check', lambda *a: Scope(first.data['items']))
+    proof = tmp_path / 'proof.json'
+    proof.write_text('{}')
+    # A genuine prior refresh changed evidence metadata, not the executable inputs.
+    record = ledger.record_path(1)
+    data = json.loads(record.read_text())
+    data['c']['harness_sha256'] = 'new-evidence'
+    record.write_text(json.dumps(data))
+    plan = v.plan([1, 2], compatibility=str(proof))
+    assert not selected(plan)
+    assert plan['items']['00000001-c']['evidence_adoption']['kind'] == 'observation-proof'
+    run = v.Run(plan)
+    run.finish()
+    assert run.data['summary']['failed'] == 0
+    assert run.data['results']['00000001-c'] == first.data['results']['00000001-c']
+    assert first.path.read_bytes() == original
+    (env.HINTS_DIR / 'fn_00000001.json').write_text('{"budget": 123}')
+    run.finish()
+    assert run.data['summary']['failed'] == 2
+    assert selected(v.plan([1, 2], reuse=str(first.path), compatibility=str(proof))) == {'00000001-c', '00000001-lifted'}
+
+
+@pytest.fixture
+def observation_receipt(corpus, monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from cmre import observation_compat as obs, session_evidence
+    corpus['components'] = {'emu.py': 'old'}
+    first = complete(v.plan([1, 2]), monkeypatch)
+    corpus.update(harness='buffer-storage-only', planner='new-local-planner', components={'emu.py': 'new'})
+    plan = v.plan([1, 2], reuse=str(first.path))
+    plan_path = tmp_path / 'plan.json'
+    plan_path.write_text(json.dumps(plan))
+    source = tmp_path / 'old-emu.py'
+    source.write_text('old observer')
+    comparison = tmp_path / 'comparison.json'
+    comparison.write_text(json.dumps({'state': 'finished', 'old_observer_sha256': 'old',
+        'new_observer_sha256': 'new', 'target_sha256': 'pinned',
+        'source_sha256': first.data['results']['00000001-c']['dependencies']['source'],
+        'options': v.effective_options(1, 'c'),
+        'cases': [{'artifact': a, 'all_Result_fields_equal': True, 'fp_equal': True}
+                  for a in ('original', '-O0', '-O2')]}))
+    regression = tmp_path / 'pytest.json'
+    regression.write_text('{"steps":[{"command":["py","-3.13","-m","pytest"],"inputs_before":{}}]}')
+    monkeypatch.setattr(obs, '_proof', lambda *a: 'recognized binding')  # source proof tested independently
+    monkeypatch.setattr(session_evidence, 'identity', lambda *a: {})
+    monkeypatch.setattr(session_evidence, 'successful_step', lambda *a: {'receipt': str(regression)})
+    monkeypatch.setattr(ledger, 'cmre_entries', lambda: [SimpleNamespace(va=i, record={'c': {'source': 'present'}}) for i in (1, 2)])
+    path = tmp_path / 'compatibility.json'
+    data = compat.create(first.path, plan_path, regression, 'test reviewer', 'storage only', path,
+                         observer_before=source, comparison=comparison)
+    return first, path, data
+
+
+def test_observation_receipt_drives_real_planner_without_execution(corpus, monkeypatch, observation_receipt):
+    first, path, data = observation_receipt
+    scope = compat.check(path, v._load_results(first.path), v.global_identity())
+    assert len(scope) == 4 and scope.observation
+    monkeypatch.setattr(v, 'execute_item', lambda *a: pytest.fail('reuse executed guest code'))
+    plan = v.plan([1, 2], reuse=str(first.path), compatibility=str(path))
+    assert not selected(plan)
+    run = v.Run(plan)
+    run.finish()
+    assert run.data['summary']['reused'] == 4
+    assert run.data['results'] == first.data['results']
+    # Subsequent planning automatically follows and rechecks the original proof.
+    again = v.plan([1, 2], reuse=str(run.path))
+    assert not selected(again)
+    assert again['compatibility']['origin_receipt'] == str(first.path)
+    following = v.Run(again)
+    following.finish()
+    assert following.data['summary']['failed'] == 0
+    assert following.data['results'] == first.data['results']
+    path.write_text('{}')
+    with pytest.raises(ValueError, match='Inherited compatibility receipt changed'):
+        v.plan([1, 2], reuse=str(following.path))
+
+
+@pytest.mark.parametrize('field', ['comparison', 'before_receipt', 'after_plan'])
+def test_observation_receipt_rejects_tampered_evidence(corpus, observation_receipt, field):
+    from pathlib import Path
+    first, path, data = observation_receipt
+    Path(data[field]).write_text('{}')
+    with pytest.raises(ValueError, match='evidence changed'):
+        compat.check(path, first.data, v.global_identity())
+
+
+def test_observation_receipt_rejects_checker_and_identity_drift(corpus, observation_receipt):
+    first, path, data = observation_receipt
+    corpus['target'] = 'changed'
+    with pytest.raises(ValueError, match='identities'):
+        compat.check(path, first.data, v.global_identity())
+    corpus['target'] = 'pinned'
+    data['checker_sha256']['observation_compat.py'] = 'tampered'
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match='checker changed'):
+        compat.check(path, first.data, v.global_identity())
+
+
+def test_observation_receipt_rejects_result_and_regression_drift(corpus, monkeypatch, observation_receipt):
+    first, path, data = observation_receipt
+    prior = copy.deepcopy(first.data)
+    prior['results']['00000001-c']['detail'] = 'tampered'
+    with pytest.raises(ValueError, match='results changed'):
+        compat.check(path, prior, v.global_identity())
+    from cmre import session_evidence
+    monkeypatch.setattr(session_evidence, 'successful_step', lambda *a: None)
+    with pytest.raises(ValueError, match='regression evidence'):
+        compat.check(path, first.data, v.global_identity())
+
+
+def test_observation_scope_still_invalidates_changed_source(corpus, observation_receipt):
+    first, path, data = observation_receipt
+    (env.C_DIR / 'fn_00000001.c').write_text('changed code')
+    assert selected(v.plan([1, 2], reuse=str(first.path), compatibility=str(path))) == {'00000001-c'}
+
+
+def test_proof_changed_after_planning_cannot_finish_green(corpus, observation_receipt):
+    first, path, data = observation_receipt
+    plan = v.plan([1, 2], reuse=str(first.path), compatibility=str(path))
+    run = v.Run(plan)
+    path.write_text('{}')
+    run.finish()
+    assert run.data['compatibility_drift']
+    assert run.data['state'] == 'incomplete'
+    assert run.data['summary']['failed'] == 4
+
+
+def test_reduced_comparison_budget_is_rejected(corpus, observation_receipt):
+    from cmre import observation_compat as obs
+    from pathlib import Path
+    first, path, data = observation_receipt
+    report = v.read(Path(data['comparison']))
+    report['options']['budget'] //= 2
+    with pytest.raises(ValueError, match='retained source, cases, budget'):
+        obs._check_comparison(report, data['before'], data['after'], first.data)
+
+
+def test_regression_pinning_separates_python_code_from_tier_data():
+    from cmre.observation_compat import _regression_files
+    data = {'files': {'cmre/emu.py': 'a', 'tests/test_cmre_read_buffers.py': 'b',
+                      'recovery/c/fn.c': 'c', 'recovery/hints/fn.json': 'd'}}
+    before = _regression_files(data)
+    data['files']['recovery/c/fn.c'] = 'changed'
+    assert _regression_files(data) == before
+    data['files']['cmre/emu.py'] = 'changed'
+    assert _regression_files(data) != before
+
+
+def test_unproven_global_change_cannot_launch_a_sweep(corpus, monkeypatch):
+    from types import SimpleNamespace
+    from cmre import cli
+    complete(v.plan([1, 2]), monkeypatch)
+    corpus['harness'] = 'unknown-change'
+    monkeypatch.setattr(ledger, 'cmre_entries', lambda: [SimpleNamespace(va=1), SimpleNamespace(va=2)])
+    monkeypatch.setattr(v, 'Run', lambda *a: pytest.fail('sweep started without explicit choice'))
+    args = SimpleNamespace(refresh=False, retry_failed=False, resume=None, reuse=None, n=2, jobs=8, plan=False,
+                           audit=False, compatibility=None, output=None)
+    with pytest.raises(ValueError, match='Unproven global harness change'):
+        cli.cmd_revalidate(args)
+
+
+def test_changed_tier_excluded_at_proof_review_stays_pending_without_global_audit(corpus, monkeypatch, tmp_path):
+    from cmre.observation_compat import Scope
+    first = complete(v.plan([1, 2]), monkeypatch)
+    corpus['harness'] = 'proven-storage-refactor'
+    monkeypatch.setattr(compat, 'check', lambda *a: Scope({'00000001-lifted', '00000002-lifted', '00000002-c'}))
+    path = tmp_path / 'proof.json'
+    path.write_text('{}')
+    (env.C_DIR / 'fn_00000001.c').write_text('changed code')
+    plan = v.plan([1, 2], reuse=str(first.path), compatibility=str(path))
+    assert selected(plan) == {'00000001-c'}
+    assert 'tier outside verified compatibility scope' in plan['items']['00000001-c']['reasons']
+    assert all('global execution/harness identity changed or unavailable' not in row['reasons']
+               for row in plan['items'].values())
+
+
 def test_unchanged_repeat_executes_nothing_and_keeps_origin(corpus, monkeypatch):
     first = complete(v.plan([1, 2]), monkeypatch)
     original = first.path.read_bytes()

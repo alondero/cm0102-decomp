@@ -8,6 +8,7 @@ simply ends the case as an observable boundary.
 from __future__ import annotations
 
 import bisect
+import ctypes
 import struct
 from dataclasses import dataclass, field
 
@@ -15,6 +16,7 @@ import capstone
 import unicorn
 from capstone import x86_const as X
 from unicorn import x86_const as R
+from unicorn.unicorn_py3.unicorn import uclib
 
 from . import image, imports, jump_transport, return_transport, x87_transport
 
@@ -123,6 +125,14 @@ class Machine:
         # Record which instruction made each read (input discovery only; it costs a register read).
         self.attribute_reads = False
         self.read_sites: dict[int, int] = {}
+        # The public binding allocates both a ctypes buffer and a bytearray per
+        # read. Reuse only host scratch; each hook still reads guest memory at
+        # the same point and appends its own immutable integer observation.
+        self._read_buffers = {}
+        for size, word in ((1, ctypes.c_uint8), (2, ctypes.c_uint16),
+                           (4, ctypes.c_uint32), (8, ctypes.c_uint64)):
+            buffer = ctypes.create_string_buffer(size)
+            self._read_buffers[size] = buffer, word.__ctype_le__.from_buffer(buffer)
         uc.hook_add(unicorn.UC_HOOK_MEM_READ | unicorn.UC_HOOK_MEM_WRITE, self._access)
         uc.hook_add(unicorn.UC_HOOK_MEM_INVALID, self._invalid)
         self.return_runtime = None
@@ -284,6 +294,18 @@ class Machine:
         self._pristine_ready = True
 
     # hooks -----------------------------------------------------------------
+    def _read_value(self, address: int, size: int) -> int:
+        storage = self._read_buffers.get(size)
+        if storage is None:
+            return int.from_bytes(self.uc.mem_read(address, size), "little")
+        buffer, word = storage
+        # Same native call and UcError as Unicorn 2.x's public mem_read. Do not
+        # use the buffer after an error, since a read may have filled only part.
+        status = uclib.uc_mem_read(self.uc._uch, address, buffer, size)
+        if status != unicorn.UC_ERR_OK:
+            raise unicorn.UcError(status, address, size)
+        return word.value
+
     def _access(self, uc, access, address, size, value, _):
         if access == unicorn.UC_MEM_WRITE:
             # The hook also fires for writes that then fault; only mapped pages are dirty.
@@ -293,7 +315,7 @@ class Machine:
                     self.written.add(page)
             self.events.append(("w", address, size, value & ((1 << (8 * size)) - 1)))
         else:
-            observed = int.from_bytes(uc.mem_read(address, size), "little")
+            observed = self._read_value(address, size)
             if self.attribute_reads:
                 self.read_sites[len(self.events)] = uc.reg_read(R.UC_X86_REG_EIP)
             self.events.append(("r", address, size, observed))

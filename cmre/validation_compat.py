@@ -1,4 +1,4 @@
-"""Explicit reviewed compatibility for input dispatch only; arbitrary changes fail closed."""
+"""Reviewed bounded dispatch and exact observer-storage compatibility; fail closed."""
 from __future__ import annotations
 
 import ast
@@ -77,7 +77,16 @@ def bounded(before: dict, after: dict) -> None:
             raise ValueError('Execution/comparison behavior changed outside input dispatch; full sweep required')
 
 
-def create(before_path: Path, after_path: Path, regression: Path, reviewer: str, reason: str, output: Path) -> dict:
+def create(before_path: Path, after_path: Path, regression: Path, reviewer: str, reason: str, output: Path,
+           *, observer_before: Path | None = None, comparison: Path | None = None) -> dict:
+    if observer_before is not None:
+        if comparison is None:
+            raise ValueError('Observation proof requires a real-case comparison')
+        from . import observation_compat
+        return observation_compat.create(before_path, after_path, regression, reviewer, reason,
+                                         output, observer_before, comparison)
+    if comparison is not None:
+        raise ValueError('Comparison requires --observer-before')
     before = validation._load_results(before_path)
     after = validation.read(after_path)
     if not reviewer.strip() or not reason.strip():
@@ -121,6 +130,9 @@ def create(before_path: Path, after_path: Path, regression: Path, reviewer: str,
 
 def check(path: Path, prior: dict, identity: dict) -> set[str]:
     data = validation.read(path)
+    from . import observation_compat
+    if data.get('schema') == observation_compat.SCHEMA:
+        return observation_compat.check(data, prior, identity)
     if (data.get('schema') != 'cmre-validation-compatibility/1'
             or data['before'] != prior.get('identity') or data['after'] != identity
             or not data.get('reviewer') or not data.get('reason') or prior.get('identity_drift')):
@@ -142,6 +154,8 @@ def check(path: Path, prior: dict, identity: dict) -> set[str]:
 
 
 def command(args) -> int:
-    result = create(Path(args.before), Path(args.after), Path(args.regressions), args.reviewer, args.reason, Path(args.output))
+    result = create(Path(args.before), Path(args.after), Path(args.regressions), args.reviewer, args.reason, Path(args.output),
+                    observer_before=Path(args.observer_before) if getattr(args, 'observer_before', None) else None,
+                    comparison=Path(args.comparison) if getattr(args, 'comparison', None) else None)
     print(f"Compatibility receipt: {args.output}; {len(result['scope'])} unaffected tiers; original hashes retained")
     return 0
