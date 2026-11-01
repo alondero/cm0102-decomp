@@ -3,6 +3,32 @@
 1. Bound the requested change and inspect existing worktree changes. For a defect,
    capture a smallest reproducer and a failing regression test before fixing it.
    For instructions, identify a session failure that the wording must prevent.
+   Inspect the selection, reuse reasons and estimated cost before execution.
+   An unproven global harness change stops before a job is created. Supply a
+   verified compatibility receipt, or explicitly choose `--audit` after deciding
+   that a fresh sweep is necessary. A hash change alone is not an instruction to
+   launch another whole-inventory job. Honor the user's validation scope.
+
+   The exact host read-buffer refactor has a separate, fail-closed proof path:
+
+   ```powershell
+   py -3.13 -m cmre validation-compatibility --before PRIOR_RECEIPT --after PLAN --regressions PYTEST_RECEIPT --observer-before OLD_EMU_SOURCE --comparison REAL_CASE_REPORT --reviewer REVIEWER --reason REASON --output PROOF_RECEIPT
+   py -3.13 -m cmre revalidate --refresh --plan --reuse PRIOR_RECEIPT --compatibility PROOF_RECEIPT
+   ```
+
+   The proof reverses only the recognized storage transformation and checks the
+   remaining complete module AST, native public-read contract, old/new real-case
+   results, current pytest evidence and unchanged environment. Each tier must
+   still match every execution dependency. Acceptance metadata is retained as
+   provenance; it does not force execution when those inputs are identical.
+   Changed or unknown tier inputs remain pending. Observer source, proof,
+   checker, Python regression code or environment drift rejects the proof.
+   C source and fixture changes are evaluated per tier. Historical results keep their original
+   identities and origins; this does not refresh acceptance records or establish
+   new composition or live-integration evidence. Other observer changes do not
+   inherit this exception. Subsequent plans based on a proof-backed receipt
+   inherit and reverify its proof automatically, including at finalization.
+
    Completion: observed failure and an explicit target behaviour, with files in scope.
 2. Make the change and run its focused check. User authorization for this task
    covers necessary edits; honor it if a runtime guard asks about harness files.
@@ -28,7 +54,6 @@
 
    ```powershell
    py -3.13 -m cmre revalidate --refresh --plan --json --output CM0102/Analysis/cmre/validation-plan.json
-   py -3.13 scripts/cmre_session.py run revalidate --refresh --jobs 16
    ```
 
    Completion: every accepted lifted and C tier has current executed or explicitly
@@ -76,9 +101,10 @@
 
    Global emulation, comparison, imports, ABI, compiler or execution-policy changes
    require a full pass. Use `--audit` at milestone/integration boundaries to execute
-   every selected tier regardless of reuse. The only bounded compatibility lane is
-   reviewed input-dispatch/validation changes; see the procedure below. File-list
-   exclusion or equal hints alone cannot establish compatibility.
+   every selected tier regardless of reuse. Bounded compatibility covers reviewed
+   input-dispatch/validation changes and the exact host read-buffer storage proof
+   described above. Neither lane exempts general guest-execution or comparison
+   changes. File-list exclusion or equal hints alone cannot establish compatibility.
 5. Only after revalidation finishes successfully, run
    `py -3.13 -m cmre unblock --batch` to requeue machine-made blocks. Agent blocks
    remain. Then return to [BATCH.md](BATCH.md) if recovery is the requested task.

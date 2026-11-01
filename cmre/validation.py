@@ -261,9 +261,24 @@ def plan(vas: list[int], *, refresh: bool = False, reuse: str | None = None,
     if prior.get('identity_drift'):
         same = False
     compatible = set()
+    proof_origin = str(path) if path else None
+    inherited = prior.get('compatibility') or {}
+    if compatibility is None and not audit and inherited.get('kind') == 'observation-proof':
+        compatibility = inherited['path']
+        if env.digest(Path(compatibility)) != inherited['sha256']:
+            raise ValueError('Inherited compatibility receipt changed')
     if compatibility:
         from . import validation_compat
-        compatible = validation_compat.check(Path(compatibility), prior, identity)
+        from . import observation_compat
+        proof_data = read(Path(compatibility))
+        proof_prior = prior
+        if proof_data.get('schema') == observation_compat.SCHEMA:
+            proof_origin = proof_data['before_receipt']
+            if prior.get('identity') == proof_data['after']:
+                if prior.get('identity_drift') or inherited.get('sha256') != env.digest(Path(compatibility)):
+                    raise ValueError('Derived receipt has no matching observation proof')
+                proof_prior = _load_results(Path(proof_origin))
+        compatible = validation_compat.check(Path(compatibility), proof_prior, identity)
     items = {}
     for va in vas:
         record = read(ledger.record_path(va))
@@ -273,7 +288,7 @@ def plan(vas: list[int], *, refresh: bool = False, reuse: str | None = None,
             adopted = None
             reason = []
             try:
-                current = snapshot(va, tier, old.get('dependencies') if same else None,
+                current = snapshot(va, tier, old.get('dependencies') if same or key in compatible else None,
                                    execution=execution if legacy_build_covered else None)
             except (OSError, ValueError, recover.build.BuildError) as exc:
                 current = None
@@ -285,13 +300,20 @@ def plan(vas: list[int], *, refresh: bool = False, reuse: str | None = None,
             if audit:
                 reason.append('explicit full audit')
             if not same and key not in compatible and not adopted:
-                reason.append('global execution/harness identity changed or unavailable')
+                reason.append('tier outside verified compatibility scope' if getattr(compatible, 'observation', False)
+                              else 'global execution/harness identity changed or unavailable')
             if not old.get('ok'):
                 reason.append('no successful tier receipt (previous failures retained)')
             if refresh and not old.get('refresh'):
                 reason.append('acceptance refresh not previously checked')
             before = old.get('dependencies', {})
-            if current != before:
+            observation = key in compatible and getattr(compatible, 'observation', False)
+            if observation:
+                from .observation_compat import same_inputs
+                unchanged = same_inputs(before, current)
+            else:
+                unchanged = current == before
+            if not unchanged:
                 reason.extend('changed ' + k for k in sorted(set(before) | set(current or {}))
                               if before.get(k) != (current or {}).get(k))
             action = 'execute' if reason else 'reuse'
@@ -302,13 +324,18 @@ def plan(vas: list[int], *, refresh: bool = False, reuse: str | None = None,
                           'action': action, 'reasons': reason,
                           'previous': old or None,
                           'estimated_seconds': old.get('elapsed_seconds')}
+            if observation and action == 'reuse':
+                items[key]['evidence_adoption'] = {'kind': 'observation-proof',
+                    'origin_identity': old.get('identity'), 'receipt': str(compatibility)}
     composed = composition_impact(items, identity)
     return {'schema': SCHEMA, 'kind': 'revalidate', 'identity': identity, 'refresh': refresh,
             'retry_failed': retry_failed, 'resume_from': str(path) if resume else None,
             'counts': coverage_counts(), 'counts_scope': 'whole accepted workspace; independent of validation selection',
             'functions': [f'{va:08x}' for va in vas], 'items': items,
             'reuse_from': str(path) if path else None,
-            'compatibility': ({'path': str(Path(compatibility).resolve()), 'sha256': env.digest(Path(compatibility))}
+            'compatibility': ({'path': str(Path(compatibility).resolve()), 'sha256': env.digest(Path(compatibility)),
+                               'kind': 'observation-proof' if getattr(compatible, 'observation', False) else 'input-dispatch',
+                               'origin_receipt': proof_origin}
                               if compatibility else None),
             'planning_seconds': time.monotonic() - started, 'compositions': composed,
             'claims': {'recovery': 'unchanged; only cmre accept owns recovery',
@@ -450,6 +477,19 @@ class Run:
 
     def finish(self):
         self.data['state'] = 'finished' if len(self.data['results']) == len(self.data['items']) else 'incomplete'
+        proof_drift = False
+        if self.data.get('compatibility'):
+            try:
+                from . import validation_compat
+                proof = self.data['compatibility']
+                if env.digest(Path(proof['path'])) != proof['sha256']:
+                    raise ValueError('Compatibility receipt changed after planning')
+                validation_compat.check(Path(proof['path']),
+                    _load_results(Path(proof.get('origin_receipt') or self.data['reuse_from'])), self.data['identity'])
+            except (OSError, ValueError, KeyError, TypeError):
+                proof_drift = True
+                self.data['compatibility_drift'] = True
+                self.data['state'] = 'incomplete'
         # Reused and early completed inputs must stay frozen until the final
         # gate too; otherwise an all-reuse run could claim green after an edit.
         for key, result in list(self.data['results'].items()):
@@ -458,7 +498,9 @@ class Run:
             item = self.data['items'][key]
             try:
                 current = snapshot(item['va'], item['tier'], result['dependencies'])
-                unchanged = current == result['dependencies']
+                expected = (item['dependencies'] if item.get('evidence_adoption')
+                            and item['action'] == 'reuse' else result['dependencies'])
+                unchanged = current == expected and not (proof_drift and item['action'] == 'reuse')
             except (OSError, ValueError, recover.build.BuildError):
                 unchanged = False
             if not unchanged:
