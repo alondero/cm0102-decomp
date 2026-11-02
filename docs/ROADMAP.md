@@ -66,7 +66,7 @@ below are unchanged; tier-1 acceptance extends M3/M5 coverage, not M2, M4 or M6.
 | M3: First recovered executable slice | One bounded original routine compiled with a differential harness | Original and recovered routine agree on outputs, state effects, ABI, and representative edge cases; source is traceable to original instructions |
 | M4: Hybrid executable | Recovered routines execute within a working original process | Controlled scenarios remain equivalent after replacement; every remaining original-code dependency is listed; integration is reproducible |
 | M5: Subsystem recovery | Increasingly complete application source and shared data model | Each subsystem passes local differential checks and whole-game replay gates before replacing its original implementation |
-| M6: Standalone faithful build | Source build with all application logic accounted for and no original executable required | Complete game and season scenarios, match behavior, save/load, and subsequent progression pass the defined parity suite; no unaccounted residual original code remains |
+| M6: Standalone faithful build | Source build with all application logic accounted for and no original executable code required at runtime; user-supplied assets permitted | Complete game and season scenarios, match behavior, save/load, and subsequent progression pass the defined parity suite; no unaccounted residual original code remains |
 | M7: Modernization | Platform and usability improvements on top of a frozen faithful reference | Each change states its intended behavioral differences and passes unchanged-behavior checks; the faithful baseline remains reproducible |
 
 ### Working toward the gates
@@ -359,7 +359,12 @@ identified third-party dependencies. A shipped original executable used as a cod
 library does not satisfy this milestone.
 
 Build from documented source and toolchain in a clean environment. Original assets
-and database files may still be necessary and remain local. Check save compatibility
+and database files may still be necessary and remain local. Users provide their
+own supported installation; documented local import/extraction is permitted and
+leaves that installation unchanged. The original executable may be an extraction
+or validation input, but its code is not a runtime dependency of the M6 engine.
+See [BUILDING.md](BUILDING.md) for the setup contract and current limitations.
+Check save compatibility
 in both directions where the original format supports it, progression after loading,
 multiple league configurations, match cases, transfers, and season rollover.
 Expand beyond the initial short reference scenario. Require zero unexplained

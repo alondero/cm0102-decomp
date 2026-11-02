@@ -159,6 +159,8 @@ def test_codex_shell_payload():
     ("apply_patch", {"command": "*** Begin Patch\n*** Update File: cmre/guard.py\n@@\n-a\n+b\n*** End Patch"}, 2),
 ])
 def test_configured_codex_hook_from_subdirectory(tool, tool_input, expected):
+    if not (env.ROOT / ".codex" / "hooks.json").is_file():
+        pytest.skip("host Codex hook configuration unavailable; synthetic guard checks still run")
     config = json.loads((env.ROOT / ".codex" / "hooks.json").read_text())
     groups = config["hooks"]["PreToolUse"]
     handlers = [handler for group in groups if re.search(group["matcher"], tool)
@@ -194,16 +196,19 @@ def publication(tmp_path, monkeypatch):
     (repo / "a.txt").write_text("clean\n")
     _git(repo, "add", "a.txt")
     _git(repo, "commit", "-q", "-m", "clean")
+    _git(repo, "remote", "add", "origin", "https://example.invalid/source.git")
     receipts = tmp_path / "receipts"
     receipts.mkdir()
     monkeypatch.setattr(guard, "ROOT", repo)
     monkeypatch.setattr(guard, "PUBLICATION_RECEIPTS", receipts)
+    monkeypatch.setattr(guard, "remote_state", lambda repo, name: {
+        "name": name, "url": "https://example.invalid/source.git", "visibility": "PRIVATE"})
     return guard, repo, receipts, _git(repo, "rev-parse", "HEAD")
 
 
 def _receipt(receipts, commit, **change):
-    receipt = {"schema": "cmre-publication-scan/1", "commit": commit, "result": "pass",
-               "remote": {"name": "origin", "visibility": "PRIVATE"}}
+    receipt = {"schema": "cmre-publication-scan/2", "commit": commit, "result": "pass",
+               "remote": {"name": "origin", "url": "https://example.invalid/source.git", "visibility": "PRIVATE"}}
     receipt.update(change)
     (receipts / f"{commit}.json").write_text(json.dumps(receipt), encoding="utf-8")
 
@@ -271,3 +276,39 @@ def test_other_push_forms_are_denied_even_with_a_receipt(publication, command):
     guard, _, receipts, head = publication
     _receipt(receipts, head)
     assert guard.decide("Bash", {"command": command})[0] == "deny"
+
+
+@pytest.mark.parametrize("visibility", ["PRIVATE", "PUBLIC"])
+def test_source_push_requires_the_scanned_remote_identity(publication, monkeypatch, visibility):
+    guard, _, receipts, head = publication
+    target = {"name": "origin", "url": "https://example.invalid/source.git", "visibility": visibility}
+    _receipt(receipts, head, remote=target)
+    monkeypatch.setattr(guard, "remote_state", lambda repo, name: dict(target))
+    command = {"command": f"{PUSH} origin github-main:main"}
+    assert guard.decide("Bash", command)[0] == "allow"
+    for changed in ({**target, "url": "https://example.invalid/other.git"},
+                    {**target, "visibility": "UNKNOWN"},
+                    {**target, "visibility": "PUBLIC" if visibility == "PRIVATE" else "PRIVATE"}):
+        monkeypatch.setattr(guard, "remote_state", lambda repo, name: changed)
+        assert guard.decide("Bash", command)[0] == "deny"
+
+
+@pytest.mark.parametrize("urls", ["https://example.invalid/push.git\n",
+                                 "https://example.invalid/a.git\nhttps://example.invalid/b.git\n"])
+def test_remote_state_checks_push_urls_and_rejects_multiple_destinations(tmp_path, monkeypatch, urls):
+    from types import SimpleNamespace
+    from cmre import guard
+
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout=urls if command[0] == "git" else "PUBLIC\n")
+    monkeypatch.setattr(guard.subprocess, "run", run)
+    state = guard.remote_state(tmp_path, "origin")
+    assert calls[0] == ["git", "remote", "get-url", "--push", "--all", "origin"]
+    if len(urls.splitlines()) == 1:
+        assert state["url"] == urls.strip() and state["visibility"] == "PUBLIC"
+        assert calls[1][3] == urls.strip()
+    else:
+        assert state["url"] == "" and state["visibility"] == "UNKNOWN"
+        assert len(calls) == 1

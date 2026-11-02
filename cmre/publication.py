@@ -21,8 +21,9 @@ a commit is pushed, this scanner checks them against the local supplied files:
 - accepted-mismatch: recovery/c source in the published tree (or staged) whose
   bytes differ from what the local ledger accepted.
 
-`scan --commit` covers every blob reachable from the commit and records a
-receipt; the guard admits a push only of a commit with a passing private receipt.
+`scan --commit` covers every blob reachable from the commit and records a receipt
+for its PUBLIC/PRIVATE push destination. A path/hash-specific authored-source
+review can resolve only the listing heuristic; payload checks remain active.
 The index is built from local files on each run; receipts record its identity.
 """
 from __future__ import annotations
@@ -37,7 +38,7 @@ from itertools import groupby
 from pathlib import Path, PurePosixPath
 
 from . import env
-from .guard import receipt_allows_push
+from .guard import PUBLICATION_SCHEMA, PUBLICATION_VISIBILITIES, receipt_allows_push, remote_state
 
 THRESHOLD = 16
 STRIDE = 8  # every run of THRESHOLD bytes contains a block starting at a multiple of STRIDE
@@ -49,7 +50,7 @@ TEXT_MINIMUM = 24
 TEXT_QUOTE_LIMIT = 64
 TEXT_FILE_LIMIT = 256
 LISTING_LINES = 8
-RECEIPT_SCHEMA = "cmre-publication-scan/1"
+RECEIPT_SCHEMA = PUBLICATION_SCHEMA
 RECEIPTS = env.ANALYSIS / "cmre/publication"
 SUPPLIED = tuple(env.ROOT / "CM0102" / name for name in ("Game", "Original-3.9.60", "InstallMedia"))
 # Generated baseline manifests quote public hashes; only whole copies matter.
@@ -59,7 +60,8 @@ PRIVATE_REFS = ("refs/heads/main",)  # the prior local history, never published
 CONTAINERS = {".iso", ".zip", ".cab", ".7z"}
 
 ASSET_ROOTS = {"CM0102", "tools"}
-LOCAL_RECORDS = ("recovery/ledger/", "recovery/lifted/", "recovery/blocked/")
+LOCAL_RECORDS = ("recovery/ledger/", "recovery/lifted/", "recovery/blocked/", "recovery/hints/",
+                 "recovery/c/tasks/", "local/fixtures/")
 ASSET_SUFFIXES = {".exe", ".dll", ".pdb", ".obj", ".o", ".lib", ".iso", ".cab", ".zip", ".7z", ".lng",
                   ".dat", ".hsr", ".his", ".wav", ".pct", ".rgn", ".fnt", ".t2k", ".mbr", ".bin", ".stackdump"}
 
@@ -258,7 +260,34 @@ def path_findings(path: str) -> list[Finding]:
     return []
 
 
-def content_findings(path: str, data: bytes, index: OriginalIndex) -> list[Finding]:
+def load_source_reviews(path: Path | None) -> dict:
+    """Local analyst dispositions for exact authored-source path/content pairs."""
+    if path is None:
+        return {}
+    try:
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"cannot read source reviews: {exc}") from exc
+    if (not isinstance(document, dict) or document.get("schema") != "cmre-source-reviews/1"
+            or not isinstance(document.get("reviews"), list)):
+        raise SystemExit("invalid source reviews schema")
+    reviews = {}
+    for entry in document["reviews"]:
+        if not isinstance(entry, dict) or not all(isinstance(entry.get(k), str) and entry[k].strip()
+                                                for k in ("path", "sha256", "reviewer", "reason")):
+            raise SystemExit("each source review needs path, sha256, reviewer and reason")
+        name, sha = entry["path"], entry["sha256"]
+        source = PurePosixPath(name)
+        if (source.is_absolute() or source.as_posix() != name or ".." in source.parts
+                or "\\" in name or ":" in name
+                or source.suffix.lower() not in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".s", ".asm"}
+                or not re.fullmatch(r"[0-9a-f]{64}", sha) or (name, sha) in reviews):
+            raise SystemExit(f"invalid or duplicate source review: {name}")
+        reviews[name, sha] = {"reviewer": entry["reviewer"], "reason": entry["reason"]}
+    return reviews
+
+
+def content_findings(path: str, data: bytes, index: OriginalIndex, source_reviews=None) -> list[Finding]:
     found = []
     copy = index.copy_of(data)
     if copy:
@@ -299,7 +328,7 @@ def content_findings(path: str, data: bytes, index: OriginalIndex) -> list[Findi
                                  f"{len(quotes)} quotes, {total} characters of game text; longest {end - start} "
                                  f"at line {line} {sample!r} matches {source}"))
     listing = LISTING.findall(data)
-    if len(listing) >= LISTING_LINES:
+    if len(listing) >= LISTING_LINES and (path, env.digest_bytes(data)) not in (source_reviews or {}):
         first = _line(data, LISTING.search(data).start())
         found.append(Finding(path, "instruction-listing", f"{len(listing)} address-keyed instruction lines from line {first}"))
     for match in CREDENTIAL.finditer(data):
@@ -323,8 +352,8 @@ def accepted_mismatch(path: str, data: bytes) -> list[Finding]:
                                                "Git line-ending normalisation or an unaccepted revision")]
 
 
-def scan_blob(path: str, data: bytes, index: OriginalIndex) -> list[Finding]:
-    return sorted(set(path_findings(path) + content_findings(path, data, index)))
+def scan_blob(path: str, data: bytes, index: OriginalIndex, source_reviews=None) -> list[Finding]:
+    return sorted(set(path_findings(path) + content_findings(path, data, index, source_reviews)))
 
 
 def _git(repo: Path, *args: str, stdin: bytes | None = None) -> bytes:
@@ -348,7 +377,7 @@ def _blobs(repo: Path, specs: list[str]):
 
 
 def scan_commit(repo: Path, ref: str, index: OriginalIndex,
-                private_refs=PRIVATE_REFS) -> tuple[str, list[Finding]]:
+                private_refs=PRIVATE_REFS, source_reviews=None) -> tuple[str, list[Finding]]:
     """Every path and blob reachable from `ref`, and its ancestry against the private history."""
     repo = Path(repo)
     commit = _git(repo, "rev-parse", "--verify", ref + "^{commit}").decode().strip()
@@ -367,13 +396,25 @@ def scan_commit(repo: Path, ref: str, index: OriginalIndex,
     for line in _git(repo, "rev-list", "--objects", commit).decode().splitlines():
         sha, _, path = line.partition(" ")
         if path:
-            named.setdefault(sha, path)
+            named.setdefault(sha, set()).add(path)
+    # rev-list records only one path per object. Recover every historical path so
+    # a reviewed blob at one path cannot authorize an identical dump at another.
+    raw = _git(repo, "log", "-m", "--format=", "--raw", "--no-abbrev", "--no-renames", "--root", "-z", commit).split(b"\0")
+    for number, record in enumerate(raw[:-1]):
+        fields = record.strip().split()
+        if len(fields) == 5 and fields[0].startswith(b":"):
+            path = raw[number + 1].decode()
+            for sha in fields[2:4]:
+                if sha.decode() in named:
+                    named[sha.decode()].add(path)
     # Git 2.30 has no type filter for rev-list; trees also carry path names.
     kinds = _git(repo, "cat-file", "--batch-check=%(objectname) %(objecttype)",
                  stdin=("\n".join(named) + "\n").encode()).decode().split()
     named = {sha: named[sha] for sha, kind in zip(kinds[::2], kinds[1::2]) if kind == "blob"}
     for sha, data in _blobs(repo, sorted(named)):
-        found += content_findings(named[sha], data, index)
+        for path in sorted(named[sha]):
+            found += path_findings(path)
+            found += content_findings(path, data, index, source_reviews)
     # Provenance is a property of the tree being published, not of superseded blobs.
     tree = [line.split("\t", 1) for line in _git(repo, "ls-tree", "-r", commit, "--", "recovery/c").decode().splitlines()]
     current = {meta.split()[2]: path for meta, path in tree if C_SOURCE.fullmatch(path)}
@@ -382,40 +423,36 @@ def scan_commit(repo: Path, ref: str, index: OriginalIndex,
     return commit, sorted(set(found))
 
 
-def scan_staged(repo: Path, index: OriginalIndex) -> list[Finding]:
+def scan_staged(repo: Path, index: OriginalIndex, source_reviews=None) -> list[Finding]:
     names = [n for n in _git(repo, "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR").decode().split("\0") if n]
     found = []
     for spec, data in _blobs(repo, [":" + name for name in names]):
-        found += scan_blob(spec[1:], data, index) + accepted_mismatch(spec[1:], data)
+        found += scan_blob(spec[1:], data, index, source_reviews) + accepted_mismatch(spec[1:], data)
     return sorted(set(found))
 
 
-def scan_paths(paths, index: OriginalIndex) -> list[Finding]:
+def scan_paths(paths, index: OriginalIndex, source_reviews=None) -> list[Finding]:
     found = []
     for given in paths:
         given = Path(given)
         files = [given] if given.is_file() else sorted(
             p for p in given.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
         for path in files:
-            found += scan_blob(env.rel(path), path.read_bytes(), index)
+            found += scan_blob(env.rel(path), path.read_bytes(), index, source_reviews)
     return sorted(set(found))
 
 
-def remote_state(repo: Path, name: str = "origin") -> dict:
-    url = _git(repo, "remote", "get-url", name).decode().strip()
-    view = subprocess.run(["gh", "repo", "view", url, "--json", "visibility", "-q", ".visibility"],
-                          cwd=repo, capture_output=True, text=True)
-    return {"name": name, "url": url, "visibility": view.stdout.strip() if view.returncode == 0 else "UNKNOWN"}
-
-
-def write_receipt(directory: Path, commit: str, findings, index: OriginalIndex, remote: dict) -> Path:
-    passed = not findings and remote.get("visibility") == "PRIVATE"
+def write_receipt(directory: Path, commit: str, findings, index: OriginalIndex, remote: dict,
+                  source_reviews=None) -> Path:
+    passed = not findings and remote.get("visibility") in PUBLICATION_VISIBILITIES and bool(remote.get("url"))
     receipt = {"schema": RECEIPT_SCHEMA, "commit": commit, "result": "pass" if passed else "fail",
                "created": datetime.now(timezone.utc).isoformat(), "target_sha256": env.TARGET_SHA256,
                "threshold_bytes": THRESHOLD, "coarse_minimum_bytes": COARSE_MINIMUM,
                "text_limits": {"minimum": TEXT_MINIMUM, "quote": TEXT_QUOTE_LIMIT, "file": TEXT_FILE_LIMIT},
                "index": {"sha256": index.identity(), "files": len(index.files)},
-               "remote": remote, "findings": [asdict(f) for f in findings]}
+               "remote": remote, "findings": [asdict(f) for f in findings],
+               "source_reviews": [{"path": name, "sha256": sha, **review}
+                                  for (name, sha), review in sorted((source_reviews or {}).items())]}
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{commit}.json"
     path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8", newline="\n")
@@ -425,19 +462,19 @@ def write_receipt(directory: Path, commit: str, findings, index: OriginalIndex, 
 MANIFEST = "STATUS.tsv"
 
 
-def manifest_rows(c_dir: Path, ledger_dir: Path, index: OriginalIndex) -> list[tuple[str, str, str]]:
+def manifest_rows(c_dir: Path, ledger_dir: Path, index: OriginalIndex, source_reviews=None) -> list[tuple[str, str, str]]:
     """(function, status, sha256) for each recovered C file that may be published.
 
     Accepted means the local ledger accepted exactly these bytes; wip means the
     file is not accepted (held, work in progress or unrecorded). Files with
-    original instruction listings or bytes, and accepted files whose bytes differ
+    unresolved instruction-listing findings or original bytes, and accepted files whose bytes differ
     from the accepted hash, are left out and stay local. The ledger's names and
     module paths are never written to the manifest.
     """
     rows = []
     for source in sorted(Path(c_dir).glob("fn_*.c")):
         data = source.read_bytes()
-        if scan_blob(env.rel(source), data, index):
+        if scan_blob(f"recovery/c/{source.name}", data, index, source_reviews):
             continue
         function, digest = source.stem, hashlib.sha256(data).hexdigest()
         ledger = Path(ledger_dir) / f"{function}.json"
@@ -454,11 +491,20 @@ def write_manifest(path: Path, rows) -> None:
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
+def supplied_index() -> OriginalIndex:
+    """A clone without the pinned comparison executable cannot pass a scan."""
+    if not env.TARGET.is_file() or env.digest(env.TARGET) != env.TARGET_SHA256:
+        raise SystemExit("publication check unavailable: supply the pinned official 3.9.68 executable locally; "
+                         "see docs/BUILDING.md")
+    return OriginalIndex.build()
+
+
 def manifest_command(a) -> int:
-    index = OriginalIndex.build()
+    source_reviews = load_source_reviews(getattr(a, 'source_reviews', None))
+    index = supplied_index()
     source = Path(a.source) if a.source else env.ROOT
     c_dir = source / "recovery/c"
-    rows = manifest_rows(c_dir, source / "recovery/ledger", index)
+    rows = manifest_rows(c_dir, source / "recovery/ledger", index, source_reviews)
     out = Path(a.out) if a.out else c_dir / MANIFEST
     write_manifest(out, rows)
     published = {status: sum(1 for _, s, _ in rows if s == status) for status in ("accepted", "wip")}
@@ -469,17 +515,18 @@ def manifest_command(a) -> int:
 
 
 def command(a) -> int:
-    index = OriginalIndex.build()
+    source_reviews = load_source_reviews(getattr(a, 'source_reviews', None))
+    index = supplied_index()
     print(f"index: {len(index.files)} supplied files, {len(index.values)} blocks, identity {index.identity()[:12]}")
     if a.commit:
-        commit, findings = scan_commit(env.ROOT, a.commit, index, tuple(a.private_ref or PRIVATE_REFS))
+        commit, findings = scan_commit(env.ROOT, a.commit, index, tuple(a.private_ref or PRIVATE_REFS), source_reviews)
         remote = remote_state(env.ROOT, a.remote)
-        receipt = write_receipt(RECEIPTS, commit, findings, index, remote)
+        receipt = write_receipt(RECEIPTS, commit, findings, index, remote, source_reviews)
         print(f"remote {remote['name']} visibility {remote['visibility']}")
     elif a.staged:
-        findings, receipt = scan_staged(env.ROOT, index), None
+        findings, receipt = scan_staged(env.ROOT, index, source_reviews), None
     else:
-        findings, receipt = scan_paths(a.paths or ["."], index), None
+        findings, receipt = scan_paths(a.paths or ["."], index, source_reviews), None
     for finding in findings[:a.limit]:
         print(f"{finding.kind:20} {finding.path}: {finding.detail}")
     if len(findings) > a.limit:
@@ -493,11 +540,12 @@ def command(a) -> int:
 
 
 def verify_remote(a) -> int:
-    """After a push: origin's main is the pushed commit and the repository is still private."""
+    """After a push: destination identity and main still match the scanned commit."""
     commit = _git(env.ROOT, "rev-parse", "--verify", a.ref + "^{commit}").decode().strip()
     remote = remote_state(env.ROOT, a.remote)
-    heads = _git(env.ROOT, "ls-remote", a.remote, "refs/heads/main").decode().split()
-    ok = remote["visibility"] == "PRIVATE" and heads[:1] == [commit]
+    heads = _git(env.ROOT, "ls-remote", remote["url"], "refs/heads/main").decode().split() if remote["url"] else []
+    ok = heads[:1] == [commit] and receipt_allows_push(
+        RECEIPTS / f"{commit}.json", commit, a.remote, remote_url=remote["url"], visibility=remote["visibility"])
     print(f"{a.remote} main {heads[0] if heads else 'missing'}; local {commit}; visibility {remote['visibility']}")
     return 0 if ok else 1
 
@@ -512,13 +560,15 @@ def add_commands(sub) -> None:
     mode.add_argument("--commit", help="every blob reachable from this ref; writes the push receipt")
     s.add_argument("--private-ref", action="append", help=f"history that must not be shared (default {PRIVATE_REFS[0]})")
     s.add_argument("--remote", default="origin")
+    s.add_argument("--source-reviews", type=Path, help="local path/hash-specific authored-source review JSON")
     s.add_argument("--limit", type=int, default=200, help="findings to print")
     s.set_defaults(func=command)
-    s = actions.add_parser("verify-remote", help="after a push, check the remote branch and private visibility")
+    s = actions.add_parser("verify-remote", help="after a push, check the remote branch and scanned destination")
     s.add_argument("ref")
     s.add_argument("--remote", default="origin")
     s.set_defaults(func=verify_remote)
     s = actions.add_parser("manifest", help="write recovery/c/STATUS.tsv: accepted and wip functions that may be published")
     s.add_argument("--source", help="checkout whose recovery/c and ledger are read (default: this checkout)")
     s.add_argument("--out", help="manifest file to write (default: recovery/c/STATUS.tsv beside the sources)")
+    s.add_argument("--source-reviews", type=Path, help="local path/hash-specific authored-source review JSON")
     s.set_defaults(func=manifest_command)

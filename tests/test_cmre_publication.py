@@ -236,24 +236,26 @@ def test_published_c_must_be_the_accepted_bytes(originals, repo, tmp_path, monke
     assert pub.scan_commit(repo, "fresh", originals["index"], private_refs=())[1] == []
 
 
-def test_receipt_records_a_passing_private_scan(originals, repo, tmp_path):
+@pytest.mark.parametrize("visibility", ["PRIVATE", "PUBLIC"])
+def test_receipt_records_a_passing_source_scan(originals, repo, tmp_path, visibility):
     head = _commit(repo, {"b.txt": b"clean\n"}, "clean")
     commit, findings = pub.scan_commit(repo, "fresh", originals["index"], private_refs=())
     path = pub.write_receipt(tmp_path / "receipts", commit, findings, originals["index"],
                              remote={"name": "origin", "url": "https://example.invalid/r.git",
-                                     "visibility": "PRIVATE"})
+                                     "visibility": visibility})
     receipt = json.loads(path.read_text(encoding="utf-8"))
     assert path.name == f"{head}.json"
     assert (receipt["schema"], receipt["commit"], receipt["result"]) == (pub.RECEIPT_SCHEMA, head, "pass")
     assert receipt["threshold_bytes"] == 16 and receipt["index"]["sha256"] == originals["index"].identity()
-    assert pub.receipt_allows_push(path, head, "origin")
+    assert pub.receipt_allows_push(path, head, "origin", remote_url="https://example.invalid/r.git",
+                                   visibility=visibility)
 
 
 @pytest.mark.parametrize("change", [
-    {"result": "fail"}, {"commit": "0" * 40}, {"remote": {"name": "origin", "visibility": "PUBLIC"}},
+    {"result": "fail"}, {"commit": "0" * 40}, {"remote": {"name": "origin", "visibility": "UNKNOWN"}},
     {"remote": {"name": "upstream", "visibility": "PRIVATE"}}, {"schema": "other/1"},
 ])
-def test_receipts_that_do_not_prove_a_private_pass_block_push(tmp_path, change):
+def test_receipts_that_do_not_prove_a_source_scan_block_push(tmp_path, change):
     head = "a" * 40
     receipt = {"schema": pub.RECEIPT_SCHEMA, "commit": head, "result": "pass",
                "remote": {"name": "origin", "visibility": "PRIVATE"}}
@@ -262,3 +264,106 @@ def test_receipts_that_do_not_prove_a_private_pass_block_push(tmp_path, change):
     path.write_text(json.dumps(receipt), encoding="utf-8")
     assert not pub.receipt_allows_push(path, head, "origin")
     assert not pub.receipt_allows_push(tmp_path / "missing.json", head, "origin")
+
+
+def test_listing_review_is_bound_to_exact_path_and_content(originals, tmp_path):
+    data = LISTING.encode()
+    path = "recovery/c/fn_006181d0.c"
+    review = tmp_path / "review.json"
+    review.write_text(json.dumps({"schema": "cmre-source-reviews/1", "reviews": [{
+        "path": path, "sha256": pub.env.digest_bytes(data), "reviewer": "analyst",
+        "reason": "Authored executable adapter reviewed against retained emission evidence."
+    }]}))
+    reviews = pub.load_source_reviews(review)
+    assert pub.scan_blob(path, data, originals["index"], reviews) == []
+    assert kinds(pub.scan_blob(path, data + b"\n", originals["index"], reviews)) == ["instruction-listing"]
+    assert kinds(pub.scan_blob("other.c", data, originals["index"], reviews)) == ["instruction-listing"]
+
+
+@pytest.mark.parametrize("extra,expected", [
+    (b"\n" + b"ghp_" + b"a1B2" * 9, "credential"),
+    (None, "original-bytes"),
+])
+def test_reviewed_assembly_still_checks_copied_bytes_and_credentials(originals, extra, expected):
+    data = LISTING.encode() + (extra if extra is not None else originals["image"][1001:1025].hex().encode())
+    path = "recovery/c/fn_006181d0.c"
+    reviews = {(path, pub.env.digest_bytes(data)): {"reviewer": "analyst", "reason": "reviewed"}}
+    assert expected in kinds(pub.scan_blob(path, data, originals["index"], reviews))
+
+
+def test_reviewed_assembly_in_removed_history_is_checked_by_blob(originals, repo):
+    path = "src/adapter.S"
+    data = LISTING.encode()
+    _commit(repo, {path: data}, "authored adapter")
+    _commit(repo, {path: None, "a.txt": b"clean\n"}, "remove")
+    reviews = {(path, pub.env.digest_bytes(data)): {"reviewer": "analyst", "reason": "reviewed"}}
+    assert pub.scan_commit(repo, "fresh", originals["index"], private_refs=(), source_reviews=reviews)[1] == []
+    assert kinds(pub.scan_commit(repo, "fresh", originals["index"], private_refs=())[1]) == ["instruction-listing"]
+
+
+def test_source_review_does_not_cover_an_identical_blob_at_another_historical_path(originals, repo):
+    data = LISTING.encode()
+    _commit(repo, {"src/a.S": data, "src/b.S": data}, "same bytes at two paths")
+    _commit(repo, {"src/b.S": None}, "remove unreviewed copy")
+    reviews = {("src/a.S", pub.env.digest_bytes(data)): {"reviewer": "analyst", "reason": "reviewed"}}
+    _, found = pub.scan_commit(repo, "fresh", originals["index"], private_refs=(), source_reviews=reviews)
+    assert [(f.path, f.kind) for f in found] == [("src/b.S", "instruction-listing")]
+
+
+def test_merge_only_local_path_is_checked_even_with_clean_contents(originals, repo):
+    _commit(repo, {"base.txt": b"base\n"}, "base")
+    _git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, {"side.txt": b"side\n"}, "side")
+    _git(repo, "checkout", "-q", "fresh")
+    _commit(repo, {"main.txt": b"main\n"}, "main")
+    _git(repo, "merge", "--no-commit", "--no-ff", "side")
+    _commit(repo, {"local/fixtures/merge.c": b"int merge_only;\n"}, "merge with local-only file")
+    _, found = pub.scan_commit(repo, "fresh", originals["index"], private_refs=())
+    assert [(f.path, f.kind) for f in found] == [("local/fixtures/merge.c", "asset-path")]
+
+
+@pytest.mark.parametrize("change", [
+    {"path": "../adapter.S"}, {"path": "/adapter.S"}, {"path": "C:/adapter.S"},
+    {"path": "src\\adapter.S"}, {"path": "raw.txt"}, {"sha256": "0" * 63},
+    {"reviewer": " "}, {"reason": ""},
+])
+def test_invalid_source_review_is_rejected(tmp_path, change):
+    entry = {"path": "src/a.S", "sha256": "0" * 64, "reviewer": "analyst", "reason": "authored adapter"}
+    path = tmp_path / "reviews.json"
+    path.write_text(json.dumps({"schema": "cmre-source-reviews/1", "reviews": [{**entry, **change}]}))
+    with pytest.raises(SystemExit, match="source review"):
+        pub.load_source_reviews(path)
+
+
+@pytest.mark.parametrize("path", ["recovery/hints/x.json", "recovery/c/tasks/x/candidate.c", "local/fixtures/x.c"])
+def test_local_records_remain_local_even_with_a_source_review(originals, path):
+    data = LISTING.encode()
+    reviews = {(path, pub.env.digest_bytes(data)): {"reviewer": "analyst", "reason": "reviewed"}}
+    assert "asset-path" in kinds(pub.scan_blob(path, data, originals["index"], reviews))
+
+
+@pytest.mark.parametrize("contents", [None, b"wrong executable"])
+def test_publication_is_unavailable_without_pinned_original(tmp_path, monkeypatch, contents):
+    target = tmp_path / "cm0102.exe"
+    if contents is not None:
+        target.write_bytes(contents)
+    monkeypatch.setattr(pub.env, "TARGET", target)
+    with pytest.raises(SystemExit, match="publication check unavailable"):
+        pub.supplied_index()
+
+
+@pytest.mark.parametrize("visibility", ["PUBLIC", "PRIVATE"])
+def test_verify_remote_requires_the_scanned_destination(originals, tmp_path, monkeypatch, visibility):
+    from types import SimpleNamespace
+
+    commit = "a" * 40
+    target = {"name": "origin", "url": "https://example.invalid/source.git", "visibility": visibility}
+    monkeypatch.setattr(pub, "RECEIPTS", tmp_path)
+    monkeypatch.setattr(pub, "remote_state", lambda repo, name: dict(target))
+    monkeypatch.setattr(pub, "_git", lambda repo, *args: (commit + ("\trefs/heads/main" if args[0] == "ls-remote" else "") + "\n").encode())
+    args = SimpleNamespace(ref="source", remote="origin")
+    assert pub.verify_remote(args) == 1
+    pub.write_receipt(tmp_path, commit, [], originals["index"], dict(target))
+    assert pub.verify_remote(args) == 0
+    target["url"] = "https://example.invalid/changed.git"
+    assert pub.verify_remote(args) == 1

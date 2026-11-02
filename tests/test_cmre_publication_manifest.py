@@ -56,3 +56,13 @@ def test_manifest_file_holds_only_the_three_columns(tree, tmp_path):
     assert len(lines) == 2 and lines[1].split("\t")[:2] == ["fn_00000001", "accepted"]
     text = out.read_text(encoding="utf-8")
     assert "FUN_secret" not in text and "e:\\dev" not in text
+
+
+def test_reviewed_assembly_keeps_accepted_hash_requirement(tree):
+    data = _write(tree, "fn_00000001", LISTING, accepted_text=LISTING)
+    path = "recovery/c/fn_00000001.c"  # logical published path even for an external --source tree
+    reviews = {(path, pub.env.digest_bytes(data)): {"reviewer": "analyst", "reason": "authored adapter"}}
+    assert pub.manifest_rows(tree["c"], tree["ledger"], tree["index"], reviews) == [
+        ("fn_00000001", "accepted", pub.env.digest_bytes(data))]
+    _write(tree, "fn_00000001", LISTING, accepted_text=BODY)
+    assert pub.manifest_rows(tree["c"], tree["ledger"], tree["index"], reviews) == []

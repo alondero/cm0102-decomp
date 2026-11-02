@@ -5,6 +5,10 @@ preflight and closure, then the M6/M7 gates in [ROADMAP.md](../ROADMAP.md).
 Native means compiled recovered game logic running on the selected host without
 executing the original executable as a library. Packaging the original process
 or emulator does not meet the standalone or modern-port deliverable.
+Users may supply original assets and databases and run documented local
+extraction. This requirement is compatible with M6/M7; executing extracted
+original code as the engine is not. Setup requirements and current availability
+are documented in [BUILDING.md](../BUILDING.md).
 
 ## Before M6 is demonstrated: planning
 

@@ -17,6 +17,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 # `cmre publication scan --commit REF` writes one receipt per scanned commit.
 PUBLICATION_RECEIPTS = ROOT / "CM0102/Analysis/cmre/publication"
+PUBLICATION_SCHEMA = "cmre-publication-scan/2"
+PUBLICATION_VISIBILITIES = ("PRIVATE", "PUBLIC")
 
 PROTECTED = [
     ("CM0102/Game/", "preserved official 3.9.68 install; work on copies (AGENTS.md)"),
@@ -64,17 +66,40 @@ def _rel(path: str) -> str:
     return p.as_posix()
 
 
-def receipt_allows_push(path: Path, commit: str, remote: str) -> bool:
-    """A receipt proves a passing scan of this commit's history for a private remote."""
+def receipt_allows_push(path: Path, commit: str, remote: str, *,
+                       remote_url: str | None = None, visibility: str | None = None) -> bool:
+    """A receipt binds a source-history scan to a known push destination."""
     try:
         receipt = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
     target = receipt.get("remote") if isinstance(receipt, dict) else None
-    return isinstance(target, dict) and (
-        receipt.get("schema"), receipt.get("commit"), receipt.get("result"),
-        target.get("name"), target.get("visibility")) == (
-        "cmre-publication-scan/1", commit, "pass", remote, "PRIVATE")
+    return (isinstance(target, dict)
+            and (receipt.get("schema"), receipt.get("commit"), receipt.get("result"), target.get("name"))
+            == (PUBLICATION_SCHEMA, commit, "pass", remote)
+            and isinstance(target.get("url"), str) and bool(target["url"].strip())
+            and target.get("visibility") in PUBLICATION_VISIBILITIES
+            and (remote_url is None or target["url"] == remote_url)
+            and (visibility is None or target["visibility"] == visibility))
+
+
+def remote_state(repo: Path, name: str = "origin") -> dict:
+    """Inspect the push URL, which may differ from the fetch URL, and visibility."""
+    target = {"name": name, "url": "", "visibility": "UNKNOWN"}
+    try:
+        url = subprocess.run(["git", "remote", "get-url", "--push", "--all", name], cwd=repo,
+                             capture_output=True, text=True)
+        urls = url.stdout.splitlines()
+        if url.returncode or len(urls) != 1 or not urls[0].strip():
+            return target
+        target["url"] = urls[0].strip()
+        view = subprocess.run(["gh", "repo", "view", target["url"], "--json", "visibility", "-q", ".visibility"],
+                              cwd=repo, capture_output=True, text=True)
+        if view.returncode == 0:
+            target["visibility"] = view.stdout.strip()
+    except OSError:
+        pass
+    return target
 
 
 def _push(cmd: str) -> tuple[str, str]:
@@ -94,8 +119,10 @@ def _push(cmd: str) -> tuple[str, str]:
     commit = resolved.stdout.strip()
     if resolved.returncode or not re.fullmatch(r"[0-9a-f]{40}", commit):
         return "deny", f"{match[1]} is not a local commit; {PUSH_RULE}"
-    if not receipt_allows_push(PUBLICATION_RECEIPTS / f"{commit}.json", commit, "origin"):
-        return "deny", f"no passing private publication receipt for {commit}; {PUSH_RULE}"
+    target = remote_state(ROOT, "origin")
+    if not receipt_allows_push(PUBLICATION_RECEIPTS / f"{commit}.json", commit, "origin",
+                              remote_url=target["url"], visibility=target["visibility"]):
+        return "deny", f"no passing publication receipt matching {commit} and the current push destination; {PUSH_RULE}"
     return "allow", ""
 
 

@@ -1,3 +1,16 @@
+# Publication policy and historical migration evidence
+
+Current publication policy and commands are maintained in
+[agent/PUBLICATION.md](agent/PUBLICATION.md). They permit requested, scanned
+source-only publication to a known public or private destination, with receipts
+bound to the exact commit, push URL and visibility. User-supplied game content,
+extracted assets and raw evidence remain local. Build/setup availability is in
+[BUILDING.md](BUILDING.md).
+
+The following migration record is historical. Its private-only receipt policy,
+absolute assembly-listing exclusions, worker/bootstrap status and measured counts
+are not current operating instructions. Use the linked workflow for new work.
+
 # Publication boundary
 
 The private GitHub repository (`origin`, branch `main`) carries reviewed,

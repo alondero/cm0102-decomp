@@ -2,17 +2,25 @@
 
 This project recovers the official 3.9.68 executable into buildable source that preserves its behavior and bugs. A validated standalone game precedes any modern port. The pinned original has SHA-256 `0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86`; its preferred image base is `0x00400000`.
 
+Users supply their own supported CM0102 installation for assets and databases.
+The completed engine runs source-built game logic; original files may be used
+for local extraction and validation. The complete game/port and general clean-clone
+bootstrap are not available yet. See the [build/setup contract](docs/BUILDING.md)
+and [publication workflow](docs/agent/PUBLICATION.md). Recovery tooling currently
+requires Python 3.13 with `unicorn`, `capstone`, `pefile`, `numpy`, `pytest`, and
+the documented MinGW/Ghidra dependencies.
+
 ## Local workspace and repository
 
 The authoritative recovery checkout is on the same machine as the supplied game and local analysis. Its agents follow the local `AGENTS.md` and `docs/agent/PLAYBOOK.md`. Use `py -3.13` for Python. The executable, supplied assets, raw analysis, generated lifts, recovery records, hints, and evidence remain local and are not distributed by this repository.
 
-This private repository contains the coordination plan, the reviewed `cmre` harness with its tests and scripts, and an initial subset of C. It is not a complete or independently runnable copy of the local workspace: recovered C, legacy sources, agent workflow documents and the local records the tests read still require publication review or the local bootstrap. [docs/PUBLICATION.md](docs/PUBLICATION.md) defines the publication boundary, the scan every commit and push must pass, the local-only components, and the migration status. A clean Git status does not mean those local-only or unreviewed files are backed up or synchronized. See [issue #22](https://github.com/alondero/cm0102-decomp/issues/22) for the remaining migration.
+This source repository contains reviewed recovery tooling, tests, scripts, workflow documentation and a subset of reconstructed C and legacy sources. It is not a complete game or an independently runnable copy of the authoritative recovery workspace: original inputs and full local acceptance records are intentionally absent. `recovery/c/STATUS.tsv` records the published source hashes and accepted/WIP status. [docs/PUBLICATION.md](docs/PUBLICATION.md) defines the publication boundary, the scan every commit and push must pass, the local-only components, and historical migration evidence. A clean Git status does not mean those local-only or unreviewed files are backed up or synchronized. See [issue #22](https://github.com/alondero/cm0102-decomp/issues/22) for the completed source migration.
 
 The local authoritative checkout also uses a Git exclude rule that hides untracked files by default. Review a file and its contents before explicitly adding it; never publish supplied assets, raw executable bytes, original instruction streams, local analysis, or credentials. The prior local Git history is retained separately and must not be pushed to this repository.
 
 ## Parallel work
 
-See [PLAN.md](PLAN.md), [START-WORKER.md](START-WORKER.md), and the [issues](https://github.com/alondero/cm0102-decomp/issues). Eight stable shards divide function ownership. Workers claim bounded batches in the authoritative checkout, independent reviewers inspect them, and one integrator accepts results serially. The coordination worktrees use `worker.ps1` to reach the authoritative checkout; they do not yet isolate recovery state. The [worktree coordination issue](https://github.com/alondero/cm0102-decomp/issues/1) tracks that gap.
+See [PLAN.md](PLAN.md), [START-WORKER.md](START-WORKER.md), and the [issues](https://github.com/alondero/cm0102-decomp/issues). Eight stable shards divide function ownership. Workers claim bounded batches in the authoritative checkout, independent reviewers inspect them, and one integrator accepts results serially. The current isolated worker protocol is documented in [docs/agent/WORKTREES.md](docs/agent/WORKTREES.md); legacy `worker.ps1` entry points do not replace its packet, claim and review gates.
 
 ## Local checks
 

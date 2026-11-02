@@ -96,7 +96,10 @@ The legacy command without `--parent` still selects the latest successful start.
 Matching completed full pytest evidence may be reused; changed declared inputs
 invalidate it. Integrity always runs. Differential inventory evidence is separate.
 On failure report exact failures and
-whether they existed at preflight. Commit only when requested; never push.
+whether they existed at preflight. Commit and push when requested, following
+[PUBLICATION.md](PUBLICATION.md) for reviewed source-only batches and exact-commit/remote
+checks. Supplied content and raw evidence remain local. `cmre task publish` remains
+local acceptance, separate from Git publication.
 
 For continuation, replace `docs/NEXT-SESSION-PROMPT.md` with at most 40 lines:
 next task and workflow, progress line, unresolved failures with commands,
