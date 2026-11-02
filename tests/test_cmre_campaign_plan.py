@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cmre import campaign, env, tasks
+from cmre import campaign, env, tasks, work
 
 A, B, C = 0x00401000, 0x00402000, 0x00403000
 
@@ -19,6 +19,7 @@ def setup(monkeypatch, tmp_path):
                                   legacy=False, source="ledger.json") for v in (A, B, C)}
     monkeypatch.setattr(campaign.ledger, "recovered", lambda: records)
     monkeypatch.setattr(env, "C_DIR", tmp_path)
+    monkeypatch.setattr(env, "HINTS_DIR", tmp_path / 'hints')
     packets = []
     monkeypatch.setattr(tasks, "status", lambda: packets)
     monkeypatch.setattr(tasks, "validate_current", lambda packet: None)
@@ -120,3 +121,40 @@ def test_prepared_packet_without_analyst_contract_is_evidence_work(setup):
     assert not plan["dispatch"]
     assert any(row.get("task_id") == "packet" and row["reason"] == "abi-evidence-required"
                for row in plan["blocked"])
+
+
+@pytest.mark.parametrize('state', ['harness-blocker', 'evidence-needed'])
+def test_plan_reports_hard_hold_before_contract_or_dispatch(setup, monkeypatch, state):
+    manifest, _, packets = setup
+    (env.C_DIR / 'contracts').mkdir()
+    (env.C_DIR / 'contracts/fn_00402000.json').write_text('{}')
+    monkeypatch.setattr(work, 'read', lambda: {'functions': {'fn_00402000':
+        {'state': state, 'retry_when': 'Resolve nested fault', 'blocker': 'nested-fault'}}})
+    plan = campaign.plan(manifest, workers=2)
+    assert not any(row['function'] == 'fn_00402000' for row in plan['prepare'] + plan['dispatch'])
+    assert any(row['function'] == 'fn_00402000' and row['reason'] == 'work-state-hold'
+               and row['retry_when'] == 'Resolve nested fault' for row in plan['blocked'])
+    packets.append(packet(B, 'submitted', name='ready-for-review'))
+    plan = campaign.plan(manifest, workers=2)
+    assert any(row['task_id'] == 'ready-for-review' for row in plan['review'])
+
+
+def test_plan_reports_unreviewed_existing_source_as_hold(setup):
+    manifest, _, _ = setup
+    (env.C_DIR / 'fn_00402000.c').write_text('retained WIP')
+    plan = campaign.plan(manifest)
+    assert any(row['function'] == 'fn_00402000' and row['reason'] == 'existing-source-needs-review'
+               for row in plan['blocked'])
+
+
+def test_plan_exposes_hold_on_live_and_submitted_tasks(setup, monkeypatch):
+    manifest, _, packets = setup
+    monkeypatch.setattr(work, 'read', lambda: {'functions': {'fn_00402000':
+        {'state': 'harness-blocker', 'retry_when': 'Resolve nested fault', 'blocker': 'nested'}}})
+    packets.append(packet(B, 'claimed', live=True, name='live-held'))
+    plan = campaign.plan(manifest)
+    assert plan['active'][0]['hold']['retry_when'] == 'Resolve nested fault'
+    packets[0] = packet(B, 'submitted', name='submitted-held')
+    plan = campaign.plan(manifest)
+    assert plan['review'][0]['task_id'] == 'submitted-held'
+    assert plan['review'][0]['hold']['retry_when'] == 'Resolve nested fault'

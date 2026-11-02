@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
+import math
+import os
 from pathlib import Path
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from . import env
@@ -260,12 +264,73 @@ def _overrides(a) -> dict:
     return {k: v for k, v in (("cases", a.cases), ("budget", a.budget)) if v is not None}
 
 
+@contextmanager
+def _diagnostic_source(va: int, source: Path):
+    """Fence explicit diagnostics from staged/worker sources and live claims.
+
+    This is trusted-process coordination, not a filesystem sandbox. It does
+    not meter arbitrary copies, canonical direct tests, or Python API calls.
+    """
+    from . import work
+
+    lexical = Path(os.path.abspath(source))
+    resolved = Path(source).resolve()
+    with work.attempt_fence(va):
+        with work.locked():
+            task_root = env.C_DIR / 'tasks'
+            if (lexical.is_relative_to(Path(os.path.abspath(task_root)))
+                    or resolved.is_relative_to(task_root.resolve())):
+                raise ValueError('Explicit diagnostics cannot test staged task sources; use task submit')
+            canonical = env.C_DIR / f'fn_{va:08x}.c'
+            if resolved == canonical.resolve() or (resolved.exists() and canonical.exists()
+                                                     and resolved.samefile(canonical)):
+                raise ValueError('Use the canonical command without --source to record its result')
+            protected_files = list(task_root.glob(f'c-{va:08x}-*/fn_{va:08x}.c'))
+            for binding in (env.ANALYSIS / 'cmre/worktrees').glob('*.json'):
+                try:
+                    data = json.loads(binding.read_text(encoding='utf-8'))
+                    if (data.get('schema') != 'cmre-worktree/1'
+                            or Path(data['coordinator']).resolve() != env.ROOT.resolve()
+                            or not Path(data['worker']).is_absolute()):
+                        raise ValueError('invalid worktree binding')
+                    worker_c = Path(data['worker']).resolve() / 'recovery/c'
+                except (KeyError, TypeError, OSError, json.JSONDecodeError) as exc:
+                    raise ValueError(f'Cannot check retained worker binding: {binding}') from exc
+                if lexical.is_relative_to(worker_c) or resolved.is_relative_to(worker_c.resolve()):
+                    raise ValueError('Explicit diagnostics cannot test worker-bound sources; use worktree test')
+                protected_files.append(worker_c / f'fn_{va:08x}.c')
+            if resolved.exists() and any(p.is_file() and resolved.samefile(p) for p in protected_files):
+                raise ValueError('Explicit diagnostics cannot test a hard link to a task or worker source')
+            if f'fn_{va:08x}' in work.claims():
+                raise ValueError('Explicit diagnostics cannot run while a shared claim is live')
+            for path in (env.ANALYSIS / 'cmre/tasks').glob(f'c-{va:08x}-*/task.json'):
+                try:
+                    manifest = json.loads(path.read_text(encoding='utf-8'))
+                    if int(manifest['va'], 16) != va:
+                        raise ValueError('task VA mismatch')
+                    lease = manifest.get('lease')
+                    expires = lease['expires_at'] if lease is not None else 0
+                    if type(expires) not in (int, float) or not math.isfinite(expires):
+                        raise ValueError('invalid task lease expiration')
+                except (KeyError, TypeError, OSError, json.JSONDecodeError) as exc:
+                    raise ValueError(f'Cannot check retained task claim: {path}') from exc
+                if expires > time.time():
+                    raise ValueError('Explicit diagnostics cannot run while a task lease is live')
+        # The same per-VA attempt fence must also cover claim acquisition. It is
+        # kept until testing completes, preventing a new worker from starting.
+        yield resolved
+
+
 def cmd_test(a) -> int:
     from . import recover
 
     va = _va(a.va)
-    r = (recover.test_c(va, _overrides(a), a.fresh, source=a.source, profile=a.profile) if a.c
-         else recover.test_lifted(va, _overrides(a), a.fresh))
+    if a.c and a.source is not None:
+        with _diagnostic_source(va, a.source) as source:
+            r = recover.test_c(va, _overrides(a), a.fresh, source=source, profile=a.profile)
+    else:
+        r = (recover.test_c(va, _overrides(a), a.fresh, source=None, profile=a.profile) if a.c
+             else recover.test_lifted(va, _overrides(a), a.fresh))
     if a.c and a.source is None:
         from . import work
         work.record_test(va, r)
@@ -277,18 +342,31 @@ def cmd_explain(a) -> int:
     from . import recover
 
     va = _va(a.va)
-    r = (recover.explain_c(va, a.case, _overrides(a), source=a.source, profile=a.profile, opt=a.opt,
-                           window=a.window) if a.c
-         else recover.explain(va, a.case, _overrides(a), window=a.window))
+    if a.c and a.source is not None:
+        with _diagnostic_source(va, a.source) as source:
+            r = recover.explain_c(va, a.case, _overrides(a), source=source, profile=a.profile, opt=a.opt,
+                                  window=a.window)
+    else:
+        r = (recover.explain_c(va, a.case, _overrides(a), source=None, profile=a.profile, opt=a.opt,
+                               window=a.window) if a.c
+             else recover.explain(va, a.case, _overrides(a), window=a.window))
     print(json.dumps(r, indent=1))
     return 0
 
 
 def cmd_accept(a) -> int:
-    from . import recover
+    from . import recover, work
 
     va = _va(a.va)
-    ok, r = recover.accept(va, "c", profile=a.profile) if a.c else recover.accept_with_inference(va)
+    if a.c:
+        with work.hold_fence(va):
+            with work.locked():
+                record = work.read()['functions'].get(f'fn_{va:08x}', {})
+                if record.get('state') in work.HARD_HOLDS:
+                    raise ValueError(f"Function has an acceptance hold: {record['state']}; {record.get('retry_when', '')}")
+            ok, r = recover.accept(va, "c", profile=a.profile)
+    else:
+        ok, r = recover.accept_with_inference(va)
     if r.get("va"):
         _print_report(r, False)
     else:

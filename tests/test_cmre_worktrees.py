@@ -51,6 +51,59 @@ def test_worker_cannot_replace_an_existing_shared_claim(worker):
     assert work.claims()['fn_00401000']['owner'] == 'existing'
 
 
+@pytest.mark.parametrize('state', ['harness-blocker', 'evidence-needed'])
+def test_worktree_claim_respects_recorded_hold_until_explicit_retry(worker, state):
+    work.update(VA, state, 'Retained discrepancy', 'Resolve named boundary', 'nested-fault')
+    with pytest.raises(ValueError, match='hold|retry'):
+        worktrees.claim(worker, VA, 'translator')
+    assert not work.claims()
+    assert not list((env.ANALYSIS / 'cmre/tasks').glob('*/task.json'))
+    record = work.read()['functions']['fn_00401000']
+    assert record['state'] == state and record['retry_when'] == 'Resolve named boundary'
+    work.retry(VA, 'Named boundary independently resolved')
+    assert worktrees.claim(worker, VA, 'translator')['status'] == 'claimed'
+
+
+def test_worktree_claim_does_not_hide_existing_unreviewed_source(worker):
+    source = env.C_DIR / 'fn_00401000.c'
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text('retained WIP', encoding='utf-8')
+    with pytest.raises(ValueError, match='hold|review'):
+        worktrees.claim(worker, VA, 'translator')
+    assert source.read_text(encoding='utf-8') == 'retained WIP'
+    assert not work.claims()
+    work.retry(VA, 'Existing source independently reviewed')
+    assert worktrees.claim(worker, VA, 'translator')['status'] == 'claimed'
+
+
+def test_imported_wip_stays_held_for_review(worker, monkeypatch):
+    from cmre import ledger
+    source = env.C_DIR / 'fn_00401000.c'
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text('unreviewed source', encoding='utf-8')
+    monkeypatch.setattr(ledger, 'cmre_entries', lambda: [])
+    monkeypatch.setattr(ledger, 'legacy_entries', lambda: [])
+    assert work.import_wip()['needs-review'] == 1
+    with pytest.raises(ValueError, match='hold|review'):
+        worktrees.claim(worker, VA, 'translator')
+    assert source.read_text(encoding='utf-8') == 'unreviewed source'
+    assert not work.claims()
+
+
+def test_new_hold_during_validation_survives_attempt_recording(worker, monkeypatch):
+    worktrees.claim(worker, VA, 'translator')
+    candidate(worker)
+    def gate(*args, **kwargs):
+        work.update(VA, 'harness-blocker', 'Fault boundary found', 'Verify boundary', 'nested-fault')
+        return {'status': 'pass'}
+    monkeypatch.setattr(tasks.recover, 'test_c', gate)
+    assert worktrees.submit(worker, VA)['status'] == 'submitted'
+    record = work.read()['functions']['fn_00401000']
+    assert record['state'] == 'harness-blocker'
+    assert record['retry_when'] == 'Verify boundary'
+    assert record['attempts'] == 1
+
+
 def test_submission_requires_review_and_imports_only_bound_source(worker, monkeypatch):
     worktrees.claim(worker, VA, 'translator')
     source = candidate(worker)
@@ -96,13 +149,16 @@ def test_source_report_and_snapshot_drift_reject_review_or_submission(worker, wo
 
 
 def test_five_attempts_survive_expiry_reclaim_and_snapshot_replacement(worker, workspace, monkeypatch):
-    worktrees.claim(worker, VA, 'translator')
+    claimed = worktrees.claim(worker, VA, 'translator')
     candidate(worker)
     monkeypatch.setattr(tasks.recover, 'test_c', lambda *a, **k: {'status': 'fail'})
     for _ in range(5):
         result = worktrees.submit(worker, VA)
     assert result['status'] == 'exhausted'
     assert work.read()['functions']['fn_00401000']['failures'] == 5
+    work.release(claimed['owner'], [VA])
+    manifest = tasks._load(claimed['task_id'])
+    tasks.release_claim(claimed['task_id'], claimed['owner'], manifest['lease']['token'], reason='Worker completed')
     workspace['harness'] = 'new'
     with pytest.raises(ValueError, match='five|exhausted'):
         worktrees.claim(worker, VA, 'replacement')
@@ -302,6 +358,9 @@ worktrees.submit(worker, va)
     if historical_failures:
         with pytest.raises(ValueError, match='exhausted'):
             worktrees.claim(worker, VA, 'retry')
+        manifest = tasks._load(claimed['task_id'])
+        assert manifest['attempts'][0]['status'] == 'interrupted'
+        assert manifest['status'] == 'exhausted'
         return
     reclaimed = worktrees.claim(worker, VA, 'retry')
     assert reclaimed['attempt_count'] == 1
@@ -360,8 +419,12 @@ def test_claim_is_rechecked_after_validation_before_success_commits(worker, monk
     candidate(worker)
     def gate(*a, **k):
         if replacement:
-            work.release(claimed['owner'], [VA])
-            work.claim([VA], 'another-worker')
+            # Simulate an externally replaced claim even though the public
+            # claim path now rejects a live task lease for another owner.
+            with work.locked():
+                claims = work.claims()
+                claims['fn_00401000']['owner'] = 'another-worker'
+                work._write_claims(claims)
         else:
             monkeypatch.setattr(tasks.time, 'time', lambda: claimed['expires_at'] + 2)
             monkeypatch.setattr(work, '_now', lambda: datetime.fromtimestamp(claimed['expires_at'] + 2, timezone.utc))

@@ -156,12 +156,13 @@ def plan(manifest: dict, workers: int = 2) -> dict:
     submissions take precedence over new translations; report only token-free
     task identifiers, never full manifests or bearer credentials.
     """
-    from . import tasks
+    from . import tasks, work
 
     if type(workers) is not int or workers < 1:
         raise ValueError("workers must be a positive integer within authorized runtime capacity")
     report = status(manifest)
     packets = tasks.status()
+    work_records = work.read()['functions']
     result = {"schema": "cmre-campaign-plan/1", "name": report["name"],
               "input_sha256": env.TARGET_SHA256, "milestone": report["milestone"],
               "source_coverage": report["source_coverage"], "worker_limit": workers,
@@ -180,6 +181,7 @@ def plan(manifest: dict, workers: int = 2) -> dict:
         related = sorted((p for p in packets if int(p["va"], 16) == va),
                          key=lambda p: p["created_at"], reverse=True)
         base = {"function": function, "body_bytes": row["body_bytes"]}
+        hold = work.dispatch_hold(va, work_records)
         publishing = [p for p in related if p["status"] == "publishing"]
         if publishing:
             result["review"].extend({**base, "task_id": p["task_id"], "action": "reconcile-publication"}
@@ -189,6 +191,8 @@ def plan(manifest: dict, workers: int = 2) -> dict:
         if live:
             for p in live:
                 item = {**base, "task_id": p["task_id"], "expires_at": p["lease"]["expires_at"]}
+                if hold:
+                    item['hold'] = hold
                 try:
                     tasks.validate_current(p)
                 except (ValueError, OSError) as exc:
@@ -210,7 +214,10 @@ def plan(manifest: dict, workers: int = 2) -> dict:
             if len(current) > 1:
                 result["blocked"].append({**item, "reason": "multiple-current-packets-require-review"})
             elif p["status"] == "submitted":
-                result["review"].append({**item, "action": "review-submission-before-serial-publication"})
+                result["review"].append({**item, "action": "review-submission-before-serial-publication",
+                                         **({'hold': hold} if hold else {})})
+            elif hold:
+                result["blocked"].append({**item, **hold})
             elif p["status"] in ("prepared", "claimed") and len(p["attempts"]) < tasks.MAX_ATTEMPTS:
                 if not p.get("abi", {}).get("analyst_contract"):
                     result["blocked"].append({**item, "reason": "abi-evidence-required"})
@@ -218,6 +225,8 @@ def plan(manifest: dict, workers: int = 2) -> dict:
                     dispatchable.append({**item, "action": "claim-existing-packet"})
             else:
                 result["blocked"].append({**item, "reason": p["status"], "action": "inspect-preserved-attempts"})
+        elif hold:
+            result["blocked"].append({**base, **hold})
         elif not row["states"]["lifted"]:
             result["blocked"].append({**base, "reason": "accepted-lift-required"})
         elif row["body_bytes"] > tasks.MAX_BODY_BYTES:

@@ -281,6 +281,7 @@ def test_holds_on_accepted_source_count_only_for_the_accepted_bytes(workspace):
     workspace.cmre[0].record["c"]["source_sha256"] = env.digest(source)
     section = shards.reconcile(shards.gather(), shard=2)["shards"][0]
     assert section["accepted_holds"] == {_id(vas[0]): "translation-defect"}  # legacy has no source identity
+    work.retry(vas[1], "draft obligation resolved by accepted source", changed=True)
     work.update(vas[1], "translation-defect", "accepted source regressed", "fix")
     work.update(vas[0], "needs-review", "superseded by acceptance")
     section = shards.reconcile(shards.gather(), shard=2)["shards"][0]
