@@ -231,11 +231,40 @@ def test_push_without_a_passing_receipt_for_that_commit_is_denied(publication):
     assert guard.decide("Bash", {"command": f"{PUSH} origin github-main:main"})[0] == "deny"
 
 
+@pytest.mark.parametrize('destination', ['fix/recovery-preflight', 'refs/heads/fix/recovery-preflight'])
+def test_same_name_pr_branch_requires_exact_passing_private_receipt(publication, destination):
+    guard, repo, receipts, head = publication
+    _git(repo, 'branch', 'fix/recovery-preflight')
+    command = f'{PUSH} origin fix/recovery-preflight:{destination}'
+    assert guard.decide('Bash', {'command': command})[0] == 'deny'
+    _receipt(receipts, head, result='fail')
+    assert guard.decide('Bash', {'command': command})[0] == 'deny'
+    _receipt(receipts, head, remote={'name': 'origin', 'visibility': 'PUBLIC'})
+    assert guard.decide('Bash', {'command': command})[0] == 'deny'
+    _receipt(receipts, head)
+    assert guard.decide('Bash', {'command': command})[0] == 'allow'
+    _git(repo, 'checkout', '-q', 'fix/recovery-preflight')
+    (repo / 'later.txt').write_text('unscanned branch update\n')
+    _git(repo, 'add', 'later.txt')
+    _git(repo, 'commit', '-qm', 'unscanned update')
+    assert guard.decide('Bash', {'command': command})[0] == 'deny'
+
+
+@pytest.mark.parametrize('ref', ['reviewed-tag', 'refs/tags/reviewed-tag'])
+def test_same_name_tag_is_not_a_pr_branch_even_with_passing_receipt(publication, ref):
+    guard, repo, receipts, head = publication
+    _git(repo, 'tag', 'reviewed-tag')
+    _receipt(receipts, head)
+    assert guard.decide('Bash', {'command': f'{PUSH} origin {ref}:{ref}'})[0] == 'deny'
+
+
 @pytest.mark.parametrize("command", [
     PUSH, f"{PUSH} origin main", f"{PUSH} --force origin github-main:main",
     f"{PUSH} origin +github-main:main", f"{PUSH} --all origin", f"{PUSH} --mirror origin",
     f"{PUSH} origin github-main:main --tags", f"{PUSH} upstream github-main:main",
     f"{PUSH} origin github-main:other", f"{PUSH} origin github-main:main && echo done",
+    f"{PUSH} origin github-main:refs/tags/github-main", f"{PUSH} origin :github-main",
+    f"{PUSH} --force origin github-main:github-main", f"{PUSH} origin +github-main:github-main",
     f"{PUSH} origin $(git rev-parse HEAD):main", f"cd /tmp && {PUSH} origin github-main:main",
 ])
 def test_other_push_forms_are_denied_even_with_a_receipt(publication, command):

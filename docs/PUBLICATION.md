@@ -48,11 +48,15 @@ the game; the scanner, not a regex, makes that distinction.
 6. `py -3.13 -m cmre publication scan --commit github-main` scans every blob
    reachable from the commit, checks that `origin` is private, and writes
    `CM0102/Analysis/cmre/publication/<commit>.json`.
-7. Push that ref to `main` on `origin`, in the single form the guard admits
-   (`<ref>:main`, no flags). Any other push, or a commit without a passing
-   receipt, is denied.
-8. `py -3.13 -m cmre publication verify-remote github-main` confirms the
-   remote branch and private visibility.
+7. Push the scanned ref to `main` on `origin` (`<ref>:main`, no flags), or open
+   a PR by pushing a same-name branch (`<branch>:<branch>`, no flags). Both forms
+   require the passing receipt for that exact commit. Mismatched branch names,
+   tags, deletions, force pushes and unscanned commits are denied.
+8. For a main push, `py -3.13 -m cmre publication verify-remote github-main`
+   confirms the remote branch and private visibility. For a PR branch, compare
+   `git ls-remote origin refs/heads/<branch>` with `git rev-parse <branch>` and
+   check `gh repo view --json visibility -q .visibility` is `PRIVATE` before
+   creating the PR against `main`.
 
 Original-derived test inputs that a test needs are kept out of Git in the
 hash-addressed store `local/fixtures/<sha256>` and read with

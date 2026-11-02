@@ -42,9 +42,64 @@ def _git_identity(root: Path) -> dict:
             'head': git('rev-parse', 'HEAD')}
 
 
+def _code_files(root: Path) -> dict[str, Path]:
+    modules, headers = _file(root, 'cmre'), _file(root, 'recovery/include')
+    files = sorted([*modules.glob('*.py'), *headers.rglob('*')])
+    return {p.relative_to(root).as_posix(): _file(root, p.relative_to(root))
+            for p in files if p.is_file()}
+
+
 def _code_identity(root: Path) -> str:
-    files = sorted([*(root / 'cmre').glob('*.py'), *(root / 'recovery/include').rglob('*')])
-    return tasks._hash({p.relative_to(root).as_posix(): env.digest(p) for p in files if p.is_file()})
+    return tasks._hash({name: env.digest(path) for name, path in _code_files(root).items()})
+
+
+def _align_tooling(worker: Path, expected: str) -> None:
+    """Preflight every destination, then copy exact bytes into an unbound tree.
+
+    Copies already matching the coordinator are left alone, including copies
+    retained by an interrupted alignment. Extra worker files require manual
+    reconciliation; this command never deletes them or touches candidate C.
+    """
+    source, destination = _code_files(env.ROOT), _code_files(worker)
+    extra = sorted(destination.keys() - source.keys())
+    if extra:
+        raise ValueError('Worker has extra tooling/header files; preserve and reconcile: ' + ', '.join(extra))
+    payloads = {name: path.read_bytes() for name, path in source.items()}
+    if tasks._hash({name: env.digest_bytes(data) for name, data in payloads.items()}) != expected:
+        raise ValueError('Coordinator tooling changed while planning alignment')
+    changes = []
+    for name, payload in payloads.items():
+        path = _file(worker, name)
+        if path.exists() and not path.is_file():
+            raise ValueError(f'Worker tooling destination is not a file: {name}')
+        before = path.read_bytes() if path.exists() else None
+        if before == payload:
+            continue
+        flags = subprocess.run(['git', '-C', str(worker), 'ls-files', '-v', '-z', '--', name],
+                               capture_output=True)
+        if flags.returncode:
+            raise ValueError(f'Cannot inspect worker index flags: {name}')
+        # Status can hide changes under assume-unchanged or skip-worktree.
+        # Require an ordinary tracked entry, or no entry for a new module.
+        if any(entry[:1] != b'H' for entry in flags.stdout.split(b'\0') if entry):
+            raise ValueError(f'Alignment cannot establish clean worker edits: {name}')
+        # Include ignored and untracked paths as well as index/worktree edits.
+        # A tracked deletion is a worker edit, not an invitation to restore it.
+        result = subprocess.run(['git', '-C', str(worker), 'status', '--porcelain=v1',
+                                 '-z', '--untracked-files=all', '--ignored', '--', name],
+                                capture_output=True)
+        if result.returncode:
+            raise ValueError(f'Cannot inspect worker edits: {name}')
+        if result.stdout:
+            raise ValueError(f'Alignment would overwrite worker edits: {name}')
+        changes.append((path, before, payload))
+    for path, before, payload in changes:
+        _file(worker, path.relative_to(worker))
+        if (path.read_bytes() if path.exists() else None) != before:
+            raise ValueError(f'Worker tooling changed during alignment: {path}')
+        coordination.atomic_bytes(path, payload)
+    if _code_identity(env.ROOT) != expected or _code_identity(worker) != expected:
+        raise ValueError('Tooling changed during alignment; retain the copies and inspect before retrying')
 
 
 def _pins() -> None:
@@ -80,28 +135,40 @@ def _load(worker: Path) -> dict:
     return state
 
 
-def bootstrap(worker: Path) -> dict:
+def bootstrap(worker: Path, *, align: bool = False) -> dict:
     worker = Path(worker).resolve()
     if worker.is_relative_to(env.ROOT) or env.ROOT.is_relative_to(worker):
         raise ValueError('Use a separate, non-nested Git worktree')
-    with coordination.writer():
+    with coordination.writer(), _worker_lock(worker):
         _pins()
         coordinator_git, worker_git = _git_identity(env.ROOT), _git_identity(worker)
         if coordinator_git['common'] != worker_git['common']:
             raise ValueError('Worker must share the coordinator Git common directory')
-        code = _code_identity(env.ROOT)
-        if _code_identity(worker) != code:
-            raise ValueError('Worker tooling/header snapshot differs from coordinator')
         # No links into authoritative assets, evidence or mutable recovery state.
         for relative in ('CM0102', LOCAL, 'recovery', 'recovery/c', 'recovery/hints',
                          'recovery/ledger', 'recovery/lifted', 'recovery/blocked'):
             _file(worker, relative)
         if _state_path(worker).exists():
+            retained = json.loads(_state_path(worker).read_text(encoding='utf-8'))
+            if (retained.get('schema') != SCHEMA or retained.get('worker') != str(worker)
+                    or retained.get('coordinator') != str(env.ROOT)):
+                raise ValueError('Worktree binding mismatch; preserve existing state')
+            if (retained['worker_git'] != worker_git or retained['coordinator_git'] != coordinator_git
+                    or retained['code'] != _code_identity(env.ROOT)
+                    or retained['code'] != _code_identity(worker)):
+                raise ValueError('Stale worktree code/HEAD snapshot; preserve claims and use a fresh worktree')
             if not _file(worker, LOCAL / 'binding.json').exists():
-                retained = json.loads(_state_path(worker).read_text(encoding='utf-8'))
                 coordination.atomic_json(_file(worker, LOCAL / 'binding.json'),
                                          {k: retained[k] for k in ('schema', 'worker', 'coordinator', 'binding')})
             return _load(worker)
+        if _file(worker, LOCAL / 'binding.json').exists():
+            raise ValueError('Worker has a retained local binding without coordinator state; reconcile it first')
+        code = _code_identity(env.ROOT)
+        if _code_identity(worker) != code:
+            if not align:
+                raise ValueError('Worker tooling/header snapshot differs from coordinator; '
+                                 'use bootstrap --align for a fresh worker with clean tooling paths')
+            _align_tooling(worker, code)
         state = {'schema': SCHEMA, 'worker': str(worker), 'coordinator': str(env.ROOT),
                  'binding': secrets.token_hex(24), 'code': code,
                  'worker_git': worker_git, 'coordinator_git': coordinator_git, 'functions': {}}
@@ -377,6 +444,9 @@ def add_commands(sub) -> None:
     for action in ('bootstrap', 'claim', 'submit', 'sync', 'review', 'revise', 'publish'):
         p = commands.add_parser(action)
         p.add_argument('worker', type=Path)
+        if action == 'bootstrap':
+            p.add_argument('--align', action='store_true',
+                           help='copy coordinator tooling into a fresh worker after checking for edits')
         if action != 'bootstrap':
             p.add_argument('va')
         if action == 'claim':
@@ -401,7 +471,7 @@ def command(a) -> int:
         return forward(a.va)
     args = [a.worker] if a.action == 'bootstrap' else [a.worker, _va(a.va)]
     options = {k: v for k, v in vars(a).items() if k in (
-        'owner', 'seconds', 'binding', 'reviewer', 'reason', 'source_sha256', 'report_sha256')}
+        'align', 'owner', 'seconds', 'binding', 'reviewer', 'reason', 'source_sha256', 'report_sha256')}
     result = globals()[a.action](*args, **options)
     if a.action == 'bootstrap':
         result = {k: result[k] for k in ('schema', 'worker', 'coordinator')}

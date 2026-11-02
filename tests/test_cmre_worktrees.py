@@ -258,15 +258,24 @@ print(json.dumps(worktrees.submit(worker, va)))
 
 @pytest.mark.parametrize('historical_failures', [0, 4])
 def test_killed_process_releases_locks_and_retains_reserved_attempt(worker, monkeypatch, historical_failures):
+    # Lease time is controlled in both processes: importing the child must not
+    # race a one-second lease. OS locks and process termination remain real.
+    now = 1_700_000_000.0
+    monkeypatch.setattr(tasks.time, 'time', lambda: now)
+    monkeypatch.setattr(work, '_now', lambda: datetime.fromtimestamp(now, timezone.utc))
     for _ in range(historical_failures):
         work.update(VA, 'translation-defect', 'Existing shared-checkout failure', report={'status': 'fail'})
     claimed = worktrees.claim(worker, VA, 'translator', seconds=1)
     candidate(worker)
     script = '''
 import sys, time
+from datetime import datetime, timezone
 from pathlib import Path
-from cmre import env, tasks, worktrees
+from cmre import env, tasks, work, worktrees
 root, worker, va = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+now = float(sys.argv[4])
+tasks.time.time = lambda: now
+work._now = lambda: datetime.fromtimestamp(now, timezone.utc)
 env.ROOT, env.ANALYSIS = root, root / 'analysis'
 env.C_DIR, env.HINTS_DIR = root / 'recovery/c', root / 'recovery/hints'
 worktrees._code_identity = lambda root: 'same-code'
@@ -278,13 +287,14 @@ def gate(*a, **k):
 tasks.recover.test_c = gate
 worktrees.submit(worker, va)
 '''
-    process = subprocess.Popen([sys.executable, '-c', script, str(env.ROOT), str(worker), str(VA)],
+    process = subprocess.Popen([sys.executable, '-c', script, str(env.ROOT), str(worker), str(VA), str(now)],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        assert process.stdout.readline().strip() == 'testing'
+        line = process.stdout.readline().strip()
     finally:
         process.kill()
-        process.communicate(timeout=10)
+        remaining, error = process.communicate(timeout=10)
+    assert line == 'testing', (line, process.returncode, remaining, error)
     manifest = tasks._load(claimed['task_id'])
     assert manifest['attempts'][0]['status'] == 'testing'
     monkeypatch.setattr(tasks.time, 'time', lambda: claimed['expires_at'] + 2)

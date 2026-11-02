@@ -15,19 +15,29 @@ receipt and do not start independent sessions.
 
 ## Bootstrap and claim (coordinator shell)
 
-First make the reviewed tooling available in the worker's Git revision through
-the repository's publication workflow. Bootstrap requires byte-identical `cmre/`
+Bootstrap requires byte-identical `cmre/`
 Python modules and `recovery/include/` files. It pins each tree's HEAD and tooling,
 the common Git directory, the official target SHA-256 and all inventory hashes.
 Different branch histories are allowed when the tooling is identical. Keep these
 inputs frozen until workers finish. Normalizing line endings changes their hashes;
 use the repository's existing line-ending configuration consistently.
 
+For a fresh, unbound worker from an older revision, use
+`py -3.13 -m cmre worktree bootstrap WORKER --align`. It checks pins, Git identity
+and every differing tooling/header destination before copying exact coordinator
+bytes. Edited, staged, deleted, untracked, ignored, hidden-index and extra worker
+files require manual reconciliation; unrelated candidate C stays in place.
+Interrupted copies can be retried. Valid bindings are reused automatically. Stale
+or orphan bindings require a fresh worker or explicit reconciliation; alignment
+preserves their claims and attempts.
+
 ```powershell
 git worktree add -b recovery-worker-a ../cm0102-worker-a HEAD
 git worktree add -b recovery-worker-b ../cm0102-worker-b HEAD
-py -3.13 -m cmre worktree bootstrap ../cm0102-worker-a
-py -3.13 -m cmre worktree bootstrap ../cm0102-worker-b
+py -3.13 -m cmre worktree bootstrap ../cm0102-worker-a --align
+py -3.13 -m cmre worktree bootstrap ../cm0102-worker-b --align
+py -3.13 -m cmre screen fn_X
+py -3.13 -m cmre screen fn_Y
 py -3.13 -m cmre worktree claim ../cm0102-worker-a fn_X --owner worker-a --seconds 3600
 py -3.13 -m cmre worktree claim ../cm0102-worker-b fn_Y --owner worker-b --seconds 3600
 ```
@@ -38,6 +48,37 @@ retained only by the coordinator. Its packet, including the complete original
 instruction evidence, is copied to the worker's ignored
 `CM0102/Analysis/cmre/worktree/fn_X/packet.json`. Read that packet, the inherited
 contract and the C workflow. Never stage packets or report snapshots.
+
+## Screen before dispatch
+
+Run `cmre screen fn_X` before reserving worker/review capacity. It executes every
+case in the effective semantic C corpus, including original-side discovery,
+fixtures and indirect boundaries, without a candidate build, task attempt or
+acceptance. Receipts record return counts, first returning case, instruction
+coverage, own/callee fault sites and execution seconds. Matching target, inventory,
+harness, headers, input policy, hints and observer identities allow receipt reuse.
+
+Exit 1 (`evidence-needed`) means no return was observed. Prefer another function;
+keep a named returning-input obligation for the held candidate. Exit 0
+(`return-observed`) is a scheduling signal: review the uncovered instructions,
+ABI, stack aliases and callee continuation obligations before accepting. A single
+return cannot establish path completeness. Keep all fault cases and the unchanged
+O0/O2 differential gate. Functions that intentionally never return require a
+specific instruction-evidence review rather than invented returning fixtures.
+
+Before claiming a likely register/stack adapter, check the ABI and availability of
+the required raw stack-alias and late-fault evidence in [C-BOUNDARIES.md](C-BOUNDARIES.md).
+If those inputs cannot be exercised through the current workflow, prepare that
+evidence first. Emitted-effect identity is useful structural evidence; record it
+separately from raw witnesses actually executed. The 2026-11-02 pilot reached
+returns but held both exact-stack adapters for this missing evidence; scaling
+translation alone would not have improved reviewed acceptance.
+
+For a small pilot, use `cmre pilot start NAME --functions fn_X fn_Y` before
+dispatch, retain task `validation_seconds`, and finish with `cmre pilot finish
+NAME`. Compare accepted functions/bytes, holds and elapsed time with the retained
+baseline. Record review/coordinator time and actual token usage only when observed;
+different cohorts do not establish a concurrency speedup.
 
 Worker bindings and a hash-pinned authoritative packet live under ignored analysis
 storage. Submission and review check the worker packet against that retained copy.
