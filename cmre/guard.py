@@ -45,9 +45,9 @@ DISCARD = {"/dev/null", "$null", "nul"}
 QUOTED = re.compile(r"""'[^']*'|"(?:\\.|[^"\\])*\"""")
 BARE_PYTHON = re.compile(r"(^|[;&|(]\s*|\bthen\s+|\bdo\s+)python3?(\.exe)?\s")
 GIT_PULL_OR_PUSH = re.compile(r"\bgit\s+(push|pull)\b")
-# The only push form: one ordinary fast-forward of a named local ref to origin's main.
-PUSH = re.compile(r"^\s*(?:rtk\s+)?git\s+push\s+origin\s+([A-Za-z0-9][\w./-]*):(?:refs/heads/)?main\s*$")
-PUSH_RULE = ("push only `git push origin <branch>:main` after "
+# One ordinary fast-forward to main or a same-name PR branch, with an exact scan.
+PUSH = re.compile(r"^\s*(?:rtk\s+)?git\s+push\s+origin\s+([A-Za-z0-9][\w./-]*):(?:refs/heads/)?([A-Za-z0-9][\w./-]*)\s*$")
+PUSH_RULE = ("push only `git push origin <branch>:main` or `<branch>:<branch>` after "
              "`py -3.13 -m cmre publication scan --commit <branch>` passes for that exact commit")
 
 
@@ -80,9 +80,16 @@ def receipt_allows_push(path: Path, commit: str, remote: str) -> bool:
 def _push(cmd: str) -> tuple[str, str]:
     """Allow a push only of a commit whose full reachable history passed the publication scan."""
     match = PUSH.match(cmd)
-    if not match:
+    if not match or match[2] not in ('main', match[1]):
         return "deny", PUSH_RULE
-    resolved = subprocess.run(["git", "rev-parse", "--verify", "--quiet", match[1] + "^{commit}"],
+    source = match[1]
+    if match[2] != 'main':
+        if source.startswith('refs/'):
+            return "deny", PUSH_RULE
+        # Resolve an actual local branch: a tag with the same short name must
+        # not turn the same-name PR form into a remote tag publication.
+        source = 'refs/heads/' + source
+    resolved = subprocess.run(["git", "rev-parse", "--verify", "--quiet", source + "^{commit}"],
                               cwd=ROOT, capture_output=True, text=True)
     commit = resolved.stdout.strip()
     if resolved.returncode or not re.fullmatch(r"[0-9a-f]{40}", commit):

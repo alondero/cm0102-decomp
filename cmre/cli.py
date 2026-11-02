@@ -711,6 +711,8 @@ def main(argv=None) -> int:
     publication.add_commands(sub)
     from . import worktrees
     worktrees.add_commands(sub)
+    from . import screen
+    screen.add_commands(sub)
     a = p.parse_args(argv)
     from .coordination import BusyError, writer
     try:
