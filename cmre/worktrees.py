@@ -187,15 +187,7 @@ def _function_lock(va: int):
 def _budget(va: int) -> None:
     # Count retained tasks across input fingerprints, owners and worker roots.
     record = work.read()['functions'].get(f'fn_{va:08x}', {})
-    events = record.get('report_events', {})
-    attempts, counted_failures = 0, 0
-    for path in (env.ANALYSIS / 'cmre/tasks').glob(f'c-{va:08x}-*/task.json'):
-        manifest = json.loads(path.read_text(encoding='utf-8'))
-        for attempt in manifest['attempts']:
-            attempts += 1
-            event = f"{manifest['task_id']}:{attempt['number']}"
-            counted_failures += event in events and events[event] != 'pass'
-    if attempts + record.get('failures', 0) - counted_failures >= tasks.MAX_ATTEMPTS:
+    if tasks.attempts_used(va, record) >= tasks.MAX_ATTEMPTS:
         raise ValueError('Function exhausted its five-attempt budget; retained evidence requires coordinator investigation')
 
 
@@ -221,15 +213,17 @@ def claim(worker: Path, va: int, owner: str, seconds: int = 900) -> dict:
     with coordination.writer(), _worker_lock(worker), _function_lock(va):
         state = _load(worker)
         _pins()
-        _budget(va)
         key = f'fn_{va:08x}'
-        with work.locked():
+        with work.attempt_fence(va), work.locked():
             if key in work.claims():
                 raise ValueError('Function already claimed; wait for expiry or integrator completion')
+            hold = work.dispatch_hold(va, work.read()['functions'])
+            if hold:
+                raise ValueError(f"Function has a scheduling hold: {hold['reason']}; {hold['retry_when']}")
             manifest = tasks.prepare(va)
             task_id = manifest['task_id']
             central_owner = f"wt:{state['binding'][:16]}:{owner}"
-            manifest = tasks.claim(task_id, central_owner, seconds)
+            manifest = tasks._claim_with_work_lock(task_id, central_owner, seconds)
             work._claim_unlocked([va], central_owner, seconds / 3600)
         entry = {'task_id': task_id, 'owner': central_owner, 'token': manifest['lease']['token'],
                  'expires_at': manifest['lease']['expires_at']}
@@ -287,7 +281,7 @@ def _record_attempts(va: int, manifest: dict) -> None:
         report = {'status': attempt['status'], 'key': event}
         work.update(va, 'needs-review' if report['status'] == 'pass' else 'translation-defect',
                     'Worktree task ' + manifest['task_id'], 'Review retained task evidence',
-                    report=report, event_id=event)
+                    report=report, event_id=event, preserve_hold=True)
 
 
 def _export_report(worker: Path, state: dict, va: int, manifest: dict, *, restore: bool = False) -> dict:
@@ -385,9 +379,16 @@ def review(worker: Path, va: int, *, reviewer: str, reason: str,
         attempt = manifest['attempts'][-1]
         if source_sha256 != attempt['candidate_sha256'] or report_sha256 != attempt['report_sha256']:
             raise ValueError('Review hashes differ from the submitted source/report')
-        entry['review'] = {'reviewer': reviewer, 'reason': reason, 'source_sha256': source_sha256,
-                           'report_sha256': report_sha256, 'input_fingerprint': manifest['input_fingerprint']}
-        _save(worker, state)
+        with work.locked():
+            records = work.read()['functions']
+            record = records.get(f'fn_{va:08x}', {})
+            if record.get('state') in work.HARD_HOLDS:
+                raise ValueError(f"Function has a review hold: {record['state']}; {record.get('retry_when', '')}")
+            generation = record.get('hold_generation', 0)
+            entry['review'] = {'reviewer': reviewer, 'reason': reason, 'source_sha256': source_sha256,
+                               'report_sha256': report_sha256, 'input_fingerprint': manifest['input_fingerprint'],
+                               'hold_generation': generation, 'attempt_number': attempt['number']}
+            _save(worker, state)
         return entry['review']
 
 
@@ -418,9 +419,10 @@ def publish(worker: Path, va: int) -> dict:
             review = entry['review']
             if (review['source_sha256'] != attempt['candidate_sha256']
                     or review['report_sha256'] != attempt['report_sha256']
-                    or review['input_fingerprint'] != manifest['input_fingerprint']):
+                    or review['input_fingerprint'] != manifest['input_fingerprint']
+                    or review.get('attempt_number') != attempt['number']):
                 raise ValueError('Stale review; review the current submission')
-        manifest = tasks.publish(entry['task_id'])
+        manifest = tasks.publish(entry['task_id'], worktree_worker=worker)
         if manifest['status'] == 'published':
             work.release(entry['owner'], [va])
         return _result(entry, manifest)

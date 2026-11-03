@@ -135,12 +135,28 @@ def claim_next(limit: int, owner: str, hours: float | None = None, **filters) ->
     """
     from . import work
     pool = c_frontier(limit * 4 + 20, owner=owner, **filters)
-    with work.locked():
-        taken = {k for k, c in work.claims().items() if c["owner"] != owner}
-        chosen = [i for i in pool if f"fn_{i.va:08x}" not in taken][:limit]
-        if chosen:
-            work._claim_unlocked([i.va for i in chosen], owner, hours or work.CLAIM_HOURS)
-    return chosen
+    from contextlib import ExitStack
+    from . import coordination
+    busy = set()
+    while True:
+        taken = {k for k, c in work.claims().items() if c['owner'] != owner}
+        chosen = [i for i in pool if i.va not in busy and f'fn_{i.va:08x}' not in taken][:limit]
+        if not chosen:
+            return []
+        with ExitStack() as fences:
+            for va in sorted({i.va for i in chosen}):
+                try:
+                    fences.enter_context(work.attempt_fence(va))
+                except coordination.BusyError:
+                    busy.add(va)
+                    break
+            else:
+                with work.locked():
+                    taken = {k for k, c in work.claims().items() if c['owner'] != owner}
+                    if any(f'fn_{i.va:08x}' in taken for i in chosen):
+                        continue
+                    work._claim_unlocked([i.va for i in chosen], owner, hours or work.CLAIM_HOURS)
+                    return chosen
 
 
 def coverage_summary() -> dict:

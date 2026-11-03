@@ -32,6 +32,14 @@
    Completion: observed failure and an explicit target behaviour, with files in scope.
 2. Make the change and run its focused check. User authorization for this task
    covers necessary edits; honor it if a runtime guard asks about harness files.
+   The guard denies every `cmre/` edit while a recovery writer holds the command
+   lease, because a running revalidation or batch would load the change mid-run.
+   Edit in a separate worktree while a run is active, then merge one batch
+   ([validation budget](PLAYBOOK.md#validation-budget)).
+   Changes to `HARNESS_MODULES` ship only as a release
+   ([ADR 0007](../adr/0007-harness-releases.md)): batched in a worktree, applied at
+   a recovery batch boundary, one revalidation per release, at most one release
+   per working day unless accepted evidence has a correctness defect.
    A worker reporting a harness issue returns evidence to its parent.
 3. Classify the changed files using `HARNESS_MODULES` in `cmre/recover.py`:
 

@@ -21,12 +21,23 @@ def test_move_destination_cannot_escape_policy():
     assert guard.decide('apply_patch', {'input': patch})[0] == 'deny'
 
 
-def test_explicit_scope_avoids_repeat_approval_without_weakening_preservation(monkeypatch):
+def test_explicit_scope_avoids_repeat_approval_without_weakening_preservation(tmp_path, monkeypatch):
+    monkeypatch.setenv('CMRE_COORDINATION_PATH', str(tmp_path / 'command.lock'))
     monkeypatch.setenv('CMRE_AUTHORIZED_PATHS', json.dumps(['cmre/', 'tests/']))
     assert guard.decide('Edit', {'file_path': 'cmre/difftest.py'})[0] == 'allow'
     assert guard.decide('Edit', {'file_path': 'pytest.ini'})[0] == 'ask'
     monkeypatch.setenv('CMRE_AUTHORIZED_PATHS', json.dumps(['recovery/ledger/']))
     assert guard.decide('Edit', {'file_path': 'recovery/ledger/fn_x.json'})[0] == 'deny'
+
+
+def test_authorized_scope_does_not_override_active_writer(tmp_path, monkeypatch):
+    from cmre import coordination
+    lease = tmp_path / 'command.lock'
+    monkeypatch.setenv('CMRE_COORDINATION_PATH', str(lease))
+    monkeypatch.setenv('CMRE_AUTHORIZED_PATHS', json.dumps(['cmre/']))
+    with coordination.lock(lease):
+        assert guard.decide('Edit', {'file_path': 'cmre/difftest.py'})[0] == 'deny'
+    assert guard.decide('Edit', {'file_path': 'cmre/difftest.py'})[0] == 'allow'
 
 
 def test_git_mutations_do_not_exempt_protected_paths_or_compound_commands():

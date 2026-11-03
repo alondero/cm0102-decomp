@@ -490,6 +490,11 @@ class Machine:
             outcome, detail = "error", ('native-step guard exhausted', eip)
         else:
             outcome, detail = "budget", (eip,)
+        # STOP is a top-level return only after every owned CALL has unwound.
+        # Keep native faults and other stop reasons unchanged.
+        if (outcome == 'return' and eip == STOP and self.return_runtime
+                and (self.return_runtime.frames or self.return_runtime.pending)):
+            outcome, detail = 'escape', (eip,)
         if outcome == 'return' and self.jump_runtime and not self.jump_runtime.completed():
             outcome, detail = 'escape', (eip,)
         if outcome == 'return' and self.x87_runtime and not self.x87_runtime.completed():
@@ -508,19 +513,25 @@ class Machine:
 class AddressMap:
     """Translate recovered-image addresses/values to original VAs via v_<va> labels."""
 
-    def __init__(self, symbols: dict[str, int], call_returns: dict[int, int], lo: int, hi: int):
+    def __init__(self, symbols: dict[str, int], call_returns: dict[int, int], lo: int, hi: int, *, verified_fault_locations=None):
         pairs = sorted((addr, int(n[2:], 16)) for n, addr in symbols.items() if n.startswith("v_"))
         self.addrs = [a for a, _ in pairs]
         self.vas = [v for _, v in pairs]
         self.exact = dict(pairs)
         self.call_returns = call_returns  # compiled return address -> original return VA
         self.lo, self.hi = lo, hi  # recovered code section bounds
+        self.verified_fault_locations = verified_fault_locations
 
     def location(self, addr: int) -> int:
         if not (self.lo <= addr < self.hi):
             return addr
         i = bisect.bisect_right(self.addrs, addr) - 1
         return self.vas[i] + (addr - self.addrs[i]) if i >= 0 else addr
+
+    def fault_location(self, addr: int) -> int:
+        if self.verified_fault_locations is None:
+            return self.location(addr)
+        return self.verified_fault_locations.get(addr, addr)
 
     def value(self, v: int) -> int:
         if v in self.call_returns:

@@ -58,8 +58,13 @@ Lift acceptance is a prerequisite where needed; it has a separate progress measu
    The tool compiles selected definitions together at O0/O2, runs each entry twice,
    and traps execution into every selected original extent. Inspect outcomes,
    coverage and `observed_other_selected_entries`: separate successful entry tests
-   do not prove that a recovered-to-recovered call was exercised. Static-name
-   collisions fail the combined build and require an explicit source-layout decision.
+   do not prove that a recovered-to-recovered call was exercised. Selected
+   sources compile separately and link into one image; the report retains object
+   identities and rejects ambiguous bindings.
+   A reviewed legacy routine may have an explicitly supported original-derived
+   lift companion via `--lift-companion fn_00417c10`. The report identifies that
+   execution as a fresh lift, not accepted C or new recovery credit; without the
+   explicit option the tool does not substitute legacy source or assembly.
    Embedded jump tables are original data. Composition classifies the entire
    observed read/write interval against discovered instruction bytes: a table-only
    read is data, while a read crossing into an instruction remains code-as-data.

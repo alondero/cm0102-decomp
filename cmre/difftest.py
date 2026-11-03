@@ -313,7 +313,8 @@ def _normalize(result: emu.Result, amap: emu.AddressMap | None, profile: str,
     detail = result.detail
     if result.outcome == "fault":
         (access, address, size), eip = detail
-        detail = ((access, address if access in DATA_FAULTS else loc(address), size), loc(eip))
+        fault_loc = amap.fault_location if amap is not None else (lambda x: x)
+        detail = ((access, address if access in DATA_FAULTS else fault_loc(address), size), fault_loc(eip))
     elif result.outcome in ("error", "budget"):
         detail = detail[:-1] + (loc(detail[-1]),)
     regs = result.regs
@@ -483,11 +484,13 @@ def _mapping_fault_pair(a, b, proof) -> bool:
                 and left[1:] == right[1:] and _mapping_proof_matches(proof, left[1], left[2]))
 
 
-def _equal_fault_detail(a, b, amap, proof) -> bool:
+def _equal_fault_detail(a, b, amap, proof, *, strict_data_fault=False) -> bool:
     left, right = _fault_parts(a), _fault_parts(b)
     if left is None or right is None or left[2:] != right[2:]:
         return False
     if left[0] == right[0]:
+        if strict_data_fault and left[0] in DATA_FAULTS:
+            return left[1] == right[1]
         return (_equal_location(left[1], right[1], amap) if left[0] in DATA_FAULTS
                 else left[1] == right[1])
     return _mapping_fault_pair(a, b, proof)
@@ -537,12 +540,12 @@ def _equal_blob(x: bytes, y: bytes, amap, pairs=frozenset()) -> bool:
     return True
 
 
-def _diff(a, b, amap=None, *, fault_mapping=None) -> dict:
+def _diff(a, b, amap=None, *, fault_mapping=None, strict_data_fault=False) -> dict:
     """Empty dict when equivalent; otherwise the first difference, for the report."""
     if a[0] != b[0]:
         return {"field": "outcome", "original": str(a[0]), "recovered": str(b[0])}
     if a[1] != b[1] and not (a[0] == 'fault' and _equal_fault_detail(
-            a[1], b[1], amap, fault_mapping)):
+            a[1], b[1], amap, fault_mapping, strict_data_fault=strict_data_fault)):
         return {"field": "detail", "original": str(a[1]), "recovered": str(b[1])}
     if len(a[2]) != len(b[2]) or not all(_equal(x, y, amap) for x, y in zip(a[2], b[2])):
         return {"field": "regs", "original": [hex(v) for v in a[2]], "recovered": [hex(v) for v in b[2]]}

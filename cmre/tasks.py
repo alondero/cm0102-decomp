@@ -5,7 +5,6 @@ only publication invokes acceptance. State and failure evidence survive restarts
 """
 from __future__ import annotations
 
-from contextlib import nullcontext
 import json
 import math
 import re
@@ -57,7 +56,7 @@ def _contract_path(va: int) -> Path:
 
 
 def validate_abi_contract(va: int, contract: dict) -> None:
-    """Validate an ABI contract object against the pinned bytes and schema."""
+    """Check contract structure and pinned bytes; this is not a C parser."""
     required = {"schema", "target_sha256", "address_convention", "va", "declaration",
                 "calling_convention", "evidence", "unknowns"}
     if not isinstance(contract, dict) or set(contract) != required:
@@ -67,9 +66,22 @@ def validate_abi_contract(va: int, contract: dict) -> None:
         raise ValueError("ABI contract target/function identity mismatch")
     declaration = contract["declaration"]
     if (not isinstance(declaration, str) or len(declaration) > 2000
-            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_ *(),\[\]]*;", declaration)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_ *(),.\[\]]*;", declaration)
             or not re.search(rf"\bcm_fn_{va:08x}\s*\(", declaration)):
         raise ValueError("ABI declaration must be one plain function declaration without directives or bodies")
+    if '.' in declaration:
+        # Limit variadics to the final parameter of the named function, with
+        # at least one fixed parameter. Dots elsewhere are not C declarations.
+        match = re.fullmatch(rf"[A-Za-z_][A-Za-z0-9_ *]*\bcm_fn_{va:08x}\s*\(([^().]+),\s*\.\.\.\s*\);", declaration)
+        if (not match or contract['calling_convention'] != 'cdecl'
+                or re.search(r'\b(?:CM_|__)?(?:stdcall|fastcall|thiscall)\b', declaration, re.IGNORECASE)):
+            raise ValueError("ABI declaration has malformed variadic parameters")
+        for parameter in match.group(1).split(','):
+            parameter = parameter.strip()
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*(?:\s+[A-Za-z_][A-Za-z0-9_]*|\s*\*\s*(?:[A-Za-z_][A-Za-z0-9_]*)?|\s*\[\s*\d*\s*\])*', parameter):
+                raise ValueError("ABI declaration has malformed variadic parameters")
+            if re.search(r'\bvoid\b', parameter) and not re.search(r'\bvoid\b[^*]*\*', parameter):
+                raise ValueError("ABI declaration has malformed variadic parameters")
     if contract["calling_convention"] not in ("cdecl", "stdcall", "thiscall", "fastcall"):
         raise ValueError("Unknown ABI calling convention")
     unknowns = contract["unknowns"]
@@ -236,30 +248,118 @@ def _lease(manifest: dict, owner: str, token: str) -> None:
         raise ValueError(f"Task is {manifest['status']}, not claimed")
 
 
-def claim(task_id: str, owner: str, lease_seconds: int = 900) -> dict:
+def attempts_used(va: int, record: dict) -> int:
+    """Count durable attempts and nonduplicated queue failures across packets."""
+    attempts, counted_failures = 0, 0
+    events = record.get('report_events', {})
+    for path in (env.ANALYSIS / 'cmre/tasks').glob(f'c-{va:08x}-*/task.json'):
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+        for attempt in manifest['attempts']:
+            attempts += 1
+            event = f"{manifest['task_id']}:{attempt['number']}"
+            counted_failures += event in events and events[event] != 'pass'
+    return attempts + record.get('failures', 0) - counted_failures
+
+
+def _lease_expiry(lease: dict) -> float:
+    """Reject malformed lease metadata rather than infer expiration."""
+    if not isinstance(lease, dict):
+        raise ValueError('Invalid task lease expiration; manual reconciliation required')
+    expiry = lease.get('expires_at')
+    if type(expiry) not in (int, float) or not math.isfinite(expiry):
+        raise ValueError('Invalid task lease expiration; manual reconciliation required')
+    return expiry
+
+
+def _reconcile_expired_attempts(manifest: dict, va: int, record: dict) -> None:
+    """Caller holds the work lock and this task's lock; never issue a lease."""
+    testing = [attempt for attempt in manifest['attempts'] if attempt['status'] == 'testing']
+    if not testing:
+        return
+    if manifest.get('status') != 'claimed':
+        raise ValueError('Testing attempt is not in a claimed task; manual reconciliation required')
+    lease = manifest.get('lease')
+    if lease is None or _lease_expiry(lease) > time.time():
+        raise ValueError('Testing attempt lacks an expired lease; manual reconciliation required')
+    for attempt in testing:
+        attempt.update(status='interrupted', error='Worker ended before validation completed')
+    manifest['lease'] = None
+    exhausted = attempts_used(va, record) >= MAX_ATTEMPTS
+    manifest['status'] = 'exhausted' if exhausted else 'prepared'
+    manifest['journal'].append({'event': 'attempt-reconciled', 'at': time.time(),
+                                'attempts': [attempt['number'] for attempt in testing],
+                                'status': manifest['status']})
+    save(manifest)
+
+
+def _claim_with_work_lock(task_id: str, owner: str, lease_seconds: int = 900) -> dict:
+    """Claim after checking the queue hold while the caller owns work.locked()."""
+    from . import work
     if not isinstance(owner, str) or not owner.strip() or len(owner) > 128:
         raise ValueError("Owner must be a nonempty name of at most 128 characters")
     if type(lease_seconds) is not int or not 1 <= lease_seconds <= 3600:
         raise ValueError("Lease must be 1..3600 seconds")
-    with coordination.lock(task_dir(task_id) / ".lock"):
+    directory = task_dir(task_id)
+    va = int(task_id[2:10], 16)
+    records = work.read()['functions']
+    hold = work.dispatch_hold(va, records)
+    shared_claim = work.claims().get(f'fn_{va:08x}')
+    if shared_claim and shared_claim['owner'] != owner:
+        raise ValueError('Function already has a shared claim')
+    for path in (env.ANALYSIS / 'cmre/tasks').glob(f'c-{va:08x}-*/task.json'):
+        if path.parent.name == task_id:
+            continue
+        other = json.loads(path.read_text(encoding='utf-8'))
+        if other.get('status') in ('submitted', 'publishing'):
+            raise ValueError(f"Function has a pending {other['status']} task: {other['task_id']}")
+        lease = other.get('lease')
+        if lease is not None and _lease_expiry(lease) > time.time():
+            raise ValueError(f"Function already has a live task lease: {other['task_id']}")
+        if any(attempt.get('status') == 'testing' for attempt in other.get('attempts', [])):
+            with coordination.lock(path.parent / '.lock'):
+                other = _load(path.parent.name)
+                if other.get('status') in ('submitted', 'publishing'):
+                    raise ValueError(f"Function has a pending {other['status']} task: {other['task_id']}")
+                _reconcile_expired_attempts(other, va, records.get(f'fn_{va:08x}', {}))
+    with coordination.lock(directory / ".lock"):
         manifest = _load(task_id)
-        validate_current(manifest)
+        if int(manifest['va'], 16) != va:
+            raise ValueError('Task identifier differs from function')
         if manifest["status"] not in ("prepared", "claimed", "publication-failed"):
             raise ValueError(f"Task is {manifest['status']}")
         previous = manifest.get("lease")
-        if previous and previous["expires_at"] > time.time():
+        if previous is not None and _lease_expiry(previous) > time.time():
             raise ValueError("Task already has a live lease")
+        _reconcile_expired_attempts(manifest, va, records.get(f'fn_{va:08x}', {}))
+        if hold:
+            raise ValueError(f"Function has a scheduling hold: {hold['reason']}; {hold['retry_when']}")
+        validate_current(manifest)
+        if attempts_used(va, records.get(f'fn_{va:08x}', {})) >= MAX_ATTEMPTS:
+            raise ValueError('Function exhausted its five-attempt budget across retained evidence')
         if len(manifest["attempts"]) >= MAX_ATTEMPTS:
             raise ValueError("Task attempts exhausted")
-        for attempt in manifest["attempts"]:
-            if attempt["status"] == "testing":
-                attempt.update(status="interrupted", error="Worker ended before validation completed")
         manifest["lease"] = {"owner": owner, "token": secrets.token_hex(24),
                              "expires_at": time.time() + lease_seconds}
         manifest["status"] = "claimed"
         manifest["journal"].append({"event": "claimed", "at": time.time(), "owner": owner})
         save(manifest)
         return manifest
+
+
+def claim(task_id: str, owner: str, lease_seconds: int = 900) -> dict:
+    from . import work
+    task_dir(task_id)
+    va = int(task_id[2:10], 16)
+    with work.attempt_fence(va), work.locked():
+        return _claim_with_work_lock(task_id, owner, lease_seconds)
+
+
+def _check_shared_owner(va: int, owner: str) -> None:
+    """Caller holds work.locked(); reject another live central claimant."""
+    from . import work
+    claim = work.claims().get(f'fn_{va:08x}')
+    if claim and claim['owner'] != owner:
+        raise ValueError('Function has a shared claim owned by another worker')
 
 
 def release_claim(task_id: str, owner: str, token: str, *, reason: str) -> dict:
@@ -318,9 +418,14 @@ def submit(task_id: str, owner: str, token: str, *, outcome: str = "candidate",
     """Validate fixed staged source and journal a bounded attempt; never accept."""
     if outcome not in ("candidate", "failed", "evidence-needed", "harness-defect") or not isinstance(summary, str) or len(summary) > 4000:
         raise ValueError("Invalid submission outcome/summary")
+    from . import work
     measured = _metrics(metrics)
-    with coordination.lock(task_dir(task_id) / ".lock"):
+    directory = task_dir(task_id)
+    va = int(task_id[2:10], 16)
+    with work.attempt_fence(va), coordination.lock(directory / ".lock"):
         manifest = _load(task_id)
+        if int(manifest['va'], 16) != va:
+            raise ValueError('Task identifier differs from function')
         _lease(manifest, owner, token)
         validate_current(manifest)
         if len(manifest["attempts"]) >= MAX_ATTEMPTS:
@@ -333,8 +438,25 @@ def submit(task_id: str, owner: str, token: str, *, outcome: str = "candidate",
                 raise ValueError("Write the fixed candidate source before submission")
             candidate_hash = env.digest(candidate)
             attempt.update(status="testing", candidate_sha256=candidate_hash)
-        manifest["attempts"].append(attempt)
-        save(manifest)
+        with work.locked():
+            records = work.read()['functions']
+            hold = work.dispatch_hold(va, records)
+            if hold:
+                raise ValueError(f"Function has a scheduling hold: {hold['reason']}; {hold['retry_when']}")
+            _check_shared_owner(va, owner)
+            if attempts_used(va, records.get(f'fn_{va:08x}', {})) >= MAX_ATTEMPTS:
+                raise ValueError('Function exhausted its five-attempt budget across retained evidence')
+            manifest["attempts"].append(attempt)
+            if outcome != 'candidate':
+                if outcome in ('evidence-needed', 'harness-defect'):
+                    manifest['status'] = 'escalated'
+                    manifest['lease'] = None
+                elif len(manifest['attempts']) >= MAX_ATTEMPTS:
+                    manifest['status'] = 'exhausted'
+                manifest['journal'].append({'event': 'submitted', 'at': time.time(), 'status': attempt['status']})
+                save(manifest)
+                return manifest
+            save(manifest)
         if outcome == "candidate":
             start = time.monotonic()
             try:
@@ -343,7 +465,8 @@ def submit(task_id: str, owner: str, token: str, *, outcome: str = "candidate",
                     raise ValueError("Candidate changed during validation")
                 # External queue ownership is checked and held only for this
                 # short commit, so disjoint workers may execute concurrently.
-                with ownership_guard() if ownership_guard else nullcontext():
+                with ownership_guard() if ownership_guard else work.locked():
+                    _check_shared_owner(va, owner)
                     _lease(manifest, owner, token)
                     validate_current(manifest)
                     report_path = task_dir(task_id) / f"report-{attempt['number']}.json"
@@ -444,16 +567,50 @@ def _recover_publication(manifest: dict) -> dict:
     return manifest
 
 
-def publish(task_id: str) -> dict:
+def publish(task_id: str, *, worktree_worker: Path | None = None) -> dict:
     """Coordinator-only canonical copy and acceptance, with durable rollback state."""
-    with coordination.writer(), coordination.lock(task_dir(task_id) / ".lock"):
+    from . import work
+    directory = task_dir(task_id)
+    va = int(task_id[2:10], 16)
+    with coordination.writer(), work.hold_fence(va), coordination.lock(directory / ".lock"):
         manifest = _load(task_id)
         if manifest["status"] == "publishing":
             return _recover_publication(manifest)
         if manifest["status"] == "published":
             return manifest
+        if int(manifest['va'], 16) != va:
+            raise ValueError('Task identifier differs from function')
+        worktree_origin = any(isinstance(attempt.get('owner'), str) and attempt['owner'].startswith('wt:')
+                              for attempt in manifest.get('attempts', []))
+        expected_hold_generation = None
+        if worktree_origin:
+            if worktree_worker is None:
+                raise ValueError('Worktree-origin task requires recorded worktree review and publication')
+            from . import worktrees
+            worker = Path(worktree_worker).resolve()
+            state = worktrees._load(worker)
+            entry, submitted = worktrees._submitted(worker, state, va)
+            if entry['task_id'] != task_id or submitted['task_id'] != task_id or not entry.get('review'):
+                raise ValueError('Worktree-origin task requires its authoritative review')
+            review, attempt = entry['review'], submitted['attempts'][-1]
+            if (review.get('source_sha256') != attempt['candidate_sha256']
+                    or review.get('report_sha256') != attempt['report_sha256']
+                    or review.get('input_fingerprint') != submitted['input_fingerprint']
+                    or review.get('attempt_number') != attempt['number']):
+                raise ValueError('Stale worktree review; fresh review required')
+            expected_hold_generation = review.get('hold_generation')
+            if type(expected_hold_generation) is not int or expected_hold_generation < 0:
+                raise ValueError('Worktree review lacks a valid hold generation')
+        elif worktree_worker is not None:
+            raise ValueError('Task does not have a worktree-origin attempt')
+        with work.locked():
+            record = work.read()['functions'].get(f'fn_{va:08x}', {})
+            if record.get('state') in work.HARD_HOLDS:
+                raise ValueError(f"Function has a publication hold: {record['state']}; {record.get('retry_when', '')}")
+            generation = record.get('hold_generation', 0)
+            if expected_hold_generation is not None and expected_hold_generation != generation:
+                raise ValueError('Review predates a hold; fresh review required')
         manifest = resolve_for_publish(task_id)
-        va = int(manifest["va"], 16)
         candidate = _candidate(task_id, va)
         destination = env.C_DIR / f"fn_{va:08x}.c"
         if not destination.resolve().is_relative_to(env.C_DIR.resolve()):

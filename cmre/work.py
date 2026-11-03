@@ -9,6 +9,8 @@ import time
 from . import coordination, env
 
 STATES = ("ready", "needs-review", "translation-defect", "harness-blocker", "evidence-needed")
+HARD_HOLDS = ("harness-blocker", "evidence-needed")
+_UNSET = object()
 # A claim only covers selection until the agent writes recovery/c/fn_X.c, which then holds it.
 CLAIM_HOURS = 3.0
 
@@ -35,6 +37,52 @@ def path():
     return env.HINTS_DIR / "work-state.json"
 
 
+@contextmanager
+def hold_fence(va, *, wait=False):
+    """Serialize a function's hard-hold transitions with new publication."""
+    deadline = time.monotonic() + 5
+    while True:
+        fence = coordination.lock(env.ANALYSIS / f'cmre/hold-fences/fn_{va:08x}.lock')
+        try:
+            fence.__enter__()
+            break
+        except coordination.BusyError:
+            if not wait or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+    try:
+        yield
+    finally:
+        fence.__exit__(None, None, None)
+
+
+def attempt_fence(va):
+    """Serialize one function's attempt reservations without blocking others."""
+    return coordination.lock(env.ANALYSIS / f'cmre/attempt-fences/fn_{va:08x}.lock')
+
+
+@contextmanager
+def attempt_fences(vas):
+    """Acquire distinct function fences in a stable order before the work lock."""
+    with ExitStack() as stack:
+        for va in sorted(set(vas)):
+            stack.enter_context(attempt_fence(va))
+        yield
+
+
+def dispatch_hold(va, records):
+    """Return scheduling hold details; ordinary failed attempts may be retried."""
+    record = records.get(f'fn_{va:08x}')
+    if record and record.get('state') in HARD_HOLDS:
+        return {'reason': 'work-state-hold', 'work_state': record['state'],
+                'retry_when': record.get('retry_when', ''), 'blocker': record.get('blocker', '')}
+    if ((not record or record.get('state') != 'ready')
+            and (env.C_DIR / f'fn_{va:08x}.c').is_file()):
+        return {'reason': 'existing-source-needs-review',
+                'retry_when': 'Inspect the existing unaccepted source before explicitly retrying'}
+    return None
+
+
 def read():
     if not path().exists():
         return {"schema": "cmre-work/1", "functions": {}}
@@ -54,7 +102,8 @@ def identity(va):
             **{k: env.digest(p) if p.is_file() else None for k, p in files.items()}}
 
 
-def update(va, state, reason, retry_when="", blocker="", *, report=None, event_id=None):
+def update(va, state, reason, retry_when="", blocker="", *, report=None, event_id=None,
+           preserve_hold=False, expected_previous=_UNSET, _remaining_holds=_UNSET, _resolution=None):
     if event_id is not None and (not isinstance(event_id, str) or not event_id or report is None):
         raise ValueError('Report events require a nonempty identity and report')
     if state not in STATES or not reason.strip():
@@ -64,17 +113,46 @@ def update(va, state, reason, retry_when="", blocker="", *, report=None, event_i
     from . import inventory
     if va not in inventory.load().functions:
         raise ValueError("Function is absent from the pinned inventory")
-    with locked():
+    with hold_fence(va, wait=True), locked():
         data = read()
         key = f"fn_{va:08x}"
         old = data["functions"].get(key, {})
+        if expected_previous is not _UNSET and data['functions'].get(key) != expected_previous:
+            raise ValueError('Work state changed during retry; inspect the current hold')
         if event_id is not None and event_id in old.get('report_events', {}):
             return old
         attempts = old.get("attempts", 0) + (report is not None)
         failures = old.get("failures", 0) + (report is not None and report["status"] != "pass")
+        old_hard = old.get('state') in HARD_HOLDS
+        generation = old.get('hold_generation', int(old_hard))
         record = {"state": state, "reason": reason, "retry_when": retry_when,
                   "blocker": blocker, "identity": identity(va), "attempts": attempts,
-                  "failures": failures, "updated": datetime.now(timezone.utc).isoformat()}
+                  "failures": failures, "updated": datetime.now(timezone.utc).isoformat(),
+                  "hold_generation": generation + (state in HARD_HOLDS and not old_hard)}
+        if old_hard and _remaining_holds is _UNSET and (preserve_hold or state in HARD_HOLDS):
+            for field in ('state', 'reason', 'retry_when', 'blocker', 'identity'):
+                record[field] = old.get(field, '')
+            extra = list(old.get('additional_holds', []))
+            if state in HARD_HOLDS:
+                new_hold = {'state': state, 'reason': reason, 'retry_when': retry_when, 'blocker': blocker}
+                current = {field: old.get(field, '') for field in ('state', 'reason', 'retry_when', 'blocker')}
+                if new_hold != current and new_hold not in extra:
+                    extra.append(new_hold)
+                    record['hold_generation'] = generation + 1
+            if extra:
+                record['additional_holds'] = extra
+        elif old_hard and _remaining_holds is _UNSET:
+            raise ValueError('Hard hold requires an explicit work retry')
+        elif _remaining_holds is not _UNSET:
+            if _remaining_holds:
+                record['additional_holds'] = list(_remaining_holds)
+            if old_hard and state in HARD_HOLDS:
+                record['hold_generation'] = generation + 1
+        if old.get('hold_resolutions'):
+            record['hold_resolutions'] = list(old['hold_resolutions'])
+        if old_hard and _resolution is not None:
+            record.setdefault('hold_resolutions', []).append({'state': old['state'],
+                'reason': old['reason'], 'retry_when': old.get('retry_when', ''), 'resolution': _resolution})
         if report is not None:
             record["last_report"] = {"key": report.get("key"), "status": report["status"],
                                      "profile": report.get("profile")}
@@ -103,22 +181,29 @@ def record_test(va, report):
     source = env.C_DIR / f"fn_{va:08x}.c"
     if report.get("source_sha256") and (not source.exists() or env.digest(source) != report["source_sha256"]):
         return update(va, "evidence-needed", "Source changed after the reported test",
-                      "Retest the current source and review its matching report", report=report)
+                      "Retest the current source and review its matching report", report=report, preserve_hold=True)
     if problems and all(isinstance(p, dict) and p.get("kind") == "budget-asymmetry" for p in problems):
         return update(va, "evidence-needed", reason,
                       "Investigate the asymmetric stop or establish an adequate equal budget for both executions",
-                      "execution-budget", report=report)
+                      "execution-budget", report=report, preserve_hold=True)
     return update(va, "needs-review" if report["status"] == "pass" else "translation-defect",
                   reason, "Review listing and current report" if report["status"] == "pass"
                   else "Resolve the recorded discrepancy; five failed attempts is the session ceiling",
-                  report=report)
+                  report=report, preserve_hold=True)
 
 
 def retry(va, reason, changed=False):
-    old = read()["functions"].get(f"fn_{va:08x}")
+    with locked():
+        old = read()["functions"].get(f"fn_{va:08x}")
     if changed and (not old or old["identity"] == identity(va)):
         raise ValueError("Inputs are unchanged; resolve the recorded retry condition first")
-    return update(va, "ready", reason)
+    remaining = list(old.get('additional_holds', [])) if old else []
+    if remaining:
+        following = remaining.pop(0)
+        return update(va, following['state'], following['reason'], following['retry_when'],
+                      following.get('blocker', ''), expected_previous=old,
+                      _remaining_holds=remaining, _resolution=reason)
+    return update(va, "ready", reason, expected_previous=old, _remaining_holds=[], _resolution=reason)
 
 
 def _now():
@@ -150,11 +235,27 @@ def _write_claims(live):
 
 
 def _claim_unlocked(vas, owner, hours):
+    from . import tasks
+    records = read()['functions']
+    for va in vas:
+        hold = dispatch_hold(va, records)
+        if hold:
+            raise ValueError(f"Function has a scheduling hold: {hold['reason']}; {hold['retry_when']}")
+        if tasks.attempts_used(va, records.get(f'fn_{va:08x}', {})) >= tasks.MAX_ATTEMPTS:
+            raise ValueError(f'fn_{va:08x} exhausted its five-attempt budget')
     live = _live_claims()
     taken = [f"fn_{va:08x} is claimed by {live[k]['owner']}" for va in vas
              if (k := f"fn_{va:08x}") in live and live[k]["owner"] != owner]
     if taken:
         raise ValueError("; ".join(taken))
+    for va in vas:
+        for path in (env.ANALYSIS / 'cmre/tasks').glob(f'c-{va:08x}-*/task.json'):
+            manifest = json.loads(path.read_text(encoding='utf-8'))
+            if manifest.get('status') in ('submitted', 'publishing'):
+                raise ValueError(f"fn_{va:08x} has a pending {manifest['status']} task; reconcile it before claiming")
+            lease = manifest.get('lease')
+            if lease is not None and tasks._lease_expiry(lease) > time.time() and lease.get('owner') != owner:
+                raise ValueError(f'fn_{va:08x} already has a live task lease')
     expires = (_now() + timedelta(hours=hours)).isoformat()
     for va in vas:
         live[f"fn_{va:08x}"] = {"owner": owner, "expires": expires}
@@ -166,8 +267,9 @@ def claim(vas, owner, hours=CLAIM_HOURS):
     """Claim functions for one agent, all or nothing; renewing your own claim is allowed."""
     if not owner.strip() or hours <= 0:
         raise ValueError("A claim requires an owner name and a positive duration")
-    with locked():
-        return _claim_unlocked(list(vas), owner, hours)
+    vas = list(vas)
+    with attempt_fences(vas), locked():
+        return _claim_unlocked(vas, owner, hours)
 
 
 def release(owner, vas=None):

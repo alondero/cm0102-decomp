@@ -102,10 +102,10 @@ def test_composition_classifies_entire_access_against_instruction_bytes(monkeypa
     monkeypatch.setattr(composition.difftest, "make_case", lambda *a: None)
     monkeypatch.setattr(composition.difftest, "_normalize", lambda *a: {})
     monkeypatch.setattr(composition.difftest, "_digest_view", lambda *a: "trace")
-    monkeypatch.setattr(composition.difftest, "_diff", lambda *a, fault_mapping=None: None)
+    monkeypatch.setattr(composition.difftest, "_diff", lambda *a, fault_mapping=None, strict_data_fault=False: None)
     built = SimpleNamespace(symbols={}, image=SimpleNamespace(
         text=SimpleNamespace(va=env.LINK_BASE, end=env.LINK_BASE + 4096)))
-    opts = SimpleNamespace(seed=1, cases=1, budget=10, discovery=0, min_coverage=1)
+    opts = SimpleNamespace(seed=1, cases=1, budget=10, discovery=0, min_coverage=1, inputs='v1')
     report = composition._run(va, {va: body}, built, {va: env.LINK_BASE}, opts)
     assert report["code_as_data_cases"] == expected
     assert report["status"] == ("fail" if expected else "pass")

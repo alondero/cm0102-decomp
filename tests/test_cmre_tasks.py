@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cmre import env, tasks
+from cmre import env, tasks, work
 
 VA = 0x401000
 
@@ -13,7 +13,8 @@ VA = 0x401000
 def workspace(tmp_path, monkeypatch):
     monkeypatch.setenv("CMRE_COORDINATION_PATH", str(tmp_path / "command.lock"))
     monkeypatch.delenv("CMRE_WRITER_TOKEN", raising=False)
-    for name, relative in (("ROOT", "."), ("ANALYSIS", "analysis"), ("C_DIR", "recovery/c"),
+    for name, relative in (("ROOT", "."), ("ANALYSIS", "analysis"), ("RECOVERY", "recovery"),
+                           ("HINTS_DIR", "recovery/hints"), ("C_DIR", "recovery/c"),
                            ("LIFTED_DIR", "recovery/lifted"), ("LEDGER_DIR", "recovery/ledger")):
         path = tmp_path / relative
         path.mkdir(parents=True, exist_ok=True)
@@ -65,6 +66,37 @@ def test_claim_rejects_live_lease_and_wrong_token(workspace):
     with pytest.raises(ValueError, match="owner/token"):
         tasks.submit(manifest["task_id"], "worker", "incorrect")
     assert "token" not in tasks.status(manifest["task_id"])["lease"]
+
+
+@pytest.mark.parametrize('state', ['harness-blocker', 'evidence-needed'])
+def test_direct_task_claim_respects_existing_hold(workspace, state):
+    packet = tasks.prepare(VA)
+    work.update(VA, state, 'Retained discrepancy', 'Resolve named boundary')
+    with pytest.raises(ValueError, match='hold|retry'):
+        tasks.claim(packet['task_id'], 'worker')
+    assert tasks.status(packet['task_id'])['status'] == 'prepared'
+    work.retry(VA, 'Named boundary independently resolved')
+    assert tasks.claim(packet['task_id'], 'worker')['status'] == 'claimed'
+
+
+def test_task_claim_cannot_collide_with_shared_claim(workspace):
+    packet = tasks.prepare(VA)
+    work.claim([VA], 'shared-worker')
+    with pytest.raises(ValueError, match='claim|owner'):
+        tasks.claim(packet['task_id'], 'direct-worker')
+    assert tasks.status(packet['task_id'])['status'] == 'prepared'
+    work.release('shared-worker')
+    assert tasks.claim(packet['task_id'], 'direct-worker')['status'] == 'claimed'
+
+
+def test_shared_claim_cannot_collide_with_live_task_lease(workspace, monkeypatch):
+    packet = tasks.prepare(VA)
+    lease = tasks.claim(packet['task_id'], 'direct-worker')
+    with pytest.raises(ValueError, match='claim|lease'):
+        work.claim([VA], 'shared-worker')
+    assert not work.claims()
+    monkeypatch.setattr(work.time, 'time', lambda: lease['lease']['expires_at'] + 1)
+    assert work.claim([VA], 'shared-worker')['fn_00401000']['owner'] == 'shared-worker'
 
 
 def test_expired_lease_can_be_reclaimed_but_old_token_cannot_submit(workspace, monkeypatch):
@@ -331,6 +363,41 @@ def test_analyst_abi_contract_embeds_byte_checked_claims_and_preserves_unknowns(
     assert "not machine-proven" in contract["verification"]
     assert packet["abi"]["unknown"] == ["Meaning of caller context remains unknown"]
     assert packet["inputs"]["abi_contract"] == env.digest(tasks._contract_path(VA))
+
+
+def test_abi_contract_accepts_variadic_function_declaration(workspace, monkeypatch):
+    declaration = 'int CM_CDECL cm_fn_00401000(const char *format, ...);'
+    write_contract(monkeypatch, declaration=declaration)
+    assert tasks.prepare(VA)['abi']['analyst_contract']['claims']['declaration'] == declaration
+
+
+@pytest.mark.parametrize('declaration', [
+    'int cm_fn_00401000(...);',
+    'int cm_fn_00401000(void, ...);',
+    'int cm_fn_00401000(int x, ..);',
+    'int cm_fn_00401000(int x, ....);',
+    'int cm_fn_00401000(int x, ..., int y);',
+    'int cm_fn_00401000(int x, ..., ...);',
+    'int cm_fn_00401000(int x,, ...);',
+    'int cm_fn_00401000(void name, ...);',
+    'int cm_fn_00401000(int x, void, ...);',
+    'int CM_STDCALL cm_fn_00401000(int x, ...);',
+    'int __fastcall cm_fn_00401000(int x, ...);',
+    'int cm_fn_00401000(int x, ...){ return 0; }',
+    '#define X 1\nint cm_fn_00401000(int x, ...);',
+])
+def test_abi_contract_rejects_malformed_variadic_declarations(workspace, monkeypatch, declaration):
+    write_contract(monkeypatch, declaration=declaration)
+    with pytest.raises(ValueError, match='declaration|variadic'):
+        tasks.prepare(VA)
+
+
+@pytest.mark.parametrize('convention', ['stdcall', 'fastcall', 'thiscall'])
+def test_variadic_abi_requires_cdecl(workspace, monkeypatch, convention):
+    write_contract(monkeypatch, declaration='int cm_fn_00401000(int value, ...);',
+                   calling_convention=convention)
+    with pytest.raises(ValueError, match='variadic|declaration'):
+        tasks.prepare(VA)
 
 
 def test_new_contract_invalidates_existing_task_and_changes_packet_id(workspace, monkeypatch):

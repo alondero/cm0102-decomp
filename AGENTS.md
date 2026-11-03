@@ -22,9 +22,10 @@ Original files may remain inputs to local extraction and differential tests.
    workers inherit it. Use `py -3.13` for all Python commands.
 2. Route the user's task through [docs/agent/PLAYBOOK.md](docs/agent/PLAYBOOK.md).
    Read the selected workflow only. Explicit tasks take priority over queued work.
-3. Run `py -3.13 scripts/cmre_session.py check`. Green means **both pytest and
-   cmre verify exit 0**. Report baseline failures as failures; name-only `RED`
-   tests are ordinary failing tests.
+3. Run `py -3.13 scripts/cmre_session.py check` at batch and handoff boundaries,
+   not after each accept ([validation budget](docs/agent/PLAYBOOK.md#validation-budget)).
+   Green means **both pytest and cmre verify exit 0**. Report baseline failures as
+   failures; name-only `RED` tests are ordinary failing tests.
 
 Use live `cmre status` for counts. For continuation, assess the local
 [docs/NEXT-SESSION-PROMPT.md](docs/NEXT-SESSION-PROMPT.md) against the baseline when

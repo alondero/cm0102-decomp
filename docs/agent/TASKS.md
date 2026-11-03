@@ -22,6 +22,10 @@ coordination and review cost before scaling or changing model tier.
    `cmre campaign plan MANIFEST --workers N` supplies a bounded queue and review
    backlog. Prepare a small backlog of reviewed ABI contracts so worker completion
    can refill a slot without a new open-ended parent investigation.
+   Hard holds and existing unreviewed canonical sources require explicit resolution.
+   Live leases across input fingerprints and submissions awaiting review or
+   publication block a new claim; retain their records and reconcile them first.
+   A crashed validation consumes its reserved attempt, including the fifth.
 2. Prepare one accepted lift from the selected campaign:
 
    ```powershell
@@ -40,12 +44,19 @@ coordination and review cost before scaling or changing model tier.
    thiscall or fastcall), `evidence` and `unknowns`. Each evidence item contains
    `va`, hex `bytes`, and `supports`. Preparation checks those bytes against the
    primary image and fingerprints the contract. It does not prove the analyst's
-   interpretation; review ABI claims before dispatch and retain unknowns.
+   interpretation or parse C syntax; review ABI claims before dispatch, compile
+   declarations in their actual use, and retain unknowns.
 3. Give the worker the packet path, task ID and unique owner name. Have it claim
    the task. Its only editable file is `candidate_path`, under
    `recovery/c/tasks/`; shared headers, hints and canonical source stay fixed.
    Workers may validate independent staged candidates concurrently. Completion:
    each worker has a distinct live lease and fixed output scope.
+   Use the task/worktree submission lane for bounded worker attempts. Direct
+   canonical `cmre test --c` and `cmre explain --c` are coordinator diagnostics,
+   not unattended worker validation: they do not reserve durable task attempts.
+   Explicit-source diagnostics are fenced against concurrent claims and reject
+   task and bound-worker sources; a held function can still have a separate
+   coordinator diagnostic without clearing its hold.
 4. Review submitted source against the instructions and the recorded report.
    Use [REVIEW.md](REVIEW.md) to reuse identity-matched evidence and add a targeted
    probe only for an uncovered obligation. Review may overlap independent worker
