@@ -11,8 +11,11 @@ and are excluded while it runs. Freeze harness code for the job's lifetime.
 2. Run a bounded batch:
 
    ```powershell
-   py -3.13 scripts/cmre_session.py run batch -n 500 --max-bytes 600 --jobs 16
+   py -3.13 scripts/cmre_session.py run batch -n 500 --max-bytes 600 --jobs 8
    ```
+
+   Use `--jobs 8` on the 64 GB host: 16 jobs produced `MemoryError` in 7 tiers on
+   2026-11-01. Run `check` only after the batch finishes ([validation budget](PLAYBOOK.md#validation-budget)).
 
    Completion: the runner receipt says `finished` and records the batch exit.
    A batch can exit 0 while blocking functions; read the ACCEPT/BLOCK summary.

@@ -87,6 +87,15 @@ callees as explicit boundaries. C acceptance does not establish composed executi
      (vtables, CRT function tables) show EAX is dead after every indirect call.
    - Draft markers `NEEDS-REVIEW` (`extraout_*`, `unaff_*`, `in_*`, pieces like
      `x._1_3_`) must be resolved from the listing before testing.
+   - A `call 0x00945640` (`__ftol`) is MSVC's lowering of a floating-point to
+     integer cast ([ADR 0006](../adr/0006-compiler-inserted-helpers-in-plain-c.md)).
+     Write it as `(long long)t`, where `t` is a `long double` that follows the
+     listing's x87 sequence on the original constants (`CM_GLOBAL(double, VA)`);
+     narrow the 64-bit result as the listing uses EAX/EDX, never `(int)t`. Name the
+     original call VA in a comment. A pass is not enough: break each converted
+     value once in a scratch copy (for example drop one FADD) and run
+     `cmre test fn_X --c --source COPY`. If that copy also passes, add evidenced
+     `c_hints` fixtures that reach the value before accepting.
    - MSVC pushes arguments right to left and may run a nested call between pushes.
      Pushes before `call A` that A's `(void)` signature does not take belong to the
      next call: `push x; push y; call A; push eax; push fmt; call B` is `B(fmt, A(), y, x)`.
@@ -133,6 +142,8 @@ callees as explicit boundaries. C acceptance does not establish composed executi
    local correction. `work retry fn_X --changed --reason "resolved obligation"`
    requeues changed inputs explicitly; a change alone does not resolve a blocker.
 4. `py -3.13 -m cmre accept fn_X --c`, then go back to step 1 for the next ID.
+   Accept needs no pytest, `check` or revalidation; those run per batch and per
+   harness change ([validation budget](PLAYBOOK.md#validation-budget)).
    A delegated worker stops at a passing test and returns the ID; the parent
    accepts serially (accept holds an exclusive lease and refuses a second writer).
    After review changes, wait for the worker's final pass and finished edits

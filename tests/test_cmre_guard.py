@@ -60,8 +60,73 @@ def test_agent_work_paths_are_allowed(path):
     assert decide("Write", file_path=path, content="x")[0] == "allow"
 
 
-def test_harness_edits_need_approval():
+def test_harness_edits_need_approval(tmp_path, monkeypatch):
+    monkeypatch.setenv('CMRE_COORDINATION_PATH', str(tmp_path / 'command.lock'))
     assert decide("Edit", file_path="cmre/difftest.py", old_string="a", new_string="b")[0] == "ask"
+
+
+def decide_with_lease(lease_path, tool, **tool_input):
+    """Guard verdict with the coordination lease at `lease_path` (the writer's lock file)."""
+    hook_env = dict(os.environ, CMRE_COORDINATION_PATH=str(lease_path))
+    p = subprocess.run([sys.executable, str(GUARD)], input=json.dumps({"tool_name": tool, "tool_input": tool_input}),
+                       capture_output=True, text=True, cwd=env.ROOT, env=hook_env)
+    return ("deny" if p.returncode == 2 else "ask" if p.stdout.strip() else "allow"), p.stderr
+
+
+def test_cmre_edit_message_names_the_active_writer(tmp_path):
+    # A running revalidation or batch holds this lease for its whole life. Editing the
+    # code it executes would change comparisons mid-run (see docs/agent/PLAYBOOK.md).
+    from cmre import coordination
+    lease = tmp_path / "command.lock"
+    with coordination.lock(lease):
+        verdict, reason = decide_with_lease(lease, "Edit", file_path="cmre/difftest.py", old_string="a", new_string="b")
+    assert verdict == "deny", reason
+    assert "writer" in reason.lower()
+
+
+@pytest.mark.parametrize("path", ["cmre/validation.py", "cmre/session_evidence.py"])
+def test_any_cmre_edit_is_denied_while_a_writer_holds_the_lease(tmp_path, path):
+    # Pool workers import validation.py and others at start, so non-harness edits are unsafe too.
+    from cmre import coordination
+    lease = tmp_path / "command.lock"
+    with coordination.lock(lease):
+        assert decide_with_lease(lease, "Write", file_path=path, content="x")[0] == "deny"
+
+
+def test_cmre_edits_need_approval_again_once_the_lease_is_free(tmp_path):
+    from cmre import coordination
+    lease = tmp_path / "command.lock"
+    with coordination.lock(lease):
+        pass  # released; the probe must not leave it held either
+    assert decide_with_lease(lease, "Edit", file_path="cmre/difftest.py", old_string="a", new_string="b")[0] == "ask"
+    with coordination.lock(lease):  # would raise BusyError if the guard leaked its probe lock
+        pass
+
+
+APPROVAL_TESTS = ("tests/test_cmre_guard.py::test_harness_edits_need_approval",
+                  "tests/test_cmre_guard.py::test_codex_authorization_does_not_override_preservation",
+                  "tests/test_cmre_guard_adapters.py::"
+                  "test_explicit_scope_avoids_repeat_approval_without_weakening_preservation")
+
+
+def test_approval_tests_pass_while_the_suite_runs_under_a_held_lease(tmp_path):
+    # `cmre_session.py check` runs pytest while it holds the checkout's lease (2026-11-03:
+    # these three approval tests failed there). The child's CMRE_COORDINATION_PATH stands in
+    # for that ambient lease; verdict tests that do not choose a lease must not see it.
+    from cmre import coordination
+    lease = tmp_path / "ambient-command.lock"
+    child_env = dict(os.environ, CMRE_COORDINATION_PATH=str(lease))
+    with coordination.lock(lease):
+        p = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *APPROVAL_TESTS],
+                           capture_output=True, text=True, cwd=env.ROOT, env=child_env)
+    assert p.returncode == 0, p.stdout[-2000:]
+
+
+def test_writer_probe_does_not_block_non_engine_paths(tmp_path):
+    from cmre import coordination
+    lease = tmp_path / "command.lock"
+    with coordination.lock(lease):
+        assert decide_with_lease(lease, "Write", file_path="docs/agent/notes.md", content="x")[0] == "allow"
 
 
 @pytest.mark.parametrize("command", [
@@ -138,7 +203,8 @@ def test_codex_patch_command_payload(path, expected):
     assert not result.stdout.strip()  # Codex must never receive unsupported `ask`.
 
 
-def test_codex_authorization_does_not_override_preservation():
+def test_codex_authorization_does_not_override_preservation(tmp_path, monkeypatch):
+    monkeypatch.setenv('CMRE_COORDINATION_PATH', str(tmp_path / 'command.lock'))
     for path, expected in [("cmre/guard.py", 0), ("CM0102/Game/cm0102.exe", 2)]:
         patch = f"*** Begin Patch\n*** Update File: {path}\n@@\n-a\n+b\n*** End Patch"
         result = codex_hook("apply_patch", {"command": patch}, scopes=["cmre", "CM0102/Game"])

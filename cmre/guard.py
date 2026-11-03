@@ -38,6 +38,9 @@ PROTECTED = [
 ASK = [("cmre/", "harness change: needs a failing test first and user approval"),
        ("tests/", "harness test change: needs user approval"),
        ("pytest.ini", "test configuration change")]
+# Recovery commands (revalidate, batch, check, accept) hold this OS lease while they run.
+# Same default and override as cmre/coordination.py; the probe below never creates it.
+COMMAND_LEASE = ROOT / "CM0102/Analysis/cmre/command.lock"
 PROTECTED_WORDS = ("CM0102/Game", "CM0102\\Game", "Original-3.9.60", "InstallMedia", "CM0102/Inspection",
                    "CM0102\\Inspection", "recovery/ledger", "recovery\\ledger", "recovery/lifted", "recovery\\lifted")
 MUTATING = re.compile(r"\b(rm|mv|del|rmdir|Remove-Item|Move-Item|Set-Content|Clear-Content|Add-Content|Out-File|sed\s+-i|truncate)\b")
@@ -126,6 +129,32 @@ def _push(cmd: str) -> tuple[str, str]:
     return "allow", ""
 
 
+def writer_active() -> bool:
+    """True while another process holds the command lease. A read-only probe: it never creates the file."""
+    path = Path(os.environ.get("CMRE_COORDINATION_PATH") or COMMAND_LEASE)
+    try:
+        handle = path.open("r+b")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True  # an unreadable lease is treated as held
+    with handle:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(handle, fcntl.LOCK_UN)
+        except OSError:
+            return True
+    return False
+
+
 def decide(tool: str, tool_input: dict) -> tuple[str, str]:
     tool = tool.rsplit('.', 1)[-1]
     if tool == 'exec_command':
@@ -143,6 +172,11 @@ def decide(tool: str, tool_input: dict) -> tuple[str, str]:
         for prefix, why in PROTECTED:
             if rel == prefix.rstrip("/") or rel.startswith(prefix):
                 return "deny", f"{rel}: {why}"
+        # Engine code is imported by running recovery workers. An edit made while a writer
+        # holds the lease changes comparisons already in flight; authorization does not override it.
+        if rel.startswith("cmre/") and writer_active():
+            return "deny", (f"{rel}: a recovery writer (revalidate, batch, check or accept) holds the command lease; "
+                            "wait for it to finish, or make the change in a separate worktree")
         # Set by a launcher only for paths explicitly authorized in the session.
         # This never overrides the preservation rules above.
         try:

@@ -57,7 +57,10 @@ Follow [C.md](C.md) for the translation itself; return `fn_X pass|wip: <detail>`
   junction the recovery directory or own a separate acceptance ledger.
 - `cmre test --c` takes no lock; CPU is the limit (24 logical processors here).
   Leave headroom for the integrator's acceptance reruns and do not add
-  translators during a machine job.
+  translators during a machine job. Revalidation pools are memory-limited on the
+  64 GB host: 16 jobs hit `MemoryError` (2026-11-01). 8 jobs ran 5,598 audit tiers in
+  53 minutes without one (2026-11-03).
+  The validation budget is in [PLAYBOOK](PLAYBOOK.md#validation-budget).
 - Measure before scaling: `cmre pilot` ([THROUGHPUT.md](THROUGHPUT.md)) per
   configuration. Report accepted bytes per hour and review corrections; more
   sessions without more reviewed acceptances is not progress.
