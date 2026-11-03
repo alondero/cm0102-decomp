@@ -50,7 +50,72 @@ def test_failed_attempt_is_not_reset_by_passing_test_or_manual_classification(wo
     work.update(0x401000, "evidence-needed", "entry register", "caller contract established")
     work.record_test(0x401000, {"status": "pass"})
     state = work.read()["functions"]["fn_00401000"]
-    assert (state["attempts"], state["failures"], state["state"]) == (6, 5, "needs-review")
+    assert (state["attempts"], state["failures"], state["state"]) == (6, 5, "evidence-needed")
+    assert state['retry_when'] == 'caller contract established'
+    work.retry(0x401000, 'Caller contract independently established')
+    state = work.read()["functions"]["fn_00401000"]
+    assert (state['attempts'], state['failures'], state['state']) == (6, 5, 'ready')
+
+
+def test_retry_does_not_clear_a_newer_hold(workspace, monkeypatch):
+    va = 0x401000
+    work.update(va, 'evidence-needed', 'Old hold', 'Old condition')
+    original = work.identity
+    injected = False
+    def identity_with_new_hold(value):
+        nonlocal injected
+        if not injected:
+            injected = True
+            work.update(va, 'harness-blocker', 'New hold', 'New condition')
+        return {'different': 'inputs'} if injected else original(value)
+    monkeypatch.setattr(work, 'identity', identity_with_new_hold)
+    with pytest.raises(ValueError, match='changed|hold|retry'):
+        work.retry(va, 'Old condition resolved', changed=True)
+    record = work.read()['functions']['fn_00401000']
+    assert record['reason'] == 'Old hold'
+    assert record['additional_holds'][0]['reason'] == 'New hold'
+
+
+def test_shared_claim_respects_hard_hold(workspace):
+    va = 0x401000
+    work.update(va, 'harness-blocker', 'Fault', 'Investigate fault')
+    with pytest.raises(ValueError, match='hold|retry'):
+        work.claim([va], 'worker')
+    assert not work.claims()
+
+
+def test_shared_claim_respects_combined_five_attempt_budget(workspace):
+    va = 0x401000
+    for _ in range(5):
+        work.update(va, 'translation-defect', 'failed test', report={'status': 'fail'})
+    with pytest.raises(ValueError, match='five|budget|exhaust'):
+        work.claim([va], 'worker')
+    assert not work.claims()
+
+
+def test_direct_cli_c_accept_respects_hard_hold(workspace, monkeypatch, capsys):
+    from cmre import recover
+    va = 0x401000
+    work.update(va, 'harness-blocker', 'Fault', 'Investigate fault')
+    monkeypatch.setattr(recover, 'accept', lambda *a, **k: pytest.fail('held function was accepted'))
+    assert cli.main(['accept', 'fn_00401000', '--c']) == 2
+    assert 'hold' in capsys.readouterr().err
+
+
+def test_new_evidence_does_not_erase_an_existing_hold(workspace):
+    va = 0x401000
+    work.update(va, 'harness-blocker', 'Original boundary', 'Resolve original boundary', 'original')
+    (env.C_DIR / 'fn_00401000.c').write_text('changed')
+    result = work.record_test(va, {'status': 'pass', 'source_sha256': 'old'})
+    assert result['reason'] == 'Original boundary'
+    assert len(result['additional_holds']) == 1
+    assert result['additional_holds'][0]['reason'] == 'Source changed after the reported test'
+    result = work.retry(va, 'Original boundary independently resolved')
+    assert result['state'] == 'evidence-needed'
+    assert result['reason'] == 'Source changed after the reported test'
+    result = work.retry(va, 'Changed source independently retested')
+    assert result['state'] == 'ready'
+    assert (result['attempts'], result['failures']) == (1, 0)
 
 
 def test_import_wip_is_idempotent_and_never_infers_test_success(workspace):
@@ -148,9 +213,10 @@ def test_concurrent_completion_retries_lock_without_duplicating_attempts(workspa
     calls = []
     @contextmanager
     def contended(path):
-        calls.append(path)
-        if len(calls) < 3:
-            raise work.coordination.BusyError("another worker is recording")
+        if path.name == 'work.lock':
+            calls.append(path)
+            if len(calls) < 3:
+                raise work.coordination.BusyError("another worker is recording")
         yield
     monkeypatch.setattr(work.coordination, "lock", contended)
     monkeypatch.setattr(work.time, "sleep", lambda _: None)
