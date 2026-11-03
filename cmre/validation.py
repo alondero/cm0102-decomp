@@ -14,7 +14,7 @@ import re
 import time
 import uuid
 
-from . import coordination, difftest, env, ledger, queue, recover
+from . import build, coordination, difftest, env, ledger, queue, recover
 
 SCHEMA = 'cmre-validation/2'
 BUILD_ENVIRONMENT = ('CPATH', 'C_INCLUDE_PATH', 'CPLUS_INCLUDE_PATH', 'GCC_EXEC_PREFIX',
@@ -345,37 +345,162 @@ def plan(vas: list[int], *, refresh: bool = False, reuse: str | None = None,
 
 def composition_impact(items: dict, identity: dict) -> list[dict]:
     """Account for recorded compositions without representing single-C as composed proof."""
+    from . import composition
     result = []
+    dependency_cache = {}
+    report_snapshots = {}
+    policy_snapshots = {}
+    legacy_snapshots = {}
+    initial_composition = env.digest(Path(composition.__file__))
+    inspector_snapshot = None
+    observed_drift = False
+    initial_environment = {name: os.environ[name] for name in BUILD_ENVIRONMENT if name in os.environ}
+    environment_unknown = bool(identity.get('build_environment')) or initial_environment != identity.get('build_environment', {})
     changed = {TierKey.parse(k).function for k, v in items.items() if v['action'] == 'execute'}
     for path in sorted((env.ANALYSIS / 'cmre/compositions').glob('*.json')):
         try:
+            report_snapshots[path] = env.digest_bytes(path.read_bytes())
             report = read(path)
             members = set(report['campaign']['functions'])
             affected = sorted(members & changed)
             reasons = []
+            if environment_unknown:
+                reasons.append('composition build environment overrides or drift')
             execution = {k: val for k, val in identity.items() if k not in LOCAL_IDENTITY_FIELDS}
             recorded = {k: val for k, val in report.get('execution_identity', {}).items() if k != 'headers'}
             if affected or execution != recorded:
                 reasons.append('selected tier or composition execution identity changed/unknown')
             if report.get('composition_sha256') != env.digest(Path(__file__).with_name('composition.py')):
                 reasons.append('composition implementation changed or unknown')
-            for name, sha in report.get('source_sha256', {}).items():
-                if _file_digest(env.C_DIR / name) != sha:
-                    reasons.append('changed member source ' + name)
-            if not report.get('source_dependencies') or not report.get('options'):
+            objdump = report.get('objdump')
+            if 'execution_tiers' in report and objdump is None:
+                reasons.append('composition object inspector identity unavailable')
+            if objdump is not None:
+                tool = Path(env.tool('objdump'))
+                version = env.run_tool([str(tool), '--version'])
+                current_inspector = (str(tool), _file_digest(tool), version.returncode, version.stdout)
+                if inspector_snapshot is None:
+                    inspector_snapshot = current_inspector
+                elif inspector_snapshot != current_inspector:
+                    observed_drift = True
+                    reasons.append('composition object inspector changed during evaluation')
+                if (not isinstance(objdump, dict) or objdump.get('path') != str(tool)
+                        or objdump.get('sha256') != _file_digest(tool) or version.returncode
+                        or not version.stdout.splitlines() or objdump.get('version') != version.stdout.splitlines()[0]):
+                    reasons.append('composition object inspector changed or unknown')
+            tiers = report.get('execution_tiers')
+            if tiers is None:
+                # Older reports predate explicit companions and only admit C.
+                tiers = {member: {'execution_tier': 'c'} for member in members}
+            if not isinstance(tiers, dict) or set(tiers) != members:
+                raise ValueError('composition tier coverage unavailable')
+            expected_sources = set()
+            for member in members:
+                tier = tiers[member]
+                if not isinstance(tier, dict):
+                    raise ValueError('composition tier malformed')
+                va = int(member.removeprefix('fn_'), 16)
+                if tier.get('execution_tier') == 'c':
+                    name = member + '.c'
+                    expected_sources.add(name)
+                    recorded_sha = report.get('source_sha256', {}).get(name)
+                    actual_sha = _file_digest(env.C_DIR / name)
+                    if not isinstance(recorded_sha, str) or actual_sha is None or actual_sha != recorded_sha:
+                        reasons.append('changed member source ' + name)
+                elif (tier.get('execution_tier') == 'lift-companion'
+                      and tier.get('provenance') == 'fresh-original-derived-legacy'
+                      and va == composition._LEGACY_LIFT):
+                    name = member + '.S'
+                    expected_sources.add(name)
+                    if (tier.get('ledger') != 'recovery/date/ledger.json'
+                            or tier.get('source_sha256') != composition._LEGACY_LIFT_SOURCE
+                            or report.get('source_sha256', {}).get(name) != composition._LEGACY_LIFT_SOURCE
+                            or tier.get('legacy_dependencies') != composition._LEGACY_FILES):
+                        reasons.append('legacy companion provenance changed or unknown ' + member)
+                    for legacy_name, sha in composition._LEGACY_FILES.items():
+                        current_sha = _file_digest(env.ROOT / legacy_name)
+                        if legacy_name in legacy_snapshots and legacy_snapshots[legacy_name] != current_sha:
+                            observed_drift = True
+                        legacy_snapshots[legacy_name] = current_sha
+                        if current_sha != sha:
+                            reasons.append('changed legacy input ' + legacy_name)
+                else:
+                    raise ValueError('unknown composition execution tier')
+            if set(report.get('source_sha256', {})) != expected_sources:
+                reasons.append('composition source coverage changed or unknown')
+            if not isinstance(report.get('source_dependencies'), dict) or not report.get('options'):
                 reasons.append('composition dependency coverage unavailable')
+            elif set(report['options']) != members:
+                reasons.append('composition input policy coverage unavailable')
+            c_sources = {member + '.c' for member in members if tiers[member].get('execution_tier') == 'c'}
+            if not c_sources <= set(report.get('source_dependencies', {})):
+                reasons.append('composition source dependency coverage unavailable')
+            for name in c_sources:
+                dependency = report.get('source_dependencies', {}).get(name)
+                if not isinstance(dependency, dict) or not isinstance(dependency.get('files'), dict):
+                    reasons.append('composition source dependency malformed ' + name)
+                    continue
+                source_name = env.rel(env.C_DIR / name)
+                if dependency['files'].get(source_name) != report.get('source_sha256', {}).get(name):
+                    reasons.append('composition source dependency missing ' + name)
+                source_path = env.C_DIR / name
+                if not reasons and source_path not in dependency_cache:
+                    try:
+                        dependency_cache[source_path] = recover.c_dependencies(source_path)
+                    except (build.BuildError, ValueError, OSError):
+                        dependency_cache[source_path] = None
+                if not reasons and (dependency_cache[source_path] is None or dependency_cache[source_path] != dependency):
+                    reasons.append('composition full C dependencies changed or unknown ' + name)
             for build_inputs in report.get('source_dependencies', {}).values():
+                if not isinstance(build_inputs, dict) or not isinstance(build_inputs.get('files'), dict):
+                    raise ValueError('composition build inputs malformed')
                 for name, sha in build_inputs.get('files', {}).items():
                     if _file_digest(env.ROOT / name) != sha:
                         reasons.append('changed composed build input ' + name)
             for function, options in report.get('options', {}).items():
-                if difftest.Options.for_function(int(function.removeprefix('fn_'), 16), tier='c').__dict__ != options:
+                current_options = composition.composition_c_options(int(function.removeprefix('fn_'), 16)).__dict__
+                if function in policy_snapshots and policy_snapshots[function] != current_options:
+                    observed_drift = True
+                policy_snapshots[function] = current_options
+                if current_options != options:
                     reasons.append('changed composed effective inputs ' + function)
             result.append({'receipt': str(path), 'members': sorted(members),
                            'action': 'revalidate separately' if reasons else 'outside selection; no new claim',
                            'affected': affected, 'status': report['status'], 'reasons': reasons})
         except (OSError, ValueError, KeyError, TypeError):
             result.append({'receipt': str(path), 'action': 'unknown dependencies; revalidate separately'})
+    final_environment = {name: os.environ[name] for name in BUILD_ENVIRONMENT if name in os.environ}
+    drift = (observed_drift or final_environment != initial_environment
+             or env.digest(Path(composition.__file__)) != initial_composition)
+    if not drift:
+        try:
+            drift = any(env.digest_bytes(path.read_bytes()) != sha for path, sha in report_snapshots.items())
+            drift |= any(_file_digest(env.ROOT / name) != sha for name, sha in legacy_snapshots.items())
+            drift |= any(composition.composition_c_options(int(name.removeprefix('fn_'), 16)).__dict__ != options
+                         for name, options in policy_snapshots.items())
+            if inspector_snapshot is not None:
+                tool = Path(env.tool('objdump'))
+                version = env.run_tool([str(tool), '--version'])
+                drift |= (str(tool), _file_digest(tool), version.returncode, version.stdout) != inspector_snapshot
+            if 'toolchain' in identity:
+                now = {k: v for k, v in recover.execution_identity().items() if k != 'headers'}
+                drift |= now != {k: v for k, v in identity.items() if k not in LOCAL_IDENTITY_FIELDS}
+        except (OSError, ValueError, KeyError, TypeError, build.BuildError):
+            drift = True
+    if not drift:
+        for source_path, snapshot in dependency_cache.items():
+            try:
+                if snapshot is None or recover.c_dependencies(source_path) != snapshot:
+                    drift = True
+                    break
+            except (build.BuildError, ValueError, OSError):
+                drift = True
+                break
+    if drift:
+        for row in result:
+            if row.get('action') == 'outside selection; no new claim':
+                row['action'] = 'revalidate separately'
+                row.setdefault('reasons', []).append('composition impact inputs changed during evaluation')
     return result
 
 

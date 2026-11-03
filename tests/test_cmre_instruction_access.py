@@ -26,7 +26,7 @@ def classify(monkeypatch, body, events_by_case):
     monkeypatch.setattr(composition.difftest, 'make_case', lambda *a: next(cases))
     monkeypatch.setattr(composition.difftest, '_normalize', lambda *a: {})
     monkeypatch.setattr(composition.difftest, '_digest_view', lambda *a: 'trace')
-    monkeypatch.setattr(composition.difftest, '_diff', lambda *a, fault_mapping=None: None)
+    monkeypatch.setattr(composition.difftest, '_diff', lambda *a, fault_mapping=None, strict_data_fault=False: None)
     built = SimpleNamespace(symbols={}, image=SimpleNamespace(
         text=SimpleNamespace(va=env.LINK_BASE, end=env.LINK_BASE+4096)))
     opts = SimpleNamespace(seed=1, cases=len(reports), budget=1, discovery=0, min_coverage=1)

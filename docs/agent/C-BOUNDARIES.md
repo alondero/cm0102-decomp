@@ -15,6 +15,21 @@ original callee descends into that stack space. Retain raw stack-alias and late
 fault reproducers alongside the source-identified reports. ABI normalization
 discards dead stack bytes, so a fixed-corpus pass alone does not cover these cases.
 
+For the two submitted 2026-11-02 pilot adapters, run the source-specific
+supplemental probes with a new output directory:
+
+```powershell
+py -3.13 scripts/cmre_adapter_witness.py --output CM0102/Analysis/cmre/diagnostics/adapter-witness-NEW
+```
+
+The driver checks current task and execution identities, compares the linked
+straight-line instruction streams, and retains raw paired VM states and artifact
+hashes. It covers only the two explicitly named submissions and their selected
+inputs; it does not approve a task, establish comprehensive memory or path
+coverage, or prove native continuation. Review the linked code, all applicable
+boundary evidence, and the task separately before local acceptance. Rejection
+controls are in `tests/test_cmre_adapter_witness.py`.
+
 Include aliases between a slot and its table-pointer global across recovered
 calls. In the descriptor slice, VA0094FD73 can OR that shared dword to -1;
 caller0094AE85 then rereads the pointer and faults on its next byte access.
