@@ -4,8 +4,9 @@ Written 2026-11-03 from live `cmre status`, `shards`, `work list` and job receip
 in the authoritative checkout, plus read-only scratch measurements (scripts and
 outputs are listed in section 9). Counts move: re-read them before acting. This
 plan changes no rule in [AGENTS.md](../../AGENTS.md); decisions it needs are in
-section 8, and two are drafted as proposed ADRs ([0006](../adr/0006-compiler-inserted-helpers-in-plain-c.md),
-[0007](../adr/0007-harness-releases.md)).
+section 8. Two are accepted ADRs ([0006](../adr/0006-compiler-inserted-helpers-in-plain-c.md),
+[0007](../adr/0007-harness-releases.md)). Section 3.3 and the day-1 plan were
+revised the same evening from the coverage spike's arm A result.
 
 Terms: **C** is readable C source; **lift** is the machine-translated assembly
 tier; a **tier** is one validation unit; **x87** is the x86 floating-point unit;
@@ -110,30 +111,57 @@ translators apply it.
 | --- | --- | --- |
 | `__ftol` boundary | 127 held fns, 305 KB; plus 123 unlifted, 548 KB | Policy, not harness: [ADR 0006](../adr/0006-compiler-inserted-helpers-in-plain-c.md). Spike `fn_006fa140` passes as plain C; sensitivity fixtures needed |
 | Remaining x87 | 17 fns, about 9 KB; 63 distinct forms across the group | Only after ADR 0006; extending the transport form by form unlocks slowly (29 forms reach 92 fns) |
-| Coverage barrier | 1,152 fns, 2,086 KB | Spike below |
+| Coverage barrier | 1,152 fns, 2,086 KB | Arm A result below: one input family now, a harness release for the rest |
+| Record-table chain (coverage) | not yet counted | Authored `fixtures`, no harness change (arm A passed 4 of 4 tried) |
+| Input capacity (coverage) | 10 of the 20 sampled fns | Harness release: arena size, coherent CRT heap, CRT file and import output buffers |
 | No blocker class | 125 fns, 67 KB | `cm-triager`; assign each to a family |
 | Missing virtual entry | 46 fns, 26 KB | Inventory reconciliation check first (read-only) |
-| Import output parameters | 12 + 25 fns, 38 KB | One import-boundary contract |
+| Import output parameters | 12 + 25 fns, 38 KB | One import-boundary contract; part of the input-capacity release |
 
-**Coverage-barrier spike (time box: one working day).** Random and probed inputs
-plateau below 0.6 (2026-10-21: the original-only input explorer ran on almost
-every unlifted function; a 40 times larger exploration budget changed 1 of 9
-sampled functions). The unlifted set shares a few callees: `0x0090d130`
-(`mov eax, 0x00ad4394; ret`, a global-object accessor) is called by 585 of them
-(1.2 MB); `0x00944c9f` by 674; `0x005e8290` by 599. The likely cause is
-unrealistic state under that object graph. Two arms on one fixed, size-stratified
-sample of 20 unlifted functions:
+**Coverage-barrier spike.** Random and probed inputs plateau below 0.6
+(2026-10-21: the original-only input explorer ran on almost every unlifted
+function; a 40 times larger exploration budget changed 1 of 9 sampled
+functions). The spike had two arms on one fixed, size-stratified sample of 20
+unlifted functions: **A**, authored fixtures (no harness change), and **B**,
+state captured from the running primary game (extending the read-only runtime
+observers in [RUNTIME-REPLAY.md](../RUNTIME-REPLAY.md), which today read the GDI
+build). The rule: if arm A brings 5 or more to 0.6 with the comparison unchanged,
+input authoring becomes a lane; otherwise arm B starts.
 
-- **A. Authored fixtures** (no harness change): an agent reads the listing and
-  writes evidenced `fixtures` hints that set the object pointers and fields the
-  branches test, then measures original-side coverage.
-- **B. Captured state:** snapshot the object graph under `0x00ad4394` from the
-  running primary game (extending the read-only runtime observers in
-  [RUNTIME-REPLAY.md](../RUNTIME-REPLAY.md), which today read the GDI build).
+**Arm A result (2026-11-03 evening, unchanged gate, 600 cases).** Evidence:
+`CM0102/Analysis/cmre/diagnostics/coverage-spike-20261103/RESULT.md` (local).
 
-Decide on the number of sample functions that reach 0.6 with the comparison
-unchanged. If arm A reaches it, it becomes a parallel lane (input authoring)
-that needs no harness release.
+- The premise was wrong. `0x00ad4394` is the version string `"3.9.68"`, and
+  `0x0090d130` → `0x00944c9f` (`sprintf`, format at `0x009870e8`) →
+  `0x005e8290` (`"Error"` box) is the game's error-report sequence. Calling it
+  marks a function with error paths; it is not a shared object graph. Only 1 of
+  the 10 sampled accessor callers passed; 3 of the 10 non-callers did.
+- **4 of 20 pass** (baseline 0 of 20): `fn_008dda90`, `fn_008de150`,
+  `fn_00935cb0`, `fn_00561050`. A fifth, `fn_0055efe0`, reaches 0.66 but its
+  lifted and original sides diverge. By size band: small 3 of 7, medium 1 of 7,
+  large 0 of 6. The strict count is below 5, so arm B is triggered.
+- Arm A works on one family: small and medium functions gated by chains of
+  global record tables (`0xae23bc`, `0xae23b4`, `0xb63c98`, `0xae2364`) or a
+  pointer structure. Each took 1–3 attempts, and evidence carried from one
+  function to the next.
+- 10 of the 15 still below 0.6 stop on input capacity, which arm B cannot fix
+  either (the other 5 need deep object graphs or realistic data):
+  - game objects of 0.76–2.4 MB against a `0x40000`-byte arena (`cmre/emu.py:26`);
+    6 sampled functions touch such objects, and 2 stop there;
+  - import stubs that return independent results, so `HeapAlloc` then
+    `HeapSize` faults (3 league constructors);
+  - CRT file I/O and import output buffers (`fopen`, save files, CD check),
+    5 functions.
+
+  These are harness changes, so they ship as one release
+  ([ADR 0007](../adr/0007-harness-releases.md)). Prefer designs whose new
+  inputs are opt-in per function (a hint key), so existing tiers keep their
+  case corpus and the release can reuse evidence through a compatibility
+  receipt instead of a 3.5-hour audit.
+- Arm B targets deep object graphs (`fn_008b2880`, `fn_006d1cc0`,
+  `fn_0070c040`, `fn_008dc370`). Most captured objects will not fit the current
+  arena, so arm B depends on the input-capacity release. `fn_006d1cc0` is 8
+  instructions short of 0.6 under authored inputs.
 
 ### 3.4 Lanes and providers
 
@@ -154,14 +182,16 @@ Scale translators only while `cmre next --c --min-bytes 129` is non-empty.
 
 | Phase | Work | Done when | Gate to next |
 | --- | --- | --- | --- |
-| 0 (done 2026-11-03) | Audit green; guard lease rule in both checkouts; ADR 0006 and 0007 accepted; mutation sample | main check green | — |
-| 1 (day 1) | Day plan below: `__ftol` family, coverage spike arm A, triage, tooling, `needs-review` | Lanes report; tokens per byte measured | Midday and end-of-day reviews |
-| 2 (days 2–3) | Rest of the `__ftol` family; coverage lane on the arm that worked; providers if tokens allow | Family accepted or held by name | Ready supply and tokens per byte |
-| 3 (days 3–5) | Coverage lane across the unlifted set; family contracts for the remaining groups | Ready queue above 200 KB | Ready supply |
+| 0 (done 2026-11-03) | Audit green; guard lease rule in both checkouts; ADR 0006 and 0007 accepted; mutation sample; coverage spike arm A (4 of 20) | main check green | — |
+| 1 (day 1) | Day plan below: accept arm A passes, `__ftol` family, record-table fixture lane, input-capacity release design, arm B feasibility, triage, tooling | Lanes report; tokens per byte measured | Midday and end-of-day reviews |
+| 2 (days 2–3) | Input-capacity release (one revalidation); rest of the `__ftol` family; arm B on the released harness; providers if tokens allow | Release applied and revalidated; family accepted or held by name | Ready supply and tokens per byte |
+| 3 (days 3–5) | Coverage lanes across the unlifted set by input family; family contracts for the remaining groups | Ready queue above 200 KB | Ready supply |
 | 4 | Scale translators and providers against measured supply and tokens | 500 KB/day for 3 days | — |
 
-500 KB per day is reachable only if the coverage lane opens the unlifted set;
-without it the reachable remainder is about 0.8 MB.
+500 KB per day is reachable only if the coverage lanes open the unlifted set;
+without them the reachable remainder is about 0.8 MB. Arm A shows authored
+inputs open one family cheaply. Most of the rest waits on the input-capacity
+release.
 
 ### Day 1 plan: parallel lanes
 
@@ -169,62 +199,135 @@ Only `accept`, `block`, `unblock`, `batch`, `revalidate`, the two `validation-*`
 commands, `status --write` and the session `check` take the writer lease.
 `brief`, `next`, `test`, `screen` and `work set|retry|claim` use short queue
 locks, so every lane except the integrator runs concurrently. No harness release
-is planned for day 1; a lane that needs a `HARNESS_MODULES` change stops and
-reports it.
+is applied on day 1: the input-capacity lane designs and tests one, and the
+project owner decides on it at the end-of-day review. Any other lane that needs
+a `HARNESS_MODULES` change stops and reports it.
 
-| Lane | Where | Model | Owns | Done when |
+Model tiers: **top** (strongest available), **moderate** (cheaper, capable),
+**cheap** (mechanical tasks with checkable output). Until tokens are measured,
+at most four translators (decision 7).
+
+| Lane | Where | Tier | Owns | Done when |
 | --- | --- | --- | --- | --- |
-| L1 Integrator | main checkout | strongest Claude | preflight, claims, review, serial `accept`, hourly `check`, pilots, token log, handoff | every passing source reviewed and accepted or held |
-| L2 `__ftol` owner | main checkout | strong | representative, cohort list, `work retry` of the cohort | representative accepted; cohort of 30 listed by family |
-| L3–L6 Translators (4) | main checkout, `next --c --claim` | cheapest that passes | up to 3 IDs each from the L2 list | `fn_X pass|wip` returned, mutation control run |
-| L7 Coverage spike, arm A | main checkout, sample hints only | strong | 20-function sample, `fixtures` hints, coverage numbers | number of sample functions at 0.6, by midday and end of day |
-| L8 Tooling | separate worktree | strong | `cmre mutate`, pytest split, lease-free acceptance test, blocker families | focused tests green; merged once at end of day |
-| L9 Triage | main checkout | medium | 46 missing-virtual-entry items, then the 125 with no class | each item has a family or a recorded cause |
+| L1 Integrator | main checkout | top | preflight, claims, review, serial `accept`, hourly `check`, pilots, token log, handoff | every passing source reviewed and accepted or held |
+| L2 `__ftol` owner | main checkout | top | representative, sensitivity fixtures, cohort list | representative accepted; cohort of 30 listed by family |
+| L3–L5 Translators (3) | main checkout, `next --c --claim` | moderate | up to 3 IDs each | `fn_X pass\|wip` returned, mutation control run |
+| L6 Translator (1) | main checkout, `next --c --claim` | cheap | up to 3 small IDs at a time | same; compared with L3–L5 on tokens and corrections |
+| L7 Record-table fixtures | main checkout, claimed hints only | moderate | the arm A family: census, fixtures, coverage | each claimed function passes the lifted gate or is held with its stop |
+| L7c Census helper | main checkout, read-only | cheap | static census for L7 and L9 | lists written with their scripts |
+| L8 Tooling | separate worktree | moderate | `cmre mutate`, pytest split, lease-free acceptance test, blocker families | focused tests green; merged once at end of day |
+| L9 Triage | main checkout | moderate | 46 missing-virtual-entry items, then the 125 with no class | each item has a family or a recorded cause |
+| L10 Reviewer | main checkout, read-only | top, other model family if available | review `needs-review` sources for L1 | each review has a verdict |
+| L11 Input-capacity release | separate worktree | top | proposed ADR 0008, harness changes and tests, `revalidate --plan` impact; `fn_0055efe0` mismatch | ADR and tested branch ready for the owner's decision |
+| L12 Arm B feasibility | main checkout, read-only runtime | top | captured state for one or two sample functions | a capture that reaches 0.6, or the named blocker |
 
 Lane details:
 
-- **L1.** Run `py -3.13 scripts/cmre_session.py start` once. First work: the 23
-  `needs-review` items (`cmre work list --state needs-review`): test once,
-  review, accept or hold by name. Start a pilot per cohort (`cmre pilot start`),
-  record elapsed time, accepted bytes and each lane's token use. Run `check` at
-  most hourly and never while a batch or revalidation runs. Accept nothing that
-  lacks its mutation control (C.md, `__ftol` rule).
-- **L2.** Make `fn_006fa140` the representative: move the spike source
-  (`CM0102/Analysis/cmre/diagnostics/scale-plan-20261103/spike/`) to
-  `recovery/c/`, add `c_hints` fixtures that make the FADD, precision, `<` and 360
-  controls fail, then `work retry --changed --reason "ADR 0006"` and test. Build
-  the cohort from the 127 `__ftol` callers, smallest first, preferring those whose
-  only x87 dependency is `__ftol` (callers of `0x00945ff0` need their own entry).
-  Group them with `cmre family` and hand translators families of up to three.
+- **L1.** Run `py -3.13 scripts/cmre_session.py start` once. First work, in
+  this order:
+  - The arm A passes. Review and accept `fn_008dda90`, `fn_008de150` and
+    `fn_00935cb0`. These are lifted-tier accepts: they move the functions into
+    the C queue.
+  - `fn_00561050` only after a reviewer rules on its record index 404 against
+    the 250-record capacity, as recorded in its hint's `fixture_provenance`.
+  - The 23 `needs-review` items (`cmre work list --state needs-review`).
+
+  Start a pilot per cohort (`cmre pilot start`). Record elapsed time, accepted
+  bytes and each lane's token use. Run `check` at most hourly, and never while a
+  batch or revalidation runs. Accept no `__ftol` source without its mutation
+  control (C.md).
+- **L2.** Make `fn_006fa140` the representative:
+  - Move the spike source from
+    `CM0102/Analysis/cmre/diagnostics/scale-plan-20261103/spike/` to
+    `recovery/c/`.
+  - Add `c_hints` fixtures that make the FADD, precision, `<` and 360 controls
+    fail.
+  - Run `work retry --changed --reason "ADR 0006"`, then test.
+
+  Then build the cohort from the 127 `__ftol` callers, smallest first. Prefer
+  those whose only x87 dependency is `__ftol`; callers of `0x00945ff0` need their
+  own registry entry. Group them with `cmre family` and hand translators families
+  of up to three. ADR 0006 governs the callers. `0x00945640` itself stays a
+  separate function with its own holds.
 - **L3–L6.** Follow [C.md](C.md) with the `__ftol` rule. Write only the claimed
   `recovery/c/fn_X.c` and hints for claimed IDs. Stop after five failed tests.
-- **L7.** Pick a seeded, size-stratified sample of 20 unlifted functions, at
-  least half calling `0x0090d130`. Write fixtures that set the object graph under
-  `0x00ad4394` from listing evidence; measure original-side coverage. Report the
-  number reaching 0.6. Arm B (captured game state) starts on day 2 only if arm A
-  reaches fewer than 5.
-- **L8.** In a fresh worktree from the published head: (1) `cmre mutate fn_X`
-  reporting surviving operator and constant mutants through the unchanged gate;
-  (2) a `workspace` pytest marker on the 13 files that read the real `recovery/`
-  tree, a conftest audit hook that fails unmarked tests that touch it, and
-  separate reuse keys; (3) make `test_lifted_refresh_refuses_to_erase_existing_c_tier`
-  use a temporary lease; (4) a blocker family catalogue and `cmre work families`.
-  None of these are harness modules. Tests first.
+  Before L2's cohort is ready, take the ordinary C queue, including the functions
+  L1 lifts. L6 takes functions of 128 bytes or less.
+- **L7.** Reuse the arm A tools (`try_fixture.py`, `write_hint.py`, `measure.py`,
+  `specs/` in the spike evidence directory).
+  - Take candidates from L7c's census: unlifted functions of up to about
+    900 bytes that read the record tables (`0xae23bc`, `0xae23b4`, `0xb63c98`,
+    `0xae2364`), and that do not use CRT heap or file imports.
+  - For each, write fixtures from instruction evidence and measure with the
+    unchanged `cmre test` lifted gate.
+  - Claim each function before editing its hint, remove `"auto": true` and back
+    up the old hint.
+  - Stop a function after three evidence-based attempts.
+  - Hand passes to L1.
+- **L7c.** Two read-only censuses. Each writes its script and its output under
+  `CM0102/Analysis/cmre/diagnostics/`.
+  - For L7: unlifted functions by the record-table globals they read and by the
+    imports or CRT helpers they reach.
+  - For L9: the missing-virtual-entry list.
+- **L8.** In a fresh worktree from the published head, tests first:
+  1. `cmre mutate fn_X`, reporting surviving operator and constant mutants
+     through the unchanged gate.
+  2. A `workspace` pytest marker on the 13 files that read the real `recovery/`
+     tree, a conftest audit hook that fails unmarked tests that touch it, and
+     separate reuse keys.
+  3. Make `test_lifted_refresh_refuses_to_erase_existing_c_tier` use a temporary
+     lease.
+  4. A blocker family catalogue and `cmre work families`.
+
+  None of these are harness modules.
 - **L9.** Read-only inventory check of the 46 missing-virtual-entry items
-  ([INVENTORY-RECONCILIATION.md](../INVENTORY-RECONCILIATION.md)), then `cm-triager`
-  on the no-class items. Record each under a family with a retry condition.
+  ([INVENTORY-RECONCILIATION.md](../INVENTORY-RECONCILIATION.md)), then
+  `cm-triager` on the no-class items. Record each under a family with a retry
+  condition.
+- **L10.** Review with [REVIEW.md](REVIEW.md), reading surviving mutant sites
+  first once L8's `cmre mutate` exists. Return a verdict per function to L1.
+  Use a different model family from the translators where one is available.
+- **L11.** Follow [HARNESS.md](HARNESS.md) and [ADR 0007](../adr/0007-harness-releases.md).
+  - Draft proposed ADR 0008 covering three changes:
+    - arena capacity for game objects of up to about 2.4 MB;
+    - a coherent CRT heap behind the `HeapAlloc`/`HeapSize`/`malloc` stubs;
+    - CRT file I/O and import output buffers.
+  - Prefer opt-in per-function inputs, so existing tiers keep their corpus.
+  - Implement in a worktree with focused tests, and report the
+    `cmre revalidate --plan` impact.
+  - For runs against the real binary, use an isolated candidate under
+    `CM0102/Analysis/cmre/diagnostics/`, following the
+    `composition-fault-location-guard-v2-20261103` precedent. Never edit the
+    main checkout's `cmre/`.
+  - Separately, find the cause of `fn_0055efe0`'s divergence: start from
+    `cmre explain fn_0055efe0 --case 7` (`0x9462bb` destructor tail). If it is
+    a lift defect, it joins the release.
+- **L12.** Read [RUNTIME-REPLAY.md](../RUNTIME-REPLAY.md). Find whether the
+  read-only observers can capture, from the primary 3.9.68 game, the inputs
+  `fn_006d1cc0` and `fn_008b2880` read, and whether those inputs fit the current
+  arena. Never write to the running game, and keep captures local. Report a
+  capture that reaches 0.6 under the unchanged gate, or the blocker.
 
 Leave the coordinator's existing holds alone: `fn_005b1940`, `fn_00441c10`
 composition, `fn_00524d10`, `fn_00524d50`, `fn_0068dbc0` (see the live handoff).
 
 Reviews:
 
-- **Midday.** `__ftol` accepted bytes per hour, review corrections, surviving
-  mutants, tokens per accepted byte; arm A count. Add translators only if the
-  ready list exceeds four families and tokens per byte are within the measured
-  range.
-- **End of day.** Merge L8 once, run `check`, checkpoint, and report tokens per
-  accepted byte per lane so the daily cap can be set (decision 7).
+- **Midday.**
+  - Accepted bytes per hour, review corrections and tokens per accepted byte,
+    per lane.
+  - L7: passes per attempt.
+  - L11: draft ADR.
+
+  Add translators only if the ready list exceeds four families and tokens per
+  byte are within the measured range. Add a second L7 lane if L7 passes at least
+  one function per two attempts.
+- **End of day.**
+  - Merge L8 once, run `check`, checkpoint.
+  - Report tokens per accepted byte per lane, so the daily cap can be set
+    (decision 7).
+  - The owner decides on ADR 0008. If accepted, the release is applied at the
+    next batch boundary with one revalidation.
 
 ## 5. How agents work autonomously
 
@@ -256,6 +359,9 @@ input separately); validation seconds per accepted byte; accept-lane wait time.
 4. Build the pytest split (lane L8).
 5. No per-function locking; the fresh accept repeat stays.
 6. Coverage spike: one working day for arm A, stop rule in section 3.3.
+   Outcome 2026-11-03: 4 of 20, so arm B is triggered. Arm A continues as a
+   lane for the record-table family only, and the input-capacity release is
+   designed on day 1 for the owner's decision (section 3.3).
 7. Tokens are measured on day 1; the daily cap and per-function target are set
    from those numbers. Until then, at most four translators.
 
@@ -265,6 +371,10 @@ input separately); validation seconds per accepted byte; accept-lane wait time.
   `x87_callees.py`, `fpenv_census.py`, `readset/`, `spike/`, `mutants.py`,
   `mutants-results.json`) are retained locally under
   `CM0102/Analysis/cmre/diagnostics/scale-plan-20261103/` (ignored, not published).
+- Coverage spike arm A: `CM0102/Analysis/cmre/diagnostics/coverage-spike-20261103/`
+  (`RESULT.md`, `sample.json` with seed 20261103, `specs/`, `hints-before/`, and the
+  `try_fixture.py`, `write_hint.py` and `measure.py` tools; local, not published).
+  The 10 edited hint files there are uncommitted inputs in the main checkout.
 - The x87 and callee censuses are linear disassembly of inventory extents:
   structural evidence, not execution.
 - Audit per-tier seconds include tiers reused from the earlier receipt.
