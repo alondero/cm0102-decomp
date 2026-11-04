@@ -82,6 +82,15 @@ def cmd_status(a) -> int:
                   "excluded from byte coverage")
     if a.write:
         _write_status(s)
+        from scripts.cmre_progress import write_dashboard
+        print(f"Progress atlas: {write_dashboard()}")
+    return 0
+
+
+def cmd_progress(a) -> int:
+    from scripts.cmre_progress import write_dashboard
+
+    print(f"Progress atlas: {write_dashboard(Path(a.output) if a.output else None)}")
     return 0
 
 
@@ -644,8 +653,11 @@ def main(argv=None) -> int:
     sub.add_parser("doctor", help="check environment, pins and ledgers").set_defaults(func=cmd_doctor)
     s = sub.add_parser("status", help="coverage summary")
     s.add_argument("--json", action="store_true")
-    s.add_argument("--write", action="store_true", help="regenerate docs/STATUS.md")
+    s.add_argument("--write", action="store_true", help="regenerate docs/STATUS.md and the local progress atlas")
     s.set_defaults(func=cmd_status)
+    s = sub.add_parser("progress", help="export the offline recovery treemap and history")
+    s.add_argument("--output", help="output directory (default: CM0102/Analysis/cmre/progress)")
+    s.set_defaults(func=cmd_progress)
     for name, func, help_ in (("next", cmd_next, "deterministic work queue"),
                               ("batch", cmd_batch, "lift+test+accept the queue; block failures")):
         s = sub.add_parser(name, help=help_)

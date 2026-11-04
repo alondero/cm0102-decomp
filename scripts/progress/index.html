@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <link rel="icon" href="data:,">
+  <title>CM 01/02 · Recovery atlas</title>
+  <style>/* PROGRESS_CSS */</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="badge">CM</span><div>CHAMPIONSHIP MANAGER <span class="edition">01/02</span><small>RECONSTRUCTION PROJECT · 3.9.68</small></div></div>
+  <button id="theme" type="button">Light theme</button>
+</header>
+<main>
+  <div class="intro"><div><p class="eyebrow">THE SHAPE OF THE RECOVERY</p><h1>Every function. A little closer.</h1><p>Explore the original engine, one recovered piece at a time.</p></div><div id="stamp" class="stamp"></div></div>
+  <section id="metrics" class="metrics" aria-label="Whole inventory coverage"></section>
+  <p class="caveat">Accepted C/legacy, lifts, composed calls and live integration are separate measures. Record presence is not fresh validation or proof of a standalone game.</p>
+  <section class="panel atlas" aria-labelledby="atlas-title">
+    <div class="panel-heading"><div><p class="eyebrow">ENGINE ATLAS</p><h2 id="atlas-title">The whole picture</h2></div><span id="scope-count" class="muted"></span></div>
+    <div class="toolbar">
+      <label class="search"><span>Find a function or module</span><input id="search" type="search" placeholder="e.g. fn_005ab510 or date" autocomplete="off"></label>
+      <label>Color by<select id="color"><option value="source">Accepted source</option><option value="recovered">Lift-inclusive recovery</option><option value="state">Work state</option><option value="composed">Composed calls reported</option><option value="integrated">Live integration recorded</option></select></label>
+      <label>Group by<select id="group"><option value="module">Candidate module</option><option value="shard">Recovery shard</option></select></label>
+      <button id="reset" type="button">Reset view</button>
+    </div>
+    <div class="map-heading"><button id="back" type="button" hidden>← All groups</button><strong id="breadcrumb">All candidate modules</strong><span class="muted">Area = original function body bytes</span></div>
+    <div class="map-layout"><div class="map-wrap"><canvas id="treemap" tabindex="0" aria-label="Function treemap. Click a group to zoom; use the searchable function table below for keyboard access."></canvas><div id="tooltip" role="tooltip" hidden></div><div id="empty" hidden>No functions match this search.</div></div><aside id="details" aria-live="polite"><p class="eyebrow">INSPECT THE ENGINE</p><h3>A map of the work ahead</h3><p>Click a group to zoom in, then select a function to see its recovery status.</p><p>Module names are candidates from the inventory. Ambiguous and unknown ownership remain explicit.</p></aside></div>
+    <div id="legend" class="legend" aria-label="Map colors"></div>
+  </section>
+  <div class="lower-grid">
+    <section class="panel history" aria-labelledby="history-title"><div class="panel-heading"><div><p class="eyebrow">PROGRESS OVER TIME</p><h2 id="history-title">Small steps add up</h2></div></div><div id="history-note" class="muted"></div><svg id="history-chart" viewBox="0 0 640 180" role="img" aria-label="Byte coverage history"></svg><div class="legend"><span><i class="source"></i>Accepted C/legacy</span><span><i class="lifted"></i>Lift-inclusive</span></div></section>
+    <section class="panel" aria-labelledby="accounting-title"><div class="panel-heading"><div><p class="eyebrow">RECOVERY ACCOUNTING</p><h2 id="accounting-title">Beyond the percentage</h2></div></div><div id="accounting"></div></section>
+  </div>
+  <section class="panel" aria-labelledby="functions-title"><div class="panel-heading"><div><p class="eyebrow">FUNCTION INDEX</p><h2 id="functions-title">Explore the details</h2></div><span id="table-count" class="muted"></span></div><div class="table-wrap"><table><thead><tr><th scope="col">Function · preferred-image VA</th><th scope="col">Candidate module</th><th scope="col">Body bytes</th><th scope="col">Work state</th></tr></thead><tbody id="functions"></tbody></table></div><div class="pagination"><button id="previous" type="button">← Previous</button><span id="page"></span><button id="next" type="button">Next →</button></div></section>
+  <footer><span>CM 01/02 · Recovery atlas</span><details><summary>Data provenance &amp; refresh</summary><p id="provenance"></p><p>Refresh with <code>py -3.13 -m cmre progress</code>. Successful session checks refresh this atlas through <code>cmre status --write</code>. Reopen or reload this file to see a new snapshot.</p><p>Only inventory byte counts and recovery metadata are embedded. No executable, disassembly, signatures or game assets. Review generated files before publication.</p></details></footer>
+</main>
+<script id="progress-data" type="application/json">PROGRESS_DATA</script>
+<script>/* PROGRESS_JS */</script>
+</body>
+</html>

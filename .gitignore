@@ -19,6 +19,7 @@ __pycache__/
 *.pdb
 *.obj
 *.o
+/.playwright-cli/
 
 # Generated recovery records and test inputs require publication review.
 /recovery/ledger/
