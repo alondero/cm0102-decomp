@@ -7,9 +7,9 @@ extern u32 CM_CDECL cm_fn_00934b60(u32 p1, u32 p2, u32 p3, u32 p4, u32 p5, u32 p
    arg_08 a record pointer (word at +2, dwords at +0x18, +0x1c, +0x20, +0x24).
    Field store order: 0x448 gets (arg_18 word != 0) before anything else.
    When arg_0c's low word is zero, the record is updated in two loops whose
-   pointer arithmetic is reproduced literally: the first loop does not reset
-   its source pointer, so each step subtracts the current destination
-   (src -= dst; read src + dst; store dst; dst += 4). The second loop copies
+   pointer arithmetic preserves the forward copy: the first loop subtracts
+   the initial destination once at VA 0x00936550, then reads src + dst while
+   advancing dst by four. The second loop copies
    the sum (arg_1c word + record word at +2) dwords from record+0x1c-based
    source. The lifted callee 0x934b60 then gets (arg_04, arg_08, arg_10,
    arg_14, arg_0c, 0, 0, 0, 0). Afterwards record+0x24 gets
@@ -36,11 +36,10 @@ u32 CM_CDECL cm_fn_00936510(u32 arg_04, u32 arg_08, u32 arg_0c, u32 arg_10,
         edx = *(volatile u32 *)(arg_08 + 0x18);
         ecx = *(volatile u32 *)(arg_04 + 0x3c8);
         if (count > 0) {
-            src = edx;
             c = ecx;
+            src = edx - c;
             k = (u32)count;
             do {
-                src -= c;
                 v = *(volatile u32 *)(src + c);
                 *(volatile u32 *)c = v;
                 c += 4u;

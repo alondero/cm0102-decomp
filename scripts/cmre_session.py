@@ -20,6 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 PROGRESS_KEYS = ("source_functions", "source_body_bytes", "c_tier_functions", "lifted_functions")
+SPLIT_TOOLING = ('pytest', '-p', 'cmre.workspace_audit', '--cmre-workspace-audit', '-m', 'not workspace')
+SPLIT_WORKSPACE = ('pytest', '-p', 'cmre.workspace_audit', '--cmre-workspace-audit', '-m', 'workspace')
 
 
 def now() -> str:
@@ -258,8 +260,11 @@ class Journal:
         step = {"command": ["py", "-3.13", "-m", *args], "started": now(),
                 "log": f"{len(self.data['steps']) + 1:02d}-{args[0]}.log", "state": "starting"}
         self.data["steps"].append(step)
+        split_scope = {SPLIT_TOOLING: 'tooling', SPLIT_WORKSPACE: 'workspace'}.get(args)
+        if args == ('pytest',) or split_scope:
+            step['inputs_before'] = (session_evidence.identity(ROOT, scope=split_scope) if split_scope
+                                     else session_evidence.identity(ROOT))
         if args == ('pytest',):
-            step['inputs_before'] = session_evidence.identity(ROOT)
             previous = session_evidence.find(self.path.parent.parent, step['inputs_before'], self.path)
             if previous:
                 step.update(state='finished', exit_code=0, ended=now(), evidence='reused', reused_from=previous)
@@ -296,8 +301,10 @@ class Journal:
             finally:
                 process.stdout.close()
         step.update(state="finished", ended=now(), exit_code=code)
-        if args == ('pytest',):
-            step.update(inputs_after=session_evidence.identity(ROOT), evidence='executed',
+        if args == ('pytest',) or split_scope:
+            after = (session_evidence.identity(ROOT, scope=split_scope) if split_scope
+                     else session_evidence.identity(ROOT))
+            step.update(inputs_after=after, evidence='executed',
                         log_sha256=env.digest(self.path.parent / step['log']))
             if step['inputs_after'] != step['inputs_before']:
                 step.update(exit_code=2, detail='Declared test inputs changed during pytest; evidence is inconclusive')
@@ -312,6 +319,10 @@ class Journal:
 
 
 def drive(mode: str, command: list[str], execute) -> int:
+    if mode == 'split-audit':
+        tooling = execute(SPLIT_TOOLING)
+        workspace = execute(SPLIT_WORKSPACE)
+        return tooling or workspace
     if mode == "check":
         tests = execute(("pytest",))
         verify = execute(("cmre", "verify"))
@@ -327,6 +338,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_subparsers(dest="mode", required=True)
     modes.add_parser("start", help="one full parent preflight")
+    modes.add_parser('split-audit', help='experimental split audit; does not replace or seed a full gate')
     check = modes.add_parser("check", help="full parent closing gate")
     check.add_argument("--parent", type=Path, help="bind progress to this preflight, not another session's")
     run = modes.add_parser("run", help="supervised job with doctor/status and current full pytest evidence")
