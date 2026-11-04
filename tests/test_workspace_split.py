@@ -101,3 +101,55 @@ def test_audit_rejects_unmarked_import_time_recovery_read(tmp_path):
 def test_audit_allows_marked_import_time_recovery_read(tmp_path):
     result = _pytest_collection_read(tmp_path, True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _pytest_class_collection_read(tmp_path, marked):
+    recovery = tmp_path / 'recovery'
+    recovery.mkdir()
+    (recovery / 'input').write_text('1')
+    test = tmp_path / 'test_class.py'
+    mark = 'import pytest\npytestmark = pytest.mark.workspace\n' if marked else ''
+    test.write_text(mark + f'''class TestExample:
+    def pytest_generate_tests(self, metafunc):
+        value = open({str(recovery / "input")!r}).read()
+        metafunc.parametrize("value", [value])
+
+    def test_value(self, value):
+        assert value == "1"
+''')
+    child_env = dict(os.environ, PYTHONPATH=str(env.ROOT), PYTEST_DISABLE_PLUGIN_AUTOLOAD='1')
+    return subprocess.run([sys.executable, '-m', 'pytest', '-q', '-p', 'cmre.workspace_audit',
+                           '--cmre-workspace-audit', '--cmre-recovery-root', str(recovery), str(test)],
+                          env=child_env, cwd=tmp_path, capture_output=True, text=True, timeout=30)
+
+
+def test_audit_rejects_unmarked_class_parametrization_read(tmp_path):
+    result = _pytest_class_collection_read(tmp_path, False)
+    assert result.returncode != 0 and 'unmarked recovery access during collection' in result.stdout
+
+
+def test_audit_allows_marked_class_parametrization_read(tmp_path):
+    result = _pytest_class_collection_read(tmp_path, True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_candidate_audit_runner_loads_main_package_and_candidate_plugin(tmp_path):
+    import textwrap
+    package = tmp_path / 'cmre'
+    package.mkdir()
+    (package / '__init__.py').write_text('')
+    (package / 'env.py').write_text('from pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\nRECOVERY = ROOT / "recovery"\n')
+    (tmp_path / 'tests').mkdir()
+    (tmp_path / 'scripts/tests').mkdir(parents=True)
+    (tmp_path / 'tests/test_main.py').write_text(textwrap.dedent('''
+        from cmre import env
+        def test_main_package():
+            assert env.ROOT.name == %r
+    ''' % tmp_path.name))
+    (tmp_path / 'scripts/tests/test_main_scripts.py').write_text('def test_script():\n    assert True\n')
+    runner = env.ROOT / 'scripts/cmre_candidate_audit.py'
+    child_env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD='1')
+    result = subprocess.run([sys.executable, str(runner), str(tmp_path)], env=child_env, cwd=tmp_path,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '2 passed' in result.stdout
