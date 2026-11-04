@@ -55,7 +55,7 @@ RECEIPTS = env.ANALYSIS / "cmre/publication"
 SUPPLIED = tuple(env.ROOT / "CM0102" / name for name in ("Game", "Original-3.9.60", "InstallMedia"))
 # Generated baseline manifests quote public hashes; only whole copies matter.
 COPY_ONLY = (env.ROOT / "CM0102/Inspection",)
-PRIVATE_REFS = ("refs/heads/main",)  # the prior local history, never published
+PRIVATE_REFS = ("refs/private/cm0102-pre-publication",)  # preserved private history; never repoint
 # Archives hold compressed copies; their extracted payloads are indexed instead.
 CONTAINERS = {".iso", ".zip", ".cab", ".7z"}
 

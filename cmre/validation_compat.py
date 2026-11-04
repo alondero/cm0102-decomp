@@ -130,6 +130,9 @@ def create(before_path: Path, after_path: Path, regression: Path, reviewer: str,
 
 def check(path: Path, prior: dict, identity: dict) -> set[str]:
     data = validation.read(path)
+    from . import known_data_compat
+    if data.get('schema') == known_data_compat.SCHEMA:
+        return known_data_compat.check(data, prior, identity)
     from . import observation_compat
     if data.get('schema') == observation_compat.SCHEMA:
         return observation_compat.check(data, prior, identity)

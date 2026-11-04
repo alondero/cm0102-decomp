@@ -79,12 +79,47 @@ addresses to unsigned dwords), and `import_seed`. Arena writes are relative to
 `emu.ARENA`; globals use preferred-image VAs. Keep the binary hash and the
 original instruction evidence with the exploration artifacts.
 
-Fixtures contain initial inputs only. Never capture execution results, change
-callee code, or supply invented callbacks. The generator mixes fixture replay
-with ordinary random cases; both differential sides receive identical inputs.
+Fixtures contain inputs at entry to the function under test. Store observed
+results separately in witness receipts; replay no callee-result transcript or
+invented callback, and leave original callee code unchanged. The generator mixes
+fixture replay with ordinary random cases; both differential sides receive identical inputs.
 Keep the normal acceptance budget and coverage threshold. A short original-only
 probe is input exploration, not acceptance evidence; run the full `cmre accept`
 gate before reporting recovery.
+
+## Input-family loop
+
+Use this loop for a named input gap or several consumers of the same layout.
+
+1. Run the cheapest original-only probe that answers the gap. Retain the exact
+   initial case, native stop/data address, registers/call context, options,
+   image/code/input hashes and observation. Distinguish sampled instruction hits
+   from complete-corpus coverage. Use the actual case index, not a fixture index.
+2. Derive field widths, pointer/table bounds and branch conditions from original
+   instructions. Select bounded values, indices and strings as explicit test
+   inputs, then observe the original on those inputs. Each literal need not appear
+   in a historical caller. Label the supplied state as a selected test input.
+   Claim a constructor output or startup state only with its original proof.
+   Keep unknown helper/OS behavior, scratch initialization and callee outputs unknown.
+3. Save reusable components in the family's ignored evidence directory: layout
+   and producer/consumer pins, exact initial writes and prerequisites, fixture
+   schema/hash, original observations and consuming function IDs. Record whether
+   a component is proposed or original-observed. Reuse unchanged evidence and
+   combine compatible components instead of rediscovering each consumer's graph.
+4. Preserve existing shared/C fixture prefixes, ordinary random cases and all
+   execution/acceptance policies when proposing a canonical update. Claim edited
+   hints by removing `auto`. Private original-only exploration stays within the
+   assigned worker budget; it neither resets nor replaces the canonical retry
+   limits above or the C workflow's lifetime failure ceiling.
+5. Classify the next stop before continuing. A missing initial input remains
+   owner work; an unsupported native/import result, calling convention or observer
+   capability becomes an evidence-bound hold with a specific retry condition.
+   Stop repeated probes of that same capability gap. Once inputs are ready, run
+   the unchanged complete corpus and required C/control gates in [C.md](C.md).
+
+Completion: a reusable original-observed input bundle with a precise next gate,
+or a concrete blocker with retained partial components. Only the normal reviewed
+acceptance workflow establishes recovery.
 
 Done: accepted through `cmre accept`, re-blocked with improved evidence, or
 returned as a harness issue. Report

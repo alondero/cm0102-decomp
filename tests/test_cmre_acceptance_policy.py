@@ -32,7 +32,7 @@ def test_c_rejects_insufficient_evidence(tmp_path, monkeypatch, coverage, exclud
     (tmp_path / "fn_004671b0.c").write_text("u32 cm_fn_004671b0(void) { return 0; }\n")
     ret = SimpleNamespace(va=0x004671B0, raw=b"\xc3", target=None)
     monkeypatch.setattr(recover.lift, "discover", lambda va: SimpleNamespace(va=va, region_end=va+1,
-                                                                          insns={va: ret}, tables={}, name="test"))
+                                                                          insns={va: ret}, tables={}, data=[], name="test"))
     monkeypatch.setattr(recover.build, "build", lambda *args: SimpleNamespace(
         image=SimpleNamespace(return_bindings=(), jump_bindings=(), x87_bindings=())))
     monkeypatch.setattr(difftest, "run", lambda *args, **kwargs: {"mismatches": [], "inconclusive": 0,

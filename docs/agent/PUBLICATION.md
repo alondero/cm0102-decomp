@@ -60,9 +60,12 @@ approve a binary package.
 5. For a requested push, run `py -3.13 -m cmre publication scan --commit BRANCH`
    against the intended remote, adding the same source-review argument. The scan
    covers every reachable blob, including removed files, and rejects ancestry
-   shared with the preserved private history. The default private ref is local
-   `main`; use the existing separate source-publication history. Do not clear or
-   repoint the private-history baseline to make a scan pass.
+   shared with the preserved private history. The default private ref is
+   `refs/private/cm0102-pre-publication`; preserve its original commit identity.
+   Local `main` tracks `origin/main` in the source-only history. Never merge the
+   private history into it or clear/repoint the private baseline to pass a scan.
+   A source-only clone lacks that local ref: perform publication scans in the
+   authoritative checkout, where the original history and supplied inputs exist.
 6. A passing receipt binds the exact commit, push URL and known PUBLIC/PRIVATE
    visibility. Supported guarded commands are `git push origin BRANCH:main` and the
    existing same-name PR form `git push origin BRANCH:BRANCH`; both require that

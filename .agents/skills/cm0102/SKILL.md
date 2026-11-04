@@ -13,7 +13,9 @@ For example, a request for a readable date subsystem uses `SUBSYSTEM.md`; a
 native-port request uses `PORT.md` and its current milestone entry gate.
 Workers inherit completed parent preflight. Delegate only when authorized;
 the parent owns jobs, shared layouts, acceptance scheduling and the final gate.
+For parallel ad hoc worktrees, use the project `cm0102-coordinator` or
+`cm0102-worktree` skill for the session's role.
 
-For project continuations, run the C loop in `docs/agent/C.md` (`cmre next --c`,
-`cmre brief`, write C, `cmre test --c`, `cmre accept --c`) until the budget is
-used. Use `cmre` commands instead of ad-hoc probe scripts.
+For project continuations, select the campaign's next connected source result
+through the playbook. Use `cmre campaign plan` for bounded packet work; the
+campaign workflow owns priorities, evidence reuse and measured concurrency.

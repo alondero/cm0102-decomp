@@ -96,6 +96,9 @@ def verify() -> list[str]:
             r = e.record
             if r.get("schema") != SCHEMA:
                 problems.append(f"{e.source}: schema {r.get('schema')!r}")
+            if 'c_retractions' in r:
+                from . import retract
+                problems.extend(f"{e.source}: {problem}" for problem in retract.verify_history(r))
             for tier in ("lifted", "c"):
                 t = r.get(tier)
                 if not t:

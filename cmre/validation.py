@@ -263,16 +263,16 @@ def plan(vas: list[int], *, refresh: bool = False, reuse: str | None = None,
     compatible = set()
     proof_origin = str(path) if path else None
     inherited = prior.get('compatibility') or {}
-    if compatibility is None and not audit and inherited.get('kind') == 'observation-proof':
+    if compatibility is None and not audit and inherited.get('kind') in {'observation-proof', 'known-data-proof'}:
         compatibility = inherited['path']
         if env.digest(Path(compatibility)) != inherited['sha256']:
             raise ValueError('Inherited compatibility receipt changed')
     if compatibility:
         from . import validation_compat
-        from . import observation_compat
+        from . import observation_compat, known_data_compat
         proof_data = read(Path(compatibility))
         proof_prior = prior
-        if proof_data.get('schema') == observation_compat.SCHEMA:
+        if proof_data.get('schema') in {observation_compat.SCHEMA, known_data_compat.SCHEMA}:
             proof_origin = proof_data['before_receipt']
             if prior.get('identity') == proof_data['after']:
                 if prior.get('identity_drift') or inherited.get('sha256') != env.digest(Path(compatibility)):
@@ -285,6 +285,9 @@ def plan(vas: list[int], *, refresh: bool = False, reuse: str | None = None,
         for tier in ('lifted', 'c') if record.get('c') else ('lifted',):
             key = str(TierKey(va, tier))
             old = prior.get('results', {}).get(key, {})
+            known = key in compatible and getattr(compatible, 'known_data', False)
+            if known:
+                old = compatible.origins[key]  # retain authenticated old report identity
             adopted = None
             reason = []
             try:
@@ -300,7 +303,8 @@ def plan(vas: list[int], *, refresh: bool = False, reuse: str | None = None,
             if audit:
                 reason.append('explicit full audit')
             if not same and key not in compatible and not adopted:
-                reason.append('tier outside verified compatibility scope' if getattr(compatible, 'observation', False)
+                reason.append('tier outside verified compatibility scope' if (getattr(compatible, 'observation', False)
+                              or getattr(compatible, 'known_data', False))
                               else 'global execution/harness identity changed or unavailable')
             if not old.get('ok'):
                 reason.append('no successful tier receipt (previous failures retained)')
@@ -308,7 +312,10 @@ def plan(vas: list[int], *, refresh: bool = False, reuse: str | None = None,
                 reason.append('acceptance refresh not previously checked')
             before = old.get('dependencies', {})
             observation = key in compatible and getattr(compatible, 'observation', False)
-            if observation:
+            if known:
+                from .known_data_compat import same_inputs
+                unchanged = same_inputs(before, current)
+            elif observation:
                 from .observation_compat import same_inputs
                 unchanged = same_inputs(before, current)
             else:
@@ -324,8 +331,8 @@ def plan(vas: list[int], *, refresh: bool = False, reuse: str | None = None,
                           'action': action, 'reasons': reason,
                           'previous': old or None,
                           'estimated_seconds': old.get('elapsed_seconds')}
-            if observation and action == 'reuse':
-                items[key]['evidence_adoption'] = {'kind': 'observation-proof',
+            if (observation or known) and action == 'reuse':
+                items[key]['evidence_adoption'] = {'kind': 'known-data-proof' if known else 'observation-proof',
                     'origin_identity': old.get('identity'), 'receipt': str(compatibility)}
     composed = composition_impact(items, identity)
     return {'schema': SCHEMA, 'kind': 'revalidate', 'identity': identity, 'refresh': refresh,
@@ -334,7 +341,8 @@ def plan(vas: list[int], *, refresh: bool = False, reuse: str | None = None,
             'functions': [f'{va:08x}' for va in vas], 'items': items,
             'reuse_from': str(path) if path else None,
             'compatibility': ({'path': str(Path(compatibility).resolve()), 'sha256': env.digest(Path(compatibility)),
-                               'kind': 'observation-proof' if getattr(compatible, 'observation', False) else 'input-dispatch',
+                               'kind': ('known-data-proof' if getattr(compatible, 'known_data', False) else
+                                        'observation-proof' if getattr(compatible, 'observation', False) else 'input-dispatch'),
                                'origin_receipt': proof_origin}
                               if compatibility else None),
             'planning_seconds': time.monotonic() - started, 'compositions': composed,
@@ -603,13 +611,14 @@ class Run:
     def finish(self):
         self.data['state'] = 'finished' if len(self.data['results']) == len(self.data['items']) else 'incomplete'
         proof_drift = False
+        verified_scope = None
         if self.data.get('compatibility'):
             try:
                 from . import validation_compat
                 proof = self.data['compatibility']
                 if env.digest(Path(proof['path'])) != proof['sha256']:
                     raise ValueError('Compatibility receipt changed after planning')
-                validation_compat.check(Path(proof['path']),
+                verified_scope = validation_compat.check(Path(proof['path']),
                     _load_results(Path(proof.get('origin_receipt') or self.data['reuse_from'])), self.data['identity'])
             except (OSError, ValueError, KeyError, TypeError):
                 proof_drift = True
@@ -626,6 +635,9 @@ class Run:
                 expected = (item['dependencies'] if item.get('evidence_adoption')
                             and item['action'] == 'reuse' else result['dependencies'])
                 unchanged = current == expected and not (proof_drift and item['action'] == 'reuse')
+                if (item.get('evidence_adoption', {}).get('kind') == 'known-data-proof'
+                        and item['action'] == 'reuse' and key not in (verified_scope or set())):
+                    unchanged = False
             except (OSError, ValueError, recover.build.BuildError):
                 unchanged = False
             if not unchanged:

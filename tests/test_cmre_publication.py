@@ -220,6 +220,18 @@ def test_commit_scan_rejects_history_shared_with_private_refs(originals, repo):
     assert (commit, findings) == (head, [])
 
 
+def test_default_private_history_survives_main_migration(originals, repo):
+    old = _commit(repo, {"a.txt": b"old local history\n"}, "old")
+    _git(repo, "update-ref", "refs/private/cm0102-pre-publication", old)
+    _git(repo, "checkout", "-q", "--orphan", "main")
+    clean = _commit(repo, {"a.txt": b"published source\n"}, "new root")
+    assert pub.scan_commit(repo, "main", originals["index"]) == (clean, [])
+    assert kinds(pub.scan_commit(repo, "fresh", originals["index"])[1]) == ["private-history"]
+    _git(repo, "update-ref", "-d", "refs/private/cm0102-pre-publication")
+    with pytest.raises(SystemExit, match="cannot compare"):
+        pub.scan_commit(repo, "main", originals["index"])
+
+
 def test_published_c_must_be_the_accepted_bytes(originals, repo, tmp_path, monkeypatch):
     from cmre import env
 

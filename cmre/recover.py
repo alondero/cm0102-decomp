@@ -256,11 +256,52 @@ def x87_contract(va: int) -> dict | None:
     return {'path': env.rel(path), 'sha256': env.digest(path)}
 
 
+def _withdrawn_c_contract(record: dict) -> dict | None:
+    """Inactive history preserves policy, never acceptance, after C withdrawal."""
+    if 'c_retractions' not in record:
+        return None
+    history = record['c_retractions']
+    try:
+        entry = history[-1]
+        contract = entry['validation_contract']
+        valid = (isinstance(history, list) and entry['schema'] == 'cmre-c-retraction/1'
+                 and contract['profile'] in C_PROFILES and contract['inputs'] in difftest.INPUT_POLICIES
+                 and isinstance(contract['effective_options_sha256'], str)
+                 and len(contract['effective_options_sha256']) == 64
+                 and all(c in '0123456789abcdef' for c in contract['effective_options_sha256']))
+        reference = entry['archive_manifest']
+        relative = Path(reference)
+        manifest_path = (env.ROOT / relative).resolve()
+        archive_base = (env.ANALYSIS / 'cmre/c-retractions' / f"fn_{int(record['va'], 16):08x}").resolve()
+        valid = (valid and isinstance(reference, str) and '\\' not in reference
+                 and not relative.is_absolute() and '..' not in relative.parts
+                 and relative.as_posix() == reference
+                 and manifest_path.is_relative_to(env.ROOT.resolve())
+                 and manifest_path.is_relative_to(archive_base)
+                 and manifest_path.name == 'manifest.json')
+        if not valid or env.digest(manifest_path) != entry['archive_manifest_sha256']:
+            valid = False
+        else:
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+            valid = (manifest.get('schema') == entry['schema']
+                     and manifest.get('va') == record['va']
+                     and manifest.get('validation_contract') == contract
+                     and env.digest(manifest_path.parent / 'validation-options-before.json') == contract['effective_options_sha256'])
+    except (KeyError, IndexError, TypeError, OSError, ValueError):
+        valid = False
+    if not valid:
+        raise ValueError('Withdrawn C validation contract is missing or malformed or changed; preserve and review its original policy')
+    return contract
+
+
 def c_profile(va: int) -> str:
     """An accepted C record keeps the profile it was accepted under; new C uses C_PROFILE."""
     path = ledger.record_path(va)
     if path.exists():
-        validation = (json.loads(path.read_text(encoding="utf-8")).get("c") or {}).get("validation") or {}
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if not record.get('c') and (contract := _withdrawn_c_contract(record)):
+            return contract['profile']
+        validation = (record.get("c") or {}).get("validation") or {}
         recorded = {v.get("profile") for v in validation.values()}
         if len(recorded) == 1 and recorded <= set(C_PROFILES):
             return recorded.pop()
@@ -272,7 +313,10 @@ def c_inputs(va: int) -> str:
     unrecorded, before v2 existed); new C uses C_INPUTS."""
     path = ledger.record_path(va)
     if path.exists():
-        c = json.loads(path.read_text(encoding="utf-8")).get("c")
+        record = json.loads(path.read_text(encoding="utf-8"))
+        c = record.get("c")
+        if not c and (contract := _withdrawn_c_contract(record)):
+            return contract['inputs']
         if c:
             recorded = {v.get("inputs", "v1") for v in (c.get("validation") or {}).values()}
             if len(recorded) == 1 and recorded <= set(difftest.INPUT_POLICIES):
@@ -352,7 +396,7 @@ def test_c(va: int, overrides: dict | None = None, fresh: bool = False, *, sourc
                 status = "fail"
                 continue
             result = difftest.run(va, (lifted.va, lifted.region_end), set(lifted.insns), built, {}, opts, profile,
-                                  returns=returns, indirect=_indirect_calls(lifted))
+                                  data_spans=_data_spans(lifted), returns=returns, indirect=_indirect_calls(lifted))
             ok = (not result["mismatches"] and result["inconclusive"] < opts.cases / 2
                   and result["coverage"] >= opts.min_coverage
                   and result["code_as_data_cases"] <= difftest.CODE_AS_DATA_LIMIT * opts.cases)
@@ -443,6 +487,8 @@ def accept(va: int, tier: str = "lifted", *, refresh: bool = False, profile: str
         record["status"] = {**record["status"], "decompiled": True}
         record["c"] = _tier_record(first, env.ROOT / first["source"])
         record["hints"] = env.rel(env.HINTS_DIR / f"fn_{va:08x}.json") if (env.HINTS_DIR / f"fn_{va:08x}.json").exists() else None
+    if existing and existing.get('c_retractions'):
+        record['c_retractions'] = existing['c_retractions']
     ledger.write_json(path, record)
     bp = ledger.blocked_path(va)
     if bp.exists():

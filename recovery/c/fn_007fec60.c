@@ -43,6 +43,6 @@ u32 CM_THISCALL cm_fn_007fec60(u32 self, u32 optional)
 
     u32 nested = *(volatile u32 *)(target + 0x10u);
     if (nested != 0)
-        return 0;
-    return 1;
+        return 1;
+    return 0;
 }

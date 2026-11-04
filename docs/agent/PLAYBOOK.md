@@ -18,6 +18,10 @@ It requires a finished green preflight and prints the latest checkpoint for
 that parent. It runs no tests and makes no new validation claim. Keep the same
 parent receipt through context compactions and bounded batches.
 
+The coordinator completes [recovery intake](HARNESS.md#recovery-intake) before
+dispatch; workers inherit its frozen receipt. Authorized parallel batches use [candidate ownership](PARALLEL.md#candidate-ownership);
+input repair uses the [input-family loop](TRIAGE.md#input-family-loop).
+
 ## 2. Route the task
 
 First matching row wins; an explicit user task outranks the queue.
@@ -34,6 +38,7 @@ First matching row wins; an explicit user task outranks the queue.
 | Composition, campaign manifests, primary-runtime checkpoints | [Campaign](CAMPAIGN.md) |
 | Planning remaining work, lanes, providers, or autonomous runs | [Next-phase plan](NEXT-PHASE-PLAN.md) |
 | Several concurrent agent sessions (any client) | [Parallel sessions](PARALLEL.md) |
+| Git history, local-only files, or retiring worker directories | [Publication](PUBLICATION.md), then [workspace lifecycle](WORKTREES.md#workspace-lifecycle) |
 | Tool-less or untrusted model workers (packets, leases) | [Task packets](TASKS.md) |
 | REA setup or investigation | [REA](REA.md) |
 | Runtime reference, live integration, milestone gate | Relevant gate in [ROADMAP](../ROADMAP.md) |
@@ -46,10 +51,12 @@ investigation; the queue and `cmre brief` supply the next unit.
 
 ### Delegation (only when the user authorizes it)
 
-Give each worker at most three distinct function IDs from one family or subsystem
-and the C loop. Workers write only
-`recovery/c/fn_X.c` for their IDs, run `cmre test --c`, and return
-`fn_X pass|wip: <detail>`. The parent runs `cmre accept fn_X --c` serially.
+Give each worker at most three distinct function IDs from one family or subsystem,
+the selected protocol and its exact writable paths. The worker owns routine input
+repair, translation, testing and computation controls through a frozen
+acceptance-ready bundle or an evidence-bound hold; see
+[candidate ownership](PARALLEL.md#candidate-ownership). The parent assigns
+independent review and runs `cmre accept fn_X --c` serially.
 Packets and leases ([TASKS.md](TASKS.md)) are for tool-less model workers only.
 Start a fresh worker at the batch boundary; do not refill a worker indefinitely.
 Give it the exact IDs, header path, representative and member delta paths, and

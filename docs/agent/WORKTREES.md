@@ -13,6 +13,31 @@ It coordinates trusted same-user local processes, not hostile filesystem access.
 The integrator owns the parent preflight and closing check; workers inherit that
 receipt and do not start independent sessions.
 
+## Workspace lifecycle
+
+Keep one authoritative checkout. Its `main` tracks `origin/main`; private history
+is retained under `refs/private/cm0102-pre-publication` and in local backups.
+Project exclusions live in `.gitignore`. Keep `.git/info/exclude` specific to
+machine-only paths; a blanket exclusion hides unfinished source from review.
+
+Create workers on demand in one external container, such as
+`F:/worktrees/cm0102/`, with a unique batch/owner name. The broker rejects workers
+nested inside the coordinator. Start with two translation workers and an independent reviewer;
+increase concurrency only from measured throughput. Harness experiments use a
+separate tree in the same container. Workers inherit the parent receipt and use
+the coordinator's broker, never their own copied game or acceptance ledger.
+
+At the batch boundary, stop workers and reconcile live claims through the normal
+work protocol. Preserve candidate source, reports, bindings and attempts. Archive
+any unique or pending files with a hash manifest outside the disposable tree and
+verify restoration before removing it with `git worktree remove`. Retain a commit
+reference for unmerged tooling. Clean trees may be removed normally; force removal
+requires a verified archive of every ignored and untracked file as well as edits.
+Old binding paths remain historical evidence, not reusable worker directories.
+Use a fresh path and bootstrap for the next batch; never erase claim/attempt
+history to recycle a directory. Local backup locations and pending candidates
+belong in `CLAUDE.local.md` and the ignored handoff.
+
 ## Bootstrap and claim (coordinator shell)
 
 Bootstrap requires byte-identical `cmre/`
@@ -32,14 +57,14 @@ or orphan bindings require a fresh worker or explicit reconciliation; alignment
 preserves their claims and attempts.
 
 ```powershell
-git worktree add -b recovery-worker-a ../cm0102-worker-a HEAD
-git worktree add -b recovery-worker-b ../cm0102-worker-b HEAD
-py -3.13 -m cmre worktree bootstrap ../cm0102-worker-a --align
-py -3.13 -m cmre worktree bootstrap ../cm0102-worker-b --align
+git worktree add -b recovery-BATCH-a F:/worktrees/cm0102/BATCH-a HEAD
+git worktree add -b recovery-BATCH-b F:/worktrees/cm0102/BATCH-b HEAD
+py -3.13 -m cmre worktree bootstrap F:/worktrees/cm0102/BATCH-a --align
+py -3.13 -m cmre worktree bootstrap F:/worktrees/cm0102/BATCH-b --align
 py -3.13 -m cmre screen fn_X
 py -3.13 -m cmre screen fn_Y
-py -3.13 -m cmre worktree claim ../cm0102-worker-a fn_X --owner worker-a --seconds 3600
-py -3.13 -m cmre worktree claim ../cm0102-worker-b fn_Y --owner worker-b --seconds 3600
+py -3.13 -m cmre worktree claim F:/worktrees/cm0102/BATCH-a fn_X --owner worker-a --seconds 3600
+py -3.13 -m cmre worktree claim F:/worktrees/cm0102/BATCH-b fn_Y --owner worker-b --seconds 3600
 ```
 
 Use distinct functions and owner names. Claims share `cmre work claims` with
@@ -120,8 +145,8 @@ report. The reviewer returns the exact source/report SHA-256 values and a concre
 instruction-evidence justification. Record those values, then publish locally:
 
 ```powershell
-py -3.13 -m cmre worktree review ../cm0102-worker-a fn_X --reviewer reviewer-a --reason "Instruction evidence and ABI reviewed" --source-sha256 SOURCE_HASH --report-sha256 REPORT_HASH
-py -3.13 -m cmre worktree publish ../cm0102-worker-a fn_X
+py -3.13 -m cmre worktree review F:/worktrees/cm0102/BATCH-a fn_X --reviewer reviewer-a --reason "Instruction evidence and ABI reviewed" --source-sha256 SOURCE_HASH --report-sha256 REPORT_HASH
+py -3.13 -m cmre worktree publish F:/worktrees/cm0102/BATCH-a fn_X
 ```
 
 Review checks both worker copies and authoritative staged evidence. Publication
@@ -134,8 +159,8 @@ Other functions' reviewed acceptances do not invalidate a worker's function inpu
 To request an edit after a passing submission:
 
 ```powershell
-py -3.13 -m cmre worktree revise ../cm0102-worker-a fn_X --reason "Describe the instruction or ABI discrepancy"
-py -3.13 -m cmre worktree claim ../cm0102-worker-a fn_X --owner worker-a --seconds 3600
+py -3.13 -m cmre worktree revise F:/worktrees/cm0102/BATCH-a fn_X --reason "Describe the instruction or ABI discrepancy"
+py -3.13 -m cmre worktree claim F:/worktrees/cm0102/BATCH-a fn_X --owner worker-a --seconds 3600
 ```
 
 Revision invalidates review and retains all attempts. The worker edits and tests

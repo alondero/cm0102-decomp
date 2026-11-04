@@ -1,5 +1,43 @@
 # Tooling and harness changes
 
+## Recovery intake
+
+The coordinator uses this gate before starting a recovery batch or resuming
+candidate dispatch. Workers inherit its receipt and frozen shared inputs.
+
+1. Inspect any required validation receipt in the handoff and its actual process
+   state. The validation budget and impact classification below determine when
+   an inventory gate is required; a new session alone does not request one. Reuse
+   matching completed evidence, preserve live jobs and resume interrupted jobs
+   through their supported receipts instead of restarting the selection.
+2. For a required inventory gate, require its complete selected scope to finish
+   with zero failed, tier-inconclusive or pending tiers and no
+   identity/compatibility drift. Check
+   ledger integrity separately and run the parent check at the boundary defined
+   in the [validation budget](PLAYBOOK.md#validation-budget).
+3. Record the batch's harness, headers, execution policies and controller identity.
+   Keep them fixed while recovery owners run. Prepare tooling in an isolated
+   lane and bring reviewed changes back at a batch boundary under the procedure below.
+
+Completion: required evidence matches the frozen execution inputs and dispatch
+has no pending mandatory inventory gate. An accepted-evidence correctness defect
+still takes priority over throughput.
+
+Retain stage receipts and the recorded child execution environment so a failed
+planning stage can resume without repeating successful work. Diagnose environment
+drift explicitly; restore a recorded environment or validate the changed inputs.
+Keep every declared input of a live proof fixed, including documentation when its
+regression receipt covers those files. Stage updates outside that input set until
+finalization finishes.
+
+During a required gate, authorized input workers may prepare private proposals
+and bounded original-only diagnostics when their selected protocol supports those
+operations. Keep the VM, pinned original code and all declared live inputs fixed;
+vary initial data only, retain receipts and leave resource headroom. These probes
+inform inputs; C validation and acceptance wait for the required gate.
+
+## Tooling changes
+
 1. Bound the requested change and inspect existing worktree changes. For a defect,
    capture a smallest reproducer and a failing regression test before fixing it.
    For instructions, identify a session failure that the wording must prevent.

@@ -27,3 +27,26 @@ __pycache__/
 /recovery/blocked/
 /recovery/hints/
 /recovery/c/tasks/
+
+# Local evidence, handoff and frozen byte-bearing legacy records.
+/docs/NEXT-SESSION-PROMPT.md
+/docs/agent/PARALLEL-BOOTSTRAP-LOCAL.md
+/.agents/hooks.json
+/recovery/registry.json
+/recovery/c/contracts/
+/recovery/date/*ledger.json
+/recovery/lang/*ledger.json
+/recovery/crt/*ledger.json
+/recovery/rng/*ledger.json
+/recovery/date/test_*.py
+/recovery/lang/test_*.py
+/recovery/crt/test_*.py
+/recovery/rng/test_*.py
+/tests/fixtures/lift-migration/accepted-source.S
+
+# Local tooling worktrees only; brokered recovery workers must be outside this root.
+/.worktrees/
+/.pytest_cache/
+/.opencode/
+/04-builds-and-tooling.md
+/Launch-Game.ps1

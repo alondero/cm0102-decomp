@@ -76,7 +76,7 @@ def validate_hints(hints: dict, *, worker: bool = False) -> None:
     """Validate inputs before execution; task workers cannot change test policy."""
     metadata = {"notes", "fixture_provenance", "input_probe", "input_probe_sha256", "fixture_evidence"}
     policy = set(DEFAULTS) | {"seed"}
-    input_fields = set(emu.REG_NAMES[:8]) | metadata | {"args", "arg_count", "struct_size", "globals", "fixtures"}
+    input_fields = set(emu.REG_NAMES[:8]) | metadata | {"args", "arg_count", "struct_size", "globals", "fixtures", "arena_size", "import_transcript"}
     allowed = policy | input_fields | {"auto", "lift_jump_tables", "original_x87", "lift_original_calls", "c_hints"}
     if not isinstance(hints, dict) or set(hints) - allowed:
         raise ValueError("hints must be an object containing only supported fields")
@@ -105,10 +105,14 @@ def validate_hints(hints: dict, *, worker: bool = False) -> None:
             valid = type(value) in (int, float) and 0 < value <= 1
         else:
             lower = 0 if key in {"discovery", "arg_count", "struct_size", "seed"} else 1
-            upper = {"struct_size": emu.ARENA_SIZE, "arg_count": 1024, "seed": 0xFFFFFFFF}.get(key, 1_000_000_000)
+            upper = {"struct_size": hints.get("arena_size", emu.ARENA_SIZE), "arg_count": 1024, "seed": 0xFFFFFFFF}.get(key, 1_000_000_000)
             valid = type(value) is int and lower <= value <= upper
         if not valid:
             raise ValueError(f"invalid hint {key}: {value!r}")
+    emu.arena_capacity(hints.get('arena_size', emu.ARENA_SIZE))
+    if 'import_transcript' in hints:
+        emu.imports.Transcript(hints['import_transcript'], emu.ARENA,
+                               hints.get('arena_size', emu.ARENA_SIZE))
     kinds = {"any", "ptr", "small", "struct"}
     args = hints.get("args", [])
     if not isinstance(args, list) or any(type(v) is not str or v not in kinds for v in args):
@@ -135,7 +139,7 @@ def validate_hints(hints: dict, *, worker: bool = False) -> None:
     if not isinstance(fixtures, list):
         raise ValueError("fixtures must be a list")
     if fixtures:
-        templates = (bytes(emu.ARENA_SIZE),) * ARENA_TEMPLATES
+        templates = (bytes(hints.get("arena_size", emu.ARENA_SIZE)),) * ARENA_TEMPLATES
         for fixture in fixtures:
             _fixture_case(fixture, templates, hints.get("arg_count", DEFAULTS["arg_count"]))
     if "c_hints" in hints:
@@ -155,9 +159,9 @@ def _pointer(rng: random.Random) -> int:
     return emu.ARENA + 4 * rng.randrange(0, (emu.ARENA_SIZE - POINTER_TAIL_RESERVE) // 4)
 
 
-def _value(rng: random.Random, kind: str = "any", struct_size: int = 0) -> int:
+def _value(rng: random.Random, kind: str = "any", struct_size: int = 0, arena_size: int = emu.ARENA_SIZE) -> int:
     if kind == "struct":
-        return _struct_pointer(rng, struct_size)
+        return _struct_pointer(rng, struct_size, arena_size)
     if kind == "ptr" or (kind == "any" and rng.random() < 0.3):
         return _pointer(rng)
     if kind == "small" or (kind == "any" and rng.random() < 0.4):
@@ -165,11 +169,11 @@ def _value(rng: random.Random, kind: str = "any", struct_size: int = 0) -> int:
     return rng.getrandbits(32)
 
 
-def _struct_pointer(rng: random.Random, size: int) -> int:
+def _struct_pointer(rng: random.Random, size: int, arena_size: int = emu.ARENA_SIZE) -> int:
     """A pointer such that the entire [base, base+size) range sits inside the test arena."""
-    if not 0 <= size <= emu.ARENA_SIZE:
+    if not 0 <= size <= arena_size:
         raise ValueError(f"struct size {size} does not fit inside the test arena")
-    max_offset = min(emu.ARENA_SIZE - size, emu.ARENA_SIZE - 1)
+    max_offset = min(arena_size - size, arena_size - 1)
     return emu.ARENA + 4 * rng.randrange(max_offset // 4 + 1)
 
 
@@ -218,7 +222,7 @@ def _fixture_case(fixture: dict, templates: list[bytes], arg_count: int) -> emu.
 
     try:
         required = {"regs", "stack", "arena_template", "arena_writes", "globals", "import_seed"}
-        if not isinstance(fixture, dict) or not required.issubset(fixture) or set(fixture) - required - {"fpcw"}:
+        if not isinstance(fixture, dict) or not required.issubset(fixture) or set(fixture) - required - {"fpcw", "import_transcript"}:
             raise ValueError("fixture fields differ from the input fixture schema")
         fpcw = fixture.get("fpcw")
         if "fpcw" in fixture and (type(fpcw) is not int or not 0 <= fpcw <= 0xFFFF):
@@ -235,7 +239,7 @@ def _fixture_case(fixture: dict, templates: list[bytes], arg_count: int) -> emu.
         arena = bytearray(templates[template])
         for key, value in fixture["arena_writes"].items():
             offset = int(key, 16)
-            if offset % 4 or not 0 <= offset <= emu.ARENA_SIZE - 4:
+            if offset % 4 or not 0 <= offset <= len(arena) - 4:
                 raise ValueError("fixture arena write must be an aligned in-range dword")
             struct.pack_into("<I", arena, offset, u32(value))
         globals_in = {}
@@ -245,7 +249,10 @@ def _fixture_case(fixture: dict, templates: list[bytes], arg_count: int) -> emu.
             if section is None or not section.writable or address + 4 > section.end:
                 raise ValueError("fixture globals must fit inside writable image sections")
             globals_in[address] = u32(value)
-        return emu.Case(regs, stack, bytes(arena), globals_in, u32(fixture["import_seed"]), fpcw)
+        transcript = fixture.get('import_transcript')
+        if transcript is not None:
+            emu.imports.Transcript(transcript, emu.ARENA, len(arena))
+        return emu.Case(regs, stack, bytes(arena), globals_in, u32(fixture["import_seed"]), fpcw, transcript)
     except (KeyError, TypeError, AttributeError, ValueError, struct.error) as exc:
         raise ValueError(f"invalid input fixture: {exc}") from exc
 
@@ -256,8 +263,9 @@ def make_case(rng: random.Random, opts: Options, global_inputs: list[int], templ
     h = opts.hints
     kinds = h.get("args", [])
     struct_size = h.get("struct_size", 0)
-    stack = [_value(rng, kinds[i] if i < len(kinds) else "any", struct_size) for i in range(opts.arg_count)]
-    regs = {name: _value(rng, h.get(name, "any"), struct_size) for name in emu.REG_NAMES[:8]}
+    size = emu.arena_capacity(h.get("arena_size", emu.ARENA_SIZE))
+    stack = [_value(rng, kinds[i] if i < len(kinds) else "any", struct_size, size) for i in range(opts.arg_count)]
+    regs = {name: _value(rng, h.get(name, "any"), struct_size, size) for name in emu.REG_NAMES[:8]}
     regs["eflags"] = rng.choice((0x202, 0x246, 0x283, 0x602))
     chosen = {}
     if global_inputs and rng.random() < 0.6:
@@ -266,10 +274,14 @@ def make_case(rng: random.Random, opts: Options, global_inputs: list[int], templ
     for va_text, values in sorted(h.get("globals", {}).items()):
         chosen[int(va_text, 16)] = rng.choice(values)
     case = emu.Case(regs, stack, _mutated_arena(rng, templates), chosen, rng.getrandbits(32))
+    case.arena += bytes(size - len(case.arena))
     fixtures = h.get("fixtures", [])
     if fixtures and rng.randrange(2) == 0:
         # Keep random/edge cases alongside original-side selected input fixtures.
-        case = _fixture_case(rng.choice(fixtures), templates, opts.arg_count)
+        case = _fixture_case(rng.choice(fixtures),
+                             [t + bytes(size - len(t)) for t in templates], opts.arg_count)
+    if "import_transcript" in h:
+        case.import_transcript = h["import_transcript"]
     if opts.inputs == "v2":
         # Apply the recorded entry policy to either input source, without new draws.
         case.regs["eflags"] &= ~EFLAGS_DF
@@ -588,6 +600,10 @@ def _reads_own_code(result: emu.Result, region, data_spans) -> bool:
 def _classify(na, nb, original: emu.Result, amap, region, data_spans, *, fault_mapping=None) -> tuple[str, dict]:
     """equal | code-as-data | mismatch. Relocated code cannot reproduce its own
     instruction bytes when the original reads them as data: a hazard, not a mismatch."""
+    if original.outcome == 'error' and original.detail and str(original.detail[0]).startswith('import transcript'):
+        return 'mismatch', {'field': 'import-transcript', 'original': original.detail}
+    if nb[0] == 'error' and nb[1] and str(nb[1][0]).startswith('import transcript'):
+        return 'mismatch', {'field': 'import-transcript', 'recovered': nb[1]}
     difference = _diff(na, nb, amap, fault_mapping=fault_mapping)
     if not difference:
         return "equal", {}
@@ -602,8 +618,9 @@ CODE_AS_DATA_LIMIT = 0.02  # fraction of cases; above it the function is blocked
 def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_returns: dict[int, int],
         opts: Options, profile: str, data_spans=(), returns: str = "int", indirect: dict | None = None) -> dict:
     img = image.primary()
-    original = emu.Machine(img, watch=region)
-    recovered = emu.Machine(img, built.image, watch=region, escape=True)
+    original = emu.Machine(img, watch=region, arena_size=opts.hints.get("arena_size", emu.ARENA_SIZE))
+    recovered = emu.Machine(img, built.image, watch=region, escape=True,
+                            arena_size=opts.hints.get("arena_size", emu.ARENA_SIZE))
     if profile == "semantic" and indirect is not None:
         _stop_indirect(original, recovered, region, built, indirect)
     text = built.image.text
@@ -705,8 +722,9 @@ def explain(va: int, region, insn_starts, built, call_returns, opts: Options, pr
     if type(window) is not int or not 1 <= window <= 10000:
         raise ValueError('explain window must be an integer between 1 and 10000')
     img = image.primary()
-    original = emu.Machine(img, watch=region)
-    recovered = emu.Machine(img, built.image, watch=region, escape=True) if built else None
+    original = emu.Machine(img, watch=region, arena_size=opts.hints.get("arena_size", emu.ARENA_SIZE))
+    recovered = emu.Machine(img, built.image, watch=region, escape=True,
+                            arena_size=opts.hints.get("arena_size", emu.ARENA_SIZE)) if built else None
     if profile == "semantic" and indirect is not None:
         _stop_indirect(original, recovered, region, built, indirect)
     text = built.image.text if built else None
@@ -927,7 +945,7 @@ def infer(va: int, region, opts: Options) -> dict:
     img = image.primary()
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
     md.detail = True
-    machine = emu.Machine(img, watch=region)
+    machine = emu.Machine(img, watch=region, arena_size=opts.hints.get("arena_size", emu.ARENA_SIZE))
     rng = random.Random(opts.seed)
     templates = arena_templates()
     global_inputs: set[int] = set()

@@ -11,6 +11,12 @@ The following migration record is historical. Its private-only receipt policy,
 absolute assembly-listing exclusions, worker/bootstrap status and measured counts
 are not current operating instructions. Use the linked workflow for new work.
 
+The 2026-11-04 workspace consolidation made local `main` track `origin/main`.
+The old private tip is preserved unchanged at `refs/private/cm0102-pre-publication`;
+the scanner uses that ref. Broad local exclusions and the obsolete default push
+mapping were removed. Use [the workspace lifecycle](agent/WORKTREES.md#workspace-lifecycle)
+for temporary workers and evidence retention.
+
 # Publication boundary
 
 The private GitHub repository (`origin`, branch `main`) carries reviewed,

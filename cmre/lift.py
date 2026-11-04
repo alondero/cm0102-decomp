@@ -283,6 +283,7 @@ def discover(va: int) -> Lifted:
     # Literal operands pointing inside the region must resolve to a label we emit.
     _check_self_references(md, insns, tables, va, region_end, problems)
     data = _data_runs(img, insns, tables, va, region_end, problems)
+    _check_referenced_relative_data(md, insns, data, problems)
     covered = sum(i.size for i in insns.values())
     if covered != fn.body_bytes:
         problems.append(f"decoded {covered} instruction bytes but Ghidra body is {fn.body_bytes}")
@@ -353,6 +354,26 @@ def _data_runs(img, insns, tables, va, region_end, problems) -> list[DataRun]:
         if not any(d.va == r for d in runs):
             problems.append(f"data reference {r:#010x} does not start a data run")
     return runs
+
+
+def _check_referenced_relative_data(md, insns, data, problems):
+    """Do not copy a referenced possible callback's PC-relative bytes verbatim.
+
+    This is deliberately a refusal, not code discovery from data. A literal
+    pointing at such bytes needs an evidenced auxiliary-code boundary before
+    relocation is safe. In fn_0055efe0 the original vector destructor invokes
+    the referenced E9 thunk; copying it silently changes its destination.
+    """
+    refs = {value for rec in insns.values() for value in rec.substitutions}
+    for run in data:
+        if run.va not in refs:
+            continue
+        first = next(md.disasm(run.raw, run.va, count=1), None)
+        if (first is not None and (first.group(capstone.CS_GRP_JUMP)
+                                  or first.group(capstone.CS_GRP_CALL))
+                and first.operands and first.operands[0].type == X.X86_OP_IMM):
+            problems.append(f"referenced data at {run.va:#010x} begins PC-relative control flow; "
+                            "auxiliary code requires evidenced recovery")
 
 
 def _operand_text(rec: Insn) -> str:

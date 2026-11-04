@@ -45,6 +45,46 @@ also require original media/inspection manifests. They do not yet provide a
 general installation selector. A source-only clone alone cannot run the full
 recovery acceptance suite; report absent prerequisites rather than inventing them.
 
+## Retaining and restoring withdrawn local C evidence
+
+`py -3.13 -m cmre retract-c fn_X --reason "..." --witness PATH` previews withdrawal
+of invalid C validation while preserving the source and validated lift. Applying
+the reviewed preview requires `--apply --expect-plan SHA256`. Code, policy,
+evidence or current hint changes invalidate that plan, including creation of a
+previously absent hint file. Withdrawal never reaccepts C automatically.
+Inactive withdrawal history retains the original comparison profile and input
+policy, including legacy `v1` behavior, so withdrawal cannot silently select a
+newer policy for later tests. Missing or malformed retained policy fails closed;
+changing it requires a separate reviewed migration.
+
+Before publishing the ledger change, the command retains an immutable hashed
+archive under `CM0102/Analysis/cmre/c-retractions/`. Back up that complete tree
+with the corresponding local ledgers, source, lift, hints, work state and retained
+reports. Do not clean these archives as scratch: `cmre verify` checks them through
+the generated ledger's withdrawal history. Keep partial or failed archives too.
+
+For a local workspace restore or relocation, restore the matching recovery files
+and complete archive tree at the same paths relative to the new workspace root.
+Preserve bytes and manifest hashes; do not rewrite history or manufacture success
+labels. Archive references resolve relative to the current workspace, so the old
+machine's absolute paths are not verification dependencies. Run `cmre doctor` and
+`cmre verify` after restoring the required user-supplied inputs. Missing or changed
+archives are an unavailable or failed evidence check, never a pass.
+
+An archive supplies the exact prior ledger and provenance for investigation and
+rollback review. It does not authorize restoring an invalid C certificate. Resolve
+the retained mismatch and explicitly retry its work hold before normal testing
+and acceptance. If publication of the final operation receipt fails after the
+ledger change, `applied-receipt-incomplete` reports that withdrawal occurred;
+inspect the ledger and archive before retrying.
+
+These are private/local recovery backups. A source-only clone deliberately excludes
+generated ledgers, raw witnesses and these archives, as specified by
+[the publication workflow](agent/PUBLICATION.md). It need not carry or publish
+them. Restore trusted local recovery evidence separately when recreating an
+authoritative recovery workspace; reconstructed source alone is not acceptance
+evidence.
+
 ## Checks without game files
 
 The publication/guard tests use synthetic files and temporary repositories:

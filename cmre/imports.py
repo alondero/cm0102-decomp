@@ -88,3 +88,96 @@ def result(seed: int, index: int, arena: int, arena_size: int) -> int:
     if kind == 2:
         return arena + ((h >> 4) % (arena_size - 0x400)) & ~3
     return h
+
+
+class Transcript:
+    """Authored per-case import inputs, never a Windows or CRT implementation.
+
+    Exact call names and arguments fail closed. Heap annotations additionally
+    check the author's allocation/size/free claims; no allocation or file data
+    is inferred. Every output byte and return value is supplied by the fixture.
+    """
+
+    HEAP_IMPORTS = {'alloc': 'KERNEL32.dll!HeapAlloc',
+                    'size': 'KERNEL32.dll!HeapSize',
+                    'free': 'KERNEL32.dll!HeapFree'}
+
+    # Only the input-capacity release's explicit heap/file/drive boundaries.
+    # STDCALL_ARGS describes stack cleanup, not permission to substitute any API.
+    SUPPORTED_IMPORTS = frozenset(HEAP_IMPORTS.values()) | frozenset({
+        'KERNEL32.dll!CreateFileA', 'KERNEL32.dll!ReadFile',
+        'KERNEL32.dll!WriteFile', 'KERNEL32.dll!SetFilePointer',
+        'KERNEL32.dll!GetFileType', 'KERNEL32.dll!CloseHandle',
+        'KERNEL32.dll!FlushFileBuffers', 'KERNEL32.dll!SetEndOfFile',
+        'KERNEL32.dll!GetLastError', 'KERNEL32.dll!GetStdHandle',
+        'KERNEL32.dll!GetLogicalDriveStringsA', 'KERNEL32.dll!GetDriveTypeA',
+    })
+
+    def __init__(self, steps, arena, size):
+        import copy
+        self.steps = copy.deepcopy(steps)
+        self.index = 0
+        self.arena, self.size = arena, size
+        self.blocks = {}
+        if not isinstance(steps, list):
+            raise ValueError('import transcript must be a list')
+        for step in steps:
+            if (not isinstance(step, dict) or set(step) - {'name','args','result','writes','heap'}
+                    or not {'name','args','result'} <= set(step)):
+                raise ValueError('invalid import transcript step')
+            name, args = step['name'], step['args']
+            if not isinstance(name, str) or name not in self.SUPPORTED_IMPORTS:
+                raise ValueError('unsupported transcript import')
+            if (not isinstance(args, list) or len(args) != STDCALL_ARGS[name]
+                    or any(type(v) is not int or not 0 <= v <= 0xffffffff for v in args)
+                    or type(step['result']) is not int or not 0 <= step['result'] <= 0xffffffff):
+                raise ValueError('invalid transcript arguments or result')
+            heap = step.get('heap')
+            if name in self.HEAP_IMPORTS.values() and heap is None:
+                raise ValueError('transcript heap imports require a coherence annotation')
+            if heap is not None and (heap not in self.HEAP_IMPORTS or name != self.HEAP_IMPORTS[heap]):
+                raise ValueError('invalid heap annotation')
+            if not isinstance(step.get('writes', []), list):
+                raise ValueError('invalid transcript writes')
+            for write in step.get('writes', []):
+                if (not isinstance(write, dict) or set(write) != {'arg','data'}
+                        or type(write['arg']) is not int or not 0 <= write['arg'] < len(args)
+                        or not isinstance(write['data'], str)):
+                    raise ValueError('invalid transcript output')
+                try:
+                    blob = bytes.fromhex(write['data'])
+                except ValueError as exc:
+                    raise ValueError('invalid transcript output hex') from exc
+                self._range(args[write['arg']], len(blob))
+
+    def _range(self, address, size):
+        if not self.arena <= address <= address + size <= self.arena + self.size:
+            raise ValueError('transcript output/allocation outside arena')
+
+    def call(self, name, args, write):
+        if self.index >= len(self.steps):
+            raise ValueError('import transcript exhausted')
+        step = self.steps[self.index]
+        if step['name'] != name or tuple(step['args']) != args:
+            raise ValueError('import transcript name or arguments differ')
+        result, heap = step['result'], step.get('heap')
+        if heap == 'alloc' and result:
+            size = args[2]
+            self._range(result, size)
+            if not size or any(result < p+n and p < result+size for (_,p),n in self.blocks.items()):
+                raise ValueError('overlapping or empty transcript allocation')
+            self.blocks[args[0],result] = size
+        elif heap in ('size','free'):
+            key = (args[0], args[2])
+            if key not in self.blocks:
+                raise ValueError('unknown transcript heap block')
+            if heap == 'size' and result != self.blocks[key]:
+                raise ValueError('transcript HeapSize differs from allocation')
+            if heap == 'free' and result:
+                del self.blocks[key]
+        for output in step.get('writes', []):
+            blob = bytes.fromhex(output['data'])
+            self._range(args[output['arg']], len(blob))
+            write(args[output['arg']], blob)
+        self.index += 1
+        return result

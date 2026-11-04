@@ -24,6 +24,15 @@ PAGE = 0x1000
 STACK, STACK_SIZE = 0x02000000, 0x40000
 STACK_TOP = STACK + STACK_SIZE - 0x1000  # initial ESP; one page of caller frame above
 ARENA, ARENA_SIZE = 0x03000000, 0x40000
+MAX_ARENA_SIZE = 0x260000  # opt-in authored input capacity, about 2.4 MiB
+
+
+def arena_capacity(size: int) -> int:
+    if type(size) is not int or not ARENA_SIZE <= size <= MAX_ARENA_SIZE or size % PAGE:
+        raise ValueError("arena_size must be page aligned, between 0x40000 and 0x260000")
+    return size
+
+
 TRAP, TRAP_SIZE = 0x7FF00000, 0x1000
 STOP = 0x7FE00000
 TEB = 0x7FFDF000
@@ -56,6 +65,7 @@ class Case:
     globals: dict[int, int] = field(default_factory=dict)  # dword writes into the image
     import_seed: int = 0  # seeds the import stubs' return values
     fpcw: int | None = None  # optional incoming 16-bit x87 control word
+    import_transcript: list | None = None
 
 
 @dataclass
@@ -73,7 +83,9 @@ class Result:
 
 class Machine:
     def __init__(self, original: image.Image, recovered: image.Image | None = None,
-                 watch: tuple[int, int] | None = None, escape: bool = False):
+                 watch: tuple[int, int] | None = None, escape: bool = False,
+                 arena_size: int = ARENA_SIZE):
+        self.arena_size = arena_capacity(arena_size)
         self.uc = uc = unicorn.Uc(unicorn.UC_ARCH_X86, unicorn.UC_MODE_32)
         self.pristine: dict[int, bytes] = {}
         self._original_pages: set[int] = set()
@@ -90,7 +102,7 @@ class Machine:
             for s in recovered.sections:
                 self._map(s.va, s.raw, s.virtual_size, _perms(s),
                           origin='recovered-pe', section_name=s.name)
-        for base, size in ((STACK, STACK_SIZE), (ARENA, ARENA_SIZE), (TEB, PAGE), (GDT, PAGE)):
+        for base, size in ((STACK, STACK_SIZE), (ARENA, self.arena_size), (TEB, PAGE), (GDT, PAGE)):
             self._map(base, bytes(size), size, unicorn.UC_PROT_READ | unicorn.UC_PROT_WRITE)
         for base, size in ((TRAP, TRAP_SIZE), (STOP, PAGE)):
             self._map(base, bytes(size), size, unicorn.UC_PROT_ALL)
@@ -167,6 +179,10 @@ class Machine:
             uc.hook_add(unicorn.UC_HOOK_CODE, self._escape if escape else self._cover, begin=watch[0], end=watch[1] - 1)
         # GPR writes alone leave Unicorn's hidden exception state behind.
         # Restore the initialized CPU (including segments) before every case.
+        # Unicorn's reset can leave its internal x87 precision inconsistent
+        # with the visible control word. Reapply that exact word through the
+        # public setter before saving it; do not choose a different default.
+        uc.reg_write(R.UC_X86_REG_FPCW, uc.reg_read(R.UC_X86_REG_FPCW))
         self._pristine_cpu = uc.context_save()
 
     def stop_indirect(self, sites: dict, entries: frozenset[int], local: tuple[tuple[int, int], ...],
@@ -335,15 +351,36 @@ class Machine:
             return
         name = self.trap_names.get(address)
         if name is None or name in imports.TERMINAL:
-            self.stop_reason = ("import", name or hex(address))
+            if self.transcript is not None:
+                self.stop_reason = ('error', 'import transcript',
+                                    'unexpected terminal or unknown import: ' + (name or hex(address)),
+                                    uc.reg_read(R.UC_X86_REG_EIP))
+            else:
+                self.stop_reason = ("import", name or hex(address))
             uc.emu_stop()
             return
         n = imports.STDCALL_ARGS[name]
         esp = uc.reg_read(R.UC_X86_REG_ESP)
         args = struct.unpack(f"<{n}I", uc.mem_read(esp + 4, 4 * n)) if n else ()
         self.events.append(("c", name, n, args))
-        uc.reg_write(R.UC_X86_REG_EAX, imports.result(self.import_seed, self.import_count, ARENA, ARENA_SIZE))
+        if self.transcript is None:
+            value = imports.result(self.import_seed, self.import_count, ARENA, ARENA_SIZE)
+        else:
+            try:
+                value = self.transcript.call(name, args, self._transcript_write)
+            except ValueError as exc:
+                self.stop_reason = ('error', 'import transcript', str(exc), uc.reg_read(R.UC_X86_REG_EIP))
+                uc.emu_stop()
+                return
+        uc.reg_write(R.UC_X86_REG_EAX, value)
         self.import_count += 1
+
+    def _transcript_write(self, address, blob):
+        # Host writes do not trigger Unicorn memory hooks. Retain final-memory
+        # comparison and the same ordered write observations as guest writes.
+        self.uc.mem_write(address, blob)
+        for offset, value in enumerate(blob):
+            self._access(self.uc, unicorn.UC_MEM_WRITE, address + offset, 1, value, None)
 
     def _cover(self, uc, address, size, _):
         # An instruction counts as covered once the next watched one starts, or the
@@ -420,7 +457,7 @@ class Machine:
         self._budget_steps += 1
 
     def _initial_page(self, p: int) -> bytes:
-        if ARENA <= p < ARENA + ARENA_SIZE:
+        if ARENA <= p < ARENA + self.arena_size:
             return self.case_arena[p - ARENA : p - ARENA + PAGE]
         return self.initial.get(p, self.pristine[p])
 
@@ -440,6 +477,10 @@ class Machine:
             self.jump_runtime.reset()
         if self.return_runtime:
             self.return_runtime.reset()
+        if len(case.arena) != self.arena_size:
+            raise ValueError("case arena length differs from machine arena capacity")
+        self.transcript = (imports.Transcript(case.import_transcript, ARENA, self.arena_size)
+                           if case.import_transcript is not None else None)
         self.reset()
         uc = self.uc
         for va, value in sorted(case.globals.items()):
@@ -448,9 +489,9 @@ class Machine:
         uc.mem_write(ARENA, case.arena)
         frame = struct.pack("<I", STOP) + b"".join(struct.pack("<I", v & 0xFFFFFFFF) for v in case.stack)
         uc.mem_write(STACK_TOP, frame)
-        self.dirty.update({ARENA + o for o in range(0, ARENA_SIZE, PAGE)})
+        self.dirty.update({ARENA + o for o in range(0, self.arena_size, PAGE)})
         # Case-seeded content of non-arena input pages (arena pages come from case.arena).
-        self.initial = {p: bytes(uc.mem_read(p, PAGE)) for p in self.dirty if not ARENA <= p < ARENA + ARENA_SIZE}
+        self.initial = {p: bytes(uc.mem_read(p, PAGE)) for p in self.dirty if not ARENA <= p < ARENA + self.arena_size}
         self.case_arena = case.arena
         self.written = set()
         self.dirty.update({STACK_TOP & ~(PAGE - 1), (STACK_TOP + len(frame)) & ~(PAGE - 1)})
@@ -485,7 +526,10 @@ class Machine:
         elif error is not None:
             outcome, detail = "error", (error, eip)
         elif eip == STOP:
-            outcome, detail = "return", ()
+            if self.transcript is not None and self.transcript.index != len(self.transcript.steps):
+                outcome, detail = 'error', ('import transcript not consumed', eip)
+            else:
+                outcome, detail = "return", ()
         elif self.logical_budget and not self._budget_exhausted:
             outcome, detail = "error", ('native-step guard exhausted', eip)
         else:
