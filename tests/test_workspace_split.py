@@ -78,3 +78,26 @@ def test_audit_detects_swallowed_stat_probe(tmp_path):
                              '--cmre-workspace-audit', '--cmre-recovery-root', str(recovery), str(test)],
                             env=child_env, cwd=tmp_path, capture_output=True, text=True, timeout=30)
     assert result.returncode != 0 and 'unmarked recovery access' in result.stdout
+
+
+def _pytest_collection_read(tmp_path, marked):
+    recovery = tmp_path / 'recovery'
+    recovery.mkdir()
+    (recovery / 'input').write_text('x')
+    test = tmp_path / 'test_import.py'
+    mark = '\nimport pytest\npytestmark = pytest.mark.workspace\n' if marked else '\n'
+    test.write_text(f'CONTENT = open({str(recovery / "input")!r}).read()' + mark + 'def test_value():\n    assert CONTENT == "x"\n')
+    child_env = dict(os.environ, PYTHONPATH=str(env.ROOT), PYTEST_DISABLE_PLUGIN_AUTOLOAD='1')
+    return subprocess.run([sys.executable, '-m', 'pytest', '-q', '-p', 'cmre.workspace_audit',
+                           '--cmre-workspace-audit', '--cmre-recovery-root', str(recovery), str(test)],
+                          env=child_env, cwd=tmp_path, capture_output=True, text=True, timeout=30)
+
+
+def test_audit_rejects_unmarked_import_time_recovery_read(tmp_path):
+    result = _pytest_collection_read(tmp_path, False)
+    assert result.returncode != 0 and 'unmarked recovery access during collection' in result.stdout
+
+
+def test_audit_allows_marked_import_time_recovery_read(tmp_path):
+    result = _pytest_collection_read(tmp_path, True)
+    assert result.returncode == 0, result.stdout + result.stderr

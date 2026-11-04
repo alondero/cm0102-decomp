@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import json
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 
 _TOKEN = re.compile(r'''(?P<directive>^[ \t]*\#(?:[^\n]*\\\n)*[^\n]*)|(?P<comment>/\*.*?\*/|//[^\n]*)|(?P<string>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|(?P<identifier>[A-Za-z_]\w*)|(?P<number>\b(?:0[xX][0-9a-fA-F]+|[0-9]+)(?:[uUlL]*)\b)|(?P<op><=|>=|==|!=|(?<![<>=!])[<>](?![<>=]))''', re.M | re.S)
@@ -39,21 +40,25 @@ def classify(report):
     return 'unresolved', 'gate-failed-without-mismatch'
 
 
-def run(va, source, gate=None):
+def run(va, source, gate=None, *, fence=None):
     from . import env, recover
-    if gate is None and recover.c_profile(va) != 'semantic':
-        raise ValueError('Mutation diagnostics require the accepted semantic profile')
-    gate = gate or recover.test_c
     source = Path(source)
-    original = source.read_bytes().decode('utf-8')
-    baseline_sha = env.digest_bytes(original.encode('utf-8'))
-    result = {'va': f'{va:#010x}', 'baseline_sha256': baseline_sha,
-              'survivors': [], 'killed': [], 'invalid': [], 'unresolved': []}
     parent = env.ANALYSIS / 'cmre/mutations'
     parent.mkdir(parents=True, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix=f'fn_{va:08x}-', dir=parent)
-    result['directory'] = tmp
     candidate = Path(tmp) / source.name
+    with (fence(va, candidate) if fence else nullcontext(candidate)) as candidate:
+        if gate is None and recover.c_profile(va) != 'semantic':
+            raise ValueError('Mutation diagnostics require the accepted semantic profile')
+        return _run_fenced(va, source, candidate, gate or recover.test_c, tmp)
+
+
+def _run_fenced(va, source, candidate, gate, tmp):
+    from . import env
+    original = source.read_bytes().decode('utf-8')
+    baseline_sha = env.digest_bytes(original.encode('utf-8'))
+    result = {'va': f'{va:#010x}', 'baseline_sha256': baseline_sha,
+              'survivors': [], 'killed': [], 'invalid': [], 'unresolved': [], 'directory': tmp}
     candidate.write_text(original, encoding='utf-8', newline='')
     baseline = gate(va, source=candidate, profile='semantic', fresh=True)
     (Path(tmp) / 'baseline.json').write_text(json.dumps(baseline, indent=2), encoding='utf-8')

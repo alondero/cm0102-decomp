@@ -341,7 +341,7 @@ def cmd_test(a) -> int:
 def cmd_mutate(a) -> int:
     from . import mutate
     va = _va(a.va)
-    result = mutate.run(va, env.C_DIR / f'fn_{va:08x}.c')
+    result = mutate.run(va, env.C_DIR / f'fn_{va:08x}.c', fence=_diagnostic_source)
     print(json.dumps(result, indent=2))
     return 0
 

@@ -57,8 +57,9 @@ def pytest_configure(config):
 
 
 def pytest_unconfigure(config):
-    global _active
+    global _active, _root
     _active = None
+    _root = None
     if os.stat is _stat:
         os.stat = _original_stat
 
@@ -67,6 +68,30 @@ def pytest_collection_modifyitems(items):
     for item in items:
         if item.path.name in WORKSPACE_FILES and item.path.parent.name == 'tests':
             item.add_marker(pytest.mark.workspace)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_make_collect_report(collector):
+    global _active
+    if _root is None or not isinstance(collector, pytest.Module):
+        yield
+        return
+    previous = _active
+    _active = False
+    _violations.clear()
+    try:
+        outcome = yield
+        report = outcome.get_result()
+        marked_file = collector.path.name in WORKSPACE_FILES and collector.path.parent.name == 'tests'
+        items = report.result or []
+        marked_items = bool(items) and all(item.get_closest_marker('workspace') for item in items)
+        if _violations and not (marked_file or marked_items):
+            event, path = _violations[0]
+            report.outcome = 'failed'
+            report.longrepr = f'unmarked recovery access during collection: {event} {path}'
+        _violations.clear()
+    finally:
+        _active = previous
 
 
 @pytest.hookimpl(hookwrapper=True)
