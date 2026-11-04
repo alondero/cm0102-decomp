@@ -5,6 +5,8 @@ from cmre import cli, env, ledger, queue
 
 
 def test_source_coverage_uses_inventory_bytes_and_unique_accepted_entries(monkeypatch, capsys, tmp_path):
+    from scripts import cmre_progress
+    monkeypatch.setattr(cmre_progress, "write_dashboard", lambda: tmp_path / "index.html")
     def entry(va, *, legacy=False, c=False):
         return SimpleNamespace(va=va, legacy=legacy, size=99999, record={"c": {} if not c else {"source": "c"}})
 
@@ -14,6 +16,7 @@ def test_source_coverage_uses_inventory_bytes_and_unique_accepted_entries(monkey
     monkeypatch.setattr(queue.inventory, "load", lambda: inv)
     monkeypatch.setattr(ledger, "recovered", lambda: recovered)
     monkeypatch.setattr(ledger, "blocked", lambda: {})
+    monkeypatch.setattr(queue, "compiler_generated", lambda va: None)
     summary = queue.coverage_summary()
     assert summary["recovered_body_bytes"] == 100
     assert summary["source_body_bytes"] == 50

@@ -24,4 +24,10 @@ See [PLAN.md](PLAN.md), [START-WORKER.md](START-WORKER.md), and the [issues](htt
 
 ## Local checks
 
+For a visual overview, run `py -3.13 -m cmre progress` and open
+`CM0102/Analysis/cmre/progress/index.html`. The interactive treemap tracks accepted
+C/legacy, lifts, composed calls and live integration separately, with search and
+history. Successful session checks refresh it automatically. See
+[visual progress](docs/agent/PROGRESS.md) for worktree use and sharing.
+
 From the authoritative checkout, start a parent session with `py -3.13 scripts/cmre_session.py start`. The C workflow uses `py -3.13 -m cmre next --c`, `cmre brief`, `cmre test --c`, and `cmre accept --c`. Close the session with `py -3.13 scripts/cmre_session.py check --parent RECEIPT`; both pytest and `cmre verify` must pass. The local `docs/ROADMAP.md` defines the runtime, integration, subsystem, and standalone parity gates. Accepted C, lifts, composed calls, and live integration are separate measures.

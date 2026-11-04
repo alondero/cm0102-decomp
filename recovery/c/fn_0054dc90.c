@@ -1,4 +1,5 @@
-/* WIP: regs mismatch (eax), case 8 */
+/* OFFLINE WIP: historical EAX case-8 failure; original once-only stream
+   capture repaired below. No post-gate test or physical stack/alias proof. */
 #include "cmre.h"
 
 extern u32 CM_CDECL cm_fn_00932c30(u32 destination, u32 size, u32 count, u32 stream);
@@ -18,8 +19,9 @@ static u32 cm_io_step(u32 selector, u32 destination, u32 size, u32 context)
 /* Per record (stride 0x245 bytes, indexed by the third argument), a fixed
    sequence of transfers at the offsets below, then a 16-bit field at +0x80
    that is loaded from the first argument's low byte, scaled by 500, and
-   stored back. The first argument is re-read at the top of each iteration:
-   the transfer to &param_1 overwrites its low byte. */
+   stored back. The transfer to &param_1 overwrites its low byte for that
+   calculation. Original ESI captures the stream once before the loop
+   (0054DCA9); back edge0054E5B4 reaches0054DCAD, retaining that capture. */
 u32 CM_CDECL cm_fn_0054dc90(u32 param_1, u32 param_2, u32 param_3, u32 param_4)
 {
     u32 index = 0u;
@@ -29,8 +31,8 @@ u32 CM_CDECL cm_fn_0054dc90(u32 param_1, u32 param_2, u32 param_3, u32 param_4)
     u32 k;
 
     if (param_4 != 0u) {
+        first_arg = param_1;
         do {
-            first_arg = param_1;
             record = param_3 + index * 0x245u;
 
             if (cm_io_step(param_2, record, 4u, first_arg) == 0u) return 0u;
