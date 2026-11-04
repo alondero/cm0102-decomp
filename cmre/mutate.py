@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import json
 import tempfile
 from pathlib import Path
 
@@ -24,26 +25,59 @@ def mutants(source):
                'old': old, 'new': new, 'source': source[:token.start()] + new + source[token.end():]}
 
 
+def classify(report):
+    if report.get('status') == 'pass':
+        return 'survivors', None
+    builds = report.get('builds', {})
+    if any(b.get('status') == 'build-failed' for b in builds.values()):
+        return 'invalid', 'build-failed'
+    if report.get('problems'):
+        return 'unresolved', 'contract-or-report-error'
+    mismatches = [m for b in builds.values() for m in b.get('difftest', {}).get('mismatches', [])]
+    if any(m.get('field') or m.get('kind') not in (None, 'budget-asymmetry') for m in mismatches):
+        return 'killed', 'differential-mismatch'
+    return 'unresolved', 'gate-failed-without-mismatch'
+
+
 def run(va, source, gate=None):
-    from . import recover
+    from . import env, recover
+    if gate is None and recover.c_profile(va) != 'semantic':
+        raise ValueError('Mutation diagnostics require the accepted semantic profile')
     gate = gate or recover.test_c
     source = Path(source)
-    original = source.read_text(encoding='utf-8')
-    survivors, killed, invalid = [], [], []
-    with tempfile.TemporaryDirectory(prefix='cmre-mutate-') as tmp:
-        candidate = Path(tmp) / source.name
-        candidate.write_text(original, encoding='utf-8', newline='')
-        baseline = gate(va, source=candidate, profile='semantic', fresh=True)
-        if baseline.get('status') != 'pass':
-            raise ValueError('Original source did not pass the unchanged semantic gate in the diagnostic workspace')
-        for row in mutants(original):
-            candidate.write_text(row.pop('source'), encoding='utf-8', newline='')
+    original = source.read_bytes().decode('utf-8')
+    baseline_sha = env.digest_bytes(original.encode('utf-8'))
+    result = {'va': f'{va:#010x}', 'baseline_sha256': baseline_sha,
+              'survivors': [], 'killed': [], 'invalid': [], 'unresolved': []}
+    parent = env.ANALYSIS / 'cmre/mutations'
+    parent.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=f'fn_{va:08x}-', dir=parent)
+    result['directory'] = tmp
+    candidate = Path(tmp) / source.name
+    candidate.write_text(original, encoding='utf-8', newline='')
+    baseline = gate(va, source=candidate, profile='semantic', fresh=True)
+    (Path(tmp) / 'baseline.json').write_text(json.dumps(baseline, indent=2), encoding='utf-8')
+    (Path(tmp) / 'baseline.c').write_text(original, encoding='utf-8', newline='')
+    result.update(baseline_gate_key=baseline.get('key'),
+                  baseline_report_path=str(Path(tmp) / 'baseline.json'),
+                  baseline_source_path=str(Path(tmp) / 'baseline.c'))
+    if baseline.get('status') != 'pass':
+        raise ValueError('Original source did not pass the unchanged semantic gate in the diagnostic workspace')
+    for index, row in enumerate(mutants(original)):
+        text = row.pop('source')
+        candidate.write_text(text, encoding='utf-8', newline='')
+        saved_source = Path(tmp) / f'{index:04d}.c'
+        saved_source.write_text(text, encoding='utf-8', newline='')
+        try:
             report = gate(va, source=candidate, profile='semantic', fresh=True)
-            builds = report.get('builds', {})
-            if any(b.get('status') == 'build-failed' for b in builds.values()):
-                invalid.append(row)
-            elif report.get('status') == 'pass':
-                survivors.append(row)
-            else:
-                killed.append(row)
-    return {'va': f'{va:#010x}', 'survivors': survivors, 'killed': killed, 'invalid': invalid}
+            category, error = classify(report)
+        except (Exception, SystemExit) as exc:
+            category, error = 'unresolved', type(exc).__name__
+            report = {'status': 'error', 'error_class': error, 'detail': str(exc)}
+        report_path = Path(tmp) / f'{index:04d}.json'
+        report_path.write_text(json.dumps(report, indent=2), encoding='utf-8')
+        row.update(baseline_sha256=baseline_sha, source_sha256=env.digest(saved_source),
+                   source_path=str(saved_source), report_path=str(report_path),
+                   gate_key=report.get('key'), error_class=error)
+        result[category].append(row)
+    return result

@@ -7,3 +7,5 @@ def hermetic_hints(tmp_path_factory, monkeypatch):
     from cmre import env
 
     monkeypatch.setattr(env, "HINTS_DIR", tmp_path_factory.mktemp("hints"))
+
+pytest_plugins = ['cmre.workspace_audit']

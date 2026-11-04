@@ -11,7 +11,9 @@ import sys
 from . import env, validation
 
 
-def identity(root: Path) -> dict:
+def identity(root: Path, *, scope: str = 'full') -> dict:
+    if scope not in ('full', 'tooling', 'workspace'):
+        raise ValueError('Unknown pytest identity scope')
     # Include ignored recovery inputs and local fixtures: tests use them too.
     # Git supplies all authored files, including untracked additions/deletions.
     listing = subprocess.run(['git', 'ls-files', '-co', '--exclude-standard', '-z'], cwd=root,
@@ -24,6 +26,8 @@ def identity(root: Path) -> dict:
         paths.update(p for p in (root / directory).rglob('*') if p.is_file())
     paths.update([root / 'CM0102/Game/cm0102.exe',
                   *(root / env.rel(p) for p in env.INVENTORY_SHA256)])
+    if scope == 'tooling':
+        paths = {p for p in paths if not p.is_relative_to(root / 'recovery')}
     files = {str(p.relative_to(root)).replace('\\', '/'): env.digest(p) if p.is_file() else None
              for p in sorted(paths) if '__pycache__' not in p.parts and p.suffix != '.pyc'}
     packages = sorted([d.metadata['Name'], d.version] for d in importlib.metadata.distributions())
@@ -34,9 +38,12 @@ def identity(root: Path) -> dict:
                  or k in validation.BUILD_ENVIRONMENT or k == 'PATH'}
     variables = {k: v for k, v in variables.items()
                  if k not in {'PYTEST_CURRENT_TEST', 'CMRE_WRITER_TOKEN', 'CMRE_WRITER_PATH'}}
-    return {'schema': 'cmre-pytest-inputs/1', 'files': files, 'python': sys.version,
+    result = {'schema': 'cmre-pytest-inputs/1', 'files': files, 'python': sys.version,
             'executable': sys.executable, 'packages': packages, 'environment': variables,
             'toolchain': {k: env.digest(Path(env.tool(k))) for k in ('gcc', 'as', 'ld', 'nm')}}
+    if scope != 'full':
+        result['scope'] = scope
+    return result
 
 
 def successful_step(path: Path, expected: dict) -> dict | None:
