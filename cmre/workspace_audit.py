@@ -9,8 +9,10 @@ import threading
 
 import pytest
 
-# Derived from all events in the retained 2026-11-03 readset, including stat.
-WORKSPACE_FILES = frozenset('''test_cmre_acceptance_policy.py test_cmre_boundaries.py test_cmre_compiler_generated.py test_cmre_composition.py test_cmre_composition_fault_owner.py test_cmre_composition_legacy_lift.py test_cmre_composition_separate.py test_cmre_drafts.py test_cmre_extended_indirect_transport.py test_cmre_fixtures.py test_cmre_jobs.py test_cmre_jump_transport.py test_cmre_lifted_budget.py test_cmre_owned_return_stop.py test_cmre_pipeline.py test_cmre_review_regressions.py test_cmre_screen.py test_cmre_selection.py test_cmre_semantic.py test_cmre_tasks_integration.py test_cmre_worktrees.py test_cmre_worktrees_integration.py test_cmre_x87_transport.py'''.split())
+# The 2026-11-03 readset identified 23 files; the retained main-root audit
+# CM0102/Analysis/cmre/diagnostics/day1-20261104/l8-candidate-audit.log
+# identified ctier, input_policy, lift_migration and shards as four more.
+WORKSPACE_FILES = frozenset('''test_cmre_acceptance_policy.py test_cmre_boundaries.py test_cmre_compiler_generated.py test_cmre_composition.py test_cmre_composition_fault_owner.py test_cmre_composition_legacy_lift.py test_cmre_composition_separate.py test_cmre_ctier.py test_cmre_drafts.py test_cmre_extended_indirect_transport.py test_cmre_fixtures.py test_cmre_input_policy.py test_cmre_jobs.py test_cmre_jump_transport.py test_cmre_lift_migration.py test_cmre_lifted_budget.py test_cmre_owned_return_stop.py test_cmre_pipeline.py test_cmre_review_regressions.py test_cmre_screen.py test_cmre_selection.py test_cmre_semantic.py test_cmre_shards.py test_cmre_tasks_integration.py test_cmre_worktrees.py test_cmre_worktrees_integration.py test_cmre_x87_transport.py'''.split())
 
 _active = None
 _root = None

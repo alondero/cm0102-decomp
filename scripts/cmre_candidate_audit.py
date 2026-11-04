@@ -1,6 +1,6 @@
 ﻿"""Run main-checkout pytest using only the candidate workspace audit plugin.
 
-Usage: py -3.13 <candidate>/scripts/cmre_candidate_audit.py <main-root>
+Usage: py -3.13 <candidate>/scripts/cmre_candidate_audit.py <main-root> [pytest-selection ...]
 The main checkout's cmre package, env, tests, and child processes remain in use.
 This is an experimental audit, not a session gate or proof of subprocess reads.
 """
@@ -11,8 +11,8 @@ import sys
 
 
 def main():
-    if len(sys.argv) != 2:
-        raise SystemExit('Pass the main checkout root as the sole argument')
+    if len(sys.argv) < 2:
+        raise SystemExit('Pass the main checkout root and optional pytest selections')
     main_root = Path(sys.argv[1]).resolve(strict=True)
     candidate = Path(__file__).resolve().parents[1] / 'cmre/workspace_audit.py'
     os.chdir(main_root)
@@ -26,7 +26,8 @@ def main():
     sys.modules[name] = plugin
     spec.loader.exec_module(plugin)
     import pytest
-    return pytest.main(['tests', 'scripts/tests', '--cmre-workspace-audit', '-p', name])
+    selection = sys.argv[2:] or ['tests', 'scripts/tests']
+    return pytest.main([*selection, '--cmre-workspace-audit', '-p', name])
 
 
 if __name__ == '__main__':

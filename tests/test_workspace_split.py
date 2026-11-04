@@ -153,3 +153,13 @@ def test_candidate_audit_runner_loads_main_package_and_candidate_plugin(tmp_path
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     assert '2 passed' in result.stdout
+    result = subprocess.run([sys.executable, str(runner), str(tmp_path), 'tests/test_main.py'],
+                            env=child_env, cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '1 passed' in result.stdout
+
+
+def test_workspace_catalogue_includes_main_audit_readers():
+    from cmre.workspace_audit import WORKSPACE_FILES
+    assert {'test_cmre_ctier.py', 'test_cmre_input_policy.py', 'test_cmre_lift_migration.py', 'test_cmre_shards.py'} <= WORKSPACE_FILES
+    assert len(WORKSPACE_FILES) == 27
