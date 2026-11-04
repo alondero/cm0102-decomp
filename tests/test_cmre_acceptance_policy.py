@@ -129,6 +129,8 @@ def test_compiler_selected_support_header_changes_dependency_identity(tmp_path, 
 
 def test_lifted_refresh_refuses_to_erase_existing_c_tier(tmp_path, monkeypatch):
     from cmre import ledger
+    monkeypatch.setenv("CMRE_COORDINATION_PATH", str(tmp_path / "command.lock"))
+    monkeypatch.delenv("CMRE_WRITER_TOKEN", raising=False)
     monkeypatch.setattr(env, "LEDGER_DIR", tmp_path)
     path = ledger.record_path(0x004671b0)
     path.write_text('{"lifted": {}, "c": {"source_sha256": "keep"}}\n')

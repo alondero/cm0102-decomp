@@ -338,6 +338,14 @@ def cmd_test(a) -> int:
     return 0 if r["status"] == "pass" else 1
 
 
+def cmd_mutate(a) -> int:
+    from . import mutate
+    va = _va(a.va)
+    result = mutate.run(va, env.C_DIR / f'fn_{va:08x}.c')
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def cmd_explain(a) -> int:
     from . import recover
 
@@ -630,6 +638,9 @@ def main(argv=None) -> int:
     env.check_python()
     p = argparse.ArgumentParser(prog="cmre", description=__doc__)
     sub = p.add_subparsers(dest="command", required=True)
+    s = sub.add_parser('mutate', help='report surviving C operator and constant mutants')
+    s.add_argument('va')
+    s.set_defaults(func=cmd_mutate)
     sub.add_parser("doctor", help="check environment, pins and ledgers").set_defaults(func=cmd_doctor)
     s = sub.add_parser("status", help="coverage summary")
     s.add_argument("--json", action="store_true")

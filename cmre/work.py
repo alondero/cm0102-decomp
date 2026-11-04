@@ -308,9 +308,27 @@ def import_wip():
     return counts
 
 
+def blocker_families(records):
+    """Catalogue recorded blocker names without inferring aliases or retry policy."""
+    result = {}
+    for name, record in sorted(records.items()):
+        family = record.get('blocker') or 'unclassified'
+        row = result.setdefault(family, {'functions': [], 'retry_conditions': []})
+        row['functions'].append(name)
+        condition = record.get('retry_when', '')
+        if condition and condition not in row['retry_conditions']:
+            row['retry_conditions'].append(condition)
+    for row in result.values():
+        row['retry_conditions'].sort()
+    return dict(sorted(result.items()))
+
+
 def add_commands(sub):
     parser = sub.add_parser("work", help="persistent C queue reasons; never accepts source")
     commands = parser.add_subparsers(dest="action", required=True)
+    p = commands.add_parser('families', help='catalogue recorded blocker families')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(func=command)
     p = commands.add_parser("list")
     p.add_argument("--state", choices=STATES)
     p.add_argument("--blocker")
@@ -344,6 +362,16 @@ def add_commands(sub):
 
 def command(args):
     from .cli import _va
+    if args.action == 'families':
+        result = blocker_families(read()['functions'])
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            for family, row in result.items():
+                print(f"{family}: {len(row['functions'])} functions")
+                for condition in row['retry_conditions']:
+                    print(f'  retry: {condition}')
+        return 0
     if args.action == "set":
         result = update(_va(args.va), args.state, args.reason, args.retry_when, args.blocker)
     elif args.action == "retry":
