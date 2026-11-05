@@ -1,183 +1,133 @@
-/* WIP: plain C cannot express the listing's x87 ST0 -> 00945640 (__ftol) call boundary.
-   Original call sites: 00597ea1, 00597f19, 00598002, 0059808d, 00598114,
-   0059813c, 00598178, 005981c7. Their preceding FILD/FDIV/FMUL/FADD/FSTP
-   instruction sequences are observable; do not replace them with guessed casts.
-   The declaration below is an unvalidated Ghidra draft retained for reference.
-   Draft for preferred-image VA 0x00597db0, image base 0x00400000, converted from Ghidra 12.1.4
-   pseudocode by `cmre draft`. Unvalidated: check names, widths and signedness against
-   `cmre show --asm`; acceptance comes only from `cmre test --c` and `cmre accept --c`. */
 #include "cmre.h"
-#ifndef NULL
-#define NULL ((void *)0)
-#endif
-#define true 1
-#define false 0
-#define DAT_009cf244 CM_GLOBAL(int, 0x009cf244)
-#define DAT_009cf2c0 CM_GLOBAL(int, 0x009cf2c0)
-#define DAT_009cf2e4 CM_GLOBAL(int, 0x009cf2e4)
-#define DAT_009cf300 CM_GLOBAL(int, 0x009cf300)
-#define DAT_009cf314 CM_GLOBAL(int, 0x009cf314)
-#define DAT_009cf338 CM_GLOBAL(int, 0x009cf338)
-#define DAT_009cf360 CM_GLOBAL(int, 0x009cf360)
-#define DAT_009cf36c CM_GLOBAL(int, 0x009cf36c)
-#define DAT_009cf434 CM_GLOBAL(int, 0x009cf434)
-#define DAT_009cf45c CM_GLOBAL(int, 0x009cf45c)
-#define DAT_009cf488 CM_GLOBAL(int, 0x009cf488)
-#define DAT_009cf4a8 CM_GLOBAL(int, 0x009cf4a8)
-#define DAT_009cf4f8 CM_GLOBAL(int, 0x009cf4f8)
-#define DAT_00ae23b4 CM_GLOBAL(int, 0x00ae23b4)
-extern u8 cm_fn_0053b900(int *param_1);
-extern u32 CM_FASTCALL cm_fn_005986b0(u32 *param_1);
-extern /* Library Function - Single Match cm_fn_00945640 Library: Visual Studio */ long long cm_fn_00945640(void);
+/* Preferred-image VAs, base00400000; original SHA-256
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+   THIS1/RET4; five direct callers consume full EAX. */
+extern u32 CM_CDECL cm_fn_0053b900(u32 *);
+extern u8 CM_THISCALL cm_fn_005986b0(u32);
+#define D(a) CM_GLOBAL(volatile u32,(a))
+#define W(a) CM_GLOBAL(volatile s16,(a))
+#define B(a) CM_GLOBAL(volatile s8,(a))
+#define F(a) CM_GLOBAL(volatile double,(a))
 
-int CM_THISCALL cm_fn_00597db0(int param_1,char param_2)
-
+__attribute__((target("no-sse3")))
+u32 CM_THISCALL cm_fn_00597db0(u32 self,u32 kind)
 {
-  int iVar1;
-  int *piVar2;
-  u8 uVar3;
-  int iVar4;
-  char cVar5;
-  int iVar6;
-  
-  iVar6 = *(int *)(param_1 + 8);
-  iVar1 = DAT_00ae23b4 + iVar6 + iVar6 * 0x244;
-  if (*(char *)(DAT_00ae23b4 + iVar6 + 100 + iVar6 * 0x244) == '\x03') {
-    return 0;
-  }
-  switch(param_2 + -5) {
-  case 0:
-  case 1:
-  case 2:
-    iVar6 = 35000;
-    break;
-  case 3:
-    iVar6 = 20000;
-    break;
-  case 4:
-    iVar6 = 0x5dc;
-    break;
-  case 5:
-    iVar6 = 1000;
-    break;
-  default:
-    iVar6 = 0x2ee;
-  }
-  iVar4 = cm_fn_0053b900(iVar1);
-  if (iVar4 != 0) {
-    return iVar6;
-  }
-  piVar2 = *(int **)(iVar1 + 0x53);
-  if (piVar2 == (int *)0x0) {
-LAB_00598178:
-    iVar6 = cm_fn_00945640();
-  }
-  else {
-    cVar5 = *(char *)((int)piVar2 + 0x7e);
-    if (cVar5 < '\x01') {
-      cVar5 = '\x01';
-    }
-    else if ('\x03' < cVar5) {
-      cVar5 = '\x03';
-    }
-    iVar6 = cm_fn_00945640();
-    if (cVar5 == '\x01') {
-      iVar4 = *piVar2;
-      if (((iVar4 == DAT_009cf2e4) || (iVar4 == DAT_009cf360)) || (iVar4 == DAT_009cf488)) {
-        if (0x1c52 < *(short *)(iVar1 + 0x80)) {
-          iVar6 = cm_fn_00945640();
+    u32 index,record,group,a,base,value,region,factor,minimum,maximum;
+    s32 rating,level,division,denominator;
+    s8 category;
+    long double live,weight;
+    volatile long long converted;
+    a=D(self+8);record=D(0x00ae23b4)+a*581u;
+    if(B(record+0x64)==3)return 0;
+    rating=(s32)W(record+0x80)/50;
+    index=(u32)(s32)(s8)kind-5u;
+    if(index<=5) {
+        /* Original immutable DWORD dispatch table, exact guarded read. */
+        (void)D(0x005982f0+index*4u);
+        base=index<=2?35000u:index==3?20000u:index==4?1500u:1000u;
+    } else base=750;
+    if(cm_fn_0053b900((u32 *)record))return base;
+    group=D(record+0x53);
+    value=base;
+    if(group) {
+        category=B(group+0x7e);
+        if(category<1)category=1;
+        else if(category>3)category=3;
+        level=B(group+0x85);
+        live=(long double)level;
+        denominator=(s32)category*20;
+        live/=(long double)denominator;
+        live*=(long double)(s32)base;
+        converted=(long long)live; /* __ftol CALL00597ea1, ADR0006. */
+        value=(u32)converted;
+        if(category==1) {
+            region=D(group);
+            a=D(0x009cf2e4);
+            if(region==a || region==D(0x009cf360) || region==D(0x009cf488)) {
+                if(W(record+0x80)>7250) {
+                    live=(long double)(s32)value;live*=F(0x009689b8);
+                    converted=(long long)live; /* __ftol CALL0059813c. */
+                    value=(u32)converted;
+                }
+            } else if(region!=D(0x009cf36c)) {
+                if(region==D(0x009cf4f8)) {
+                    if((s32)value>1750) {
+                        value-=1750u;live=(long double)(s32)value;
+                        live*=F(0x00969040);live+=F(0x0096a5f8);
+                        converted=(long long)live; /* __ftol CALL00597f19. */
+                        value=(u32)converted;
+                    }
+                } else {
+                    if(region==D(0x009cf314) || region==D(0x009cf300) ||
+                       region==D(0x009cf45c) || region==D(0x009cf338)) {
+                        factor=0x00969040;minimum=2500;
+                    } else if(region==D(0x009cf4a8) || region==D(0x009cf2c0) ||
+                              region==D(0x009cf244) || region==D(0x009cf434)) {
+                        factor=0x00969040;minimum=1250;
+                    } else {factor=0x00968e80;minimum=750;}
+                    /* The native low-WORD sign extension overwrites L+4. */
+                    division=(s16)rating;
+                    weight=(long double)F(factor);
+                    if(division>level*10) {
+                        denominator=level<1?1:level;
+                        weight=(long double)division;
+                        weight/=(long double)denominator;
+                        weight*=F(0x00967880);weight*=F(factor);
+                    }
+                    if((s32)value>(s32)minimum) {
+                        if(weight>(long double)F(0x00967890))
+                            weight=(long double)F(0x00967890);
+                        value-=minimum;live=(long double)(s32)value;
+                        live*=weight;
+                        if(minimum==750) {
+                            live+=F(0x0096a5f0);
+                            converted=(long long)live; /* __ftol CALL00598002. */
+                        } else if(minimum==1250) {
+                            live+=F(0x0096a5e8);
+                            converted=(long long)live; /* __ftol CALL0059808d. */
+                        } else {
+                            live+=F(0x009690b0);
+                            converted=(long long)live; /* __ftol CALL00598114. */
+                        }
+                        value=(u32)converted;
+                    }
+                }
+            }
         }
-      }
-      else if (iVar4 != DAT_009cf36c) {
-        if (iVar4 == DAT_009cf4f8) {
-          if (0x6d6 < iVar6) {
-            iVar6 = cm_fn_00945640();
-          }
+        a=D(record+0x57);
+        if(a) {
+            live=(long double)(s32)W(a+0x69);
+            live*=(long double)(s32)value;live*=F(0x00968918);
+            converted=(long long)live; /* __ftol CALL00598178, linked path. */
+            value=(u32)converted;
         }
-        else if (((iVar4 == DAT_009cf314) || (iVar4 == DAT_009cf300)) ||
-                ((iVar4 == DAT_009cf45c || (iVar4 == DAT_009cf338)))) {
-          if (0x9c4 < iVar6) {
-            iVar6 = cm_fn_00945640();
-          }
+    } else {
+        live=(long double)(s32)base;live*=F(0x009689e0);
+        converted=(long long)live; /* __ftol CALL00598178, unlinked path. */
+        value=(u32)converted;
+    }
+    a=(u32)(s32)(s8)cm_fn_005986b0(self)+2u;
+    if(a<=4) {
+        (void)D(0x00598308+a*4u);
+        if(a==4)value+=value;
+        else if(a!=2) {
+            factor=a==0?0x00969040:a==1?0x009689d0:0x00968940;
+            live=(long double)(s32)value;live*=F(factor);
+            converted=(long long)live; /* __ftol CALL005981c7. */
+            value=(u32)converted;
         }
-        else if (((iVar4 == DAT_009cf4a8) || (iVar4 == DAT_009cf2c0)) ||
-                ((iVar4 == DAT_009cf244 || (iVar4 == DAT_009cf434)))) {
-          if (0x4e2 < iVar6) {
-            iVar6 = cm_fn_00945640();
-          }
-        }
-        else if (0x2ee < iVar6) {
-          iVar6 = cm_fn_00945640();
-        }
-      }
     }
-    if (*(int *)(iVar1 + 0x57) != 0) goto LAB_00598178;
-  }
-  uVar3 = cm_fn_005986b0();
-  switch(uVar3) {
-  default:
-    goto switchD_0059819a_caseD_0;
-  case 1:
-    break;
-  case 2:
-    iVar6 = iVar6 * 2;
-    goto switchD_0059819a_caseD_0;
-  case 0xfe:
-    break;
-  case 0xff:
-  }
-  iVar6 = cm_fn_00945640();
-switchD_0059819a_caseD_0:
-  if (*(int *)(param_1 + 0x14) < iVar6) {
-    iVar6 = *(int *)(param_1 + 0x14);
-  }
-  switch(param_2 + -5) {
-  case 0:
-    if (35000 < iVar6) {
-      return 35000;
-    }
-    if (iVar6 < 0x6d6) {
-      return 0x6d6;
-    }
-    goto LAB_005982d6;
-  case 1:
-  case 2:
-    if (20000 < iVar6) {
-      return 20000;
-    }
-    if (iVar6 < 500) {
-      return 500;
-    }
-    goto LAB_005982d6;
-  case 3:
-    if (0x1d4c < iVar6) {
-      return 0x1d4c;
-    }
-    if (iVar6 < 0xfa) {
-      return 0xfa;
-    }
-    goto LAB_005982d6;
-  case 4:
-    if (2000 < iVar6) {
-      return 2000;
-    }
-    break;
-  case 5:
-    if (0x5dc < iVar6) {
-      return 0x5dc;
-    }
-    break;
-  default:
-    if (1000 < iVar6) {
-      return 1000;
-    }
-  }
-  if (iVar6 < 0x7d) {
-    return 0x7d;
-  }
-LAB_005982d6:
-  if (250000 < iVar6) {
-    iVar6 = 250000;
-  }
-  return iVar6;
+    a=D(self+0x14);if((s32)a<(s32)value)value=a;
+    if(index<=5) {
+        (void)D(0x0059831c+index*4u);
+        if(index==0){maximum=35000;minimum=1750;}
+        else if(index<=2){maximum=20000;minimum=500;}
+        else if(index==3){maximum=7500;minimum=250;}
+        else if(index==4){maximum=2000;minimum=125;}
+        else {maximum=1500;minimum=125;}
+    } else {maximum=1000;minimum=125;}
+    if((s32)value>(s32)maximum)return maximum;
+    if((s32)value<(s32)minimum)return minimum;
+    if((s32)value>250000)value=250000;
+    return value;
 }

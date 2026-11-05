@@ -1,3 +1,40 @@
 #include "cmre.h"
+/* Preferred-image VA 0043f580, image base00400000; primary3.9.68 SHA256
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+   Native thiscall/one DWORD flags/RET4. EDX:EAX is fully defined by final
+   original FTOL lowering; store only lowDWORD through the original receiver.
+   All integer helpers remain calls to original native functions. */
+extern unsigned long long CM_CDECL cm_fn_004426e0(u32 low, u32 high, u32 flags);
+extern unsigned long long CM_STDCALL cm_fn_00945e80(u32 low, u32 high,
+                                                  u32 divisor_low, u32 divisor_high);
+extern unsigned long long CM_STDCALL cm_fn_00945e40(u32 low, u32 high,
+                                                  u32 multiplier_low, u32 multiplier_high);
 
-/* WIP: original leaves a live x87 ST0 (FILD m32 at 0x0043F588 times FMUL m64 at 0x0043F58E) across the direct call to 0x00945640 (__ftol-like, no-argument, consumes ST0). Plain C has no transport that keeps ST0 live across that call, and C that reconverts the value would replace the callee. The second conversion path at 0x0043F5FA (FILD m64) and 0x0043F5FE (FDIV m64) uses x87 forms outside cmre/x87_transport.py's supported list (FILD m32, FSTP m64, FMUL m64, FCOMP m64, FNSTSW AX). No test has been run. Needs a parent decision on original_x87 transport for these sites. */
+__attribute__((target("no-sse3")))
+unsigned long long CM_THISCALL cm_fn_0043f580(u32 self, u32 flags)
+{
+    long double value_fp;
+    unsigned long long value, quantum, half, quotient, selected;
+    value_fp = (long double)*(volatile s32 *)self;
+    value_fp *= (long double)CM_GLOBAL(volatile double, 0x00ad9cb8u);
+    /* Original __ftol site 0043f594. */
+    value = (unsigned long long)(long long)value_fp;
+    if ((flags & 0x20u) == 0u) {
+        quantum = cm_fn_004426e0((u32)value, (u32)(value >> 32), flags);
+        half = cm_fn_00945e80((u32)quantum, (u32)(quantum >> 32), 2u, 0u);
+        value += half; /* Original ADD/ADC wraps the full64 bits. */
+        quotient = cm_fn_00945e80((u32)value, (u32)(value >> 32),
+                                  (u32)quantum, (u32)(quantum >> 32));
+        value = cm_fn_00945e40((u32)quotient, (u32)(quotient >> 32),
+                               (u32)quantum, (u32)(quantum >> 32));
+    }
+    selected = value;
+    quantum = cm_fn_004426e0((u32)selected, (u32)(selected >> 32), flags);
+    value -= quantum; /* Original ADD/ADC or SUB/SBB, modulo2^64. */
+    value_fp = (long double)(long long)value;
+    value_fp /= (long double)CM_GLOBAL(volatile double, 0x00ad9cb8u);
+    /* Original __ftol site 0043f604. */
+    value = (unsigned long long)(long long)value_fp;
+    *(volatile u32 *)self = (u32)value;
+    return value;
+}

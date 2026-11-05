@@ -24,6 +24,18 @@ closure; a delegated reviewer inherits the parent's baseline.
    and runtime gates still run; supplemental checks answer the named gap and stop
    when it is resolved. A new reviewer can audit existing evidence without
    regenerating the same experiments.
+   Reuse a return-width proof only for the same value origin, call edge and
+   argument positions. A later call can introduce new high bits after an earlier
+   proof's full-register kill. Follow those bits through each forwarded slot;
+   a full-width store derived from the old slot, including a read-modify-write,
+   does not establish that its high bits were discarded.
+   For final-byte claims from `cmre explain`, run
+   `py -3.13 -m cmre trace-check EXPLAIN.json` and require exit 0 before treating
+   a last visible write as final. It checks complete memory-first trace windows;
+   the reviewer still checks the compared address, width, bytes and causality.
+   Legacy reports need their retained independent completeness proof or a new
+   complete witness. Local first-divergence claims need only their relevant
+   context; this diagnostic check changes no acceptance or execution policy.
 4. Return the verdict for the **claimed gate**, remaining unknowns, and the next
    check that would resolve each blocker. Preserve a failed baseline as failed.
    Completion: no required claim is silently omitted or promoted beyond evidence.

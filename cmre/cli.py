@@ -367,8 +367,19 @@ def cmd_explain(a) -> int:
         r = (recover.explain_c(va, a.case, _overrides(a), source=None, profile=a.profile, opt=a.opt,
                                window=a.window) if a.c
              else recover.explain(va, a.case, _overrides(a), window=a.window))
+    if a.case is not None:
+        from . import trace_evidence
+        r['trace_evidence'] = trace_evidence.describe(r, a.window)
     print(json.dumps(r, indent=1))
     return 0
+
+
+def cmd_trace_check(a) -> int:
+    from . import trace_evidence
+
+    summary = trace_evidence.check_file(a.report)
+    print(json.dumps(summary, indent=1))
+    return 0 if summary['trace_evidence']['complete'] else 1
 
 
 def cmd_accept(a) -> int:
@@ -725,6 +736,9 @@ def main(argv=None) -> int:
     s.add_argument("--profile", choices=("semantic", "abi"))
     s.add_argument("--opt", choices=("-O0", "-O2"), default="-O2")
     s.set_defaults(func=cmd_explain)
+    s = sub.add_parser("trace-check", help="offline completeness check for retained memory-first explain JSON")
+    s.add_argument("report", type=Path)
+    s.set_defaults(func=cmd_trace_check)
     s = sub.add_parser("block", help="record why a function cannot proceed")
     s.add_argument("va")
     s.add_argument("--reason", required=True)

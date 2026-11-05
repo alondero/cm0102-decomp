@@ -92,7 +92,11 @@ callees as explicit boundaries. C acceptance does not establish composed executi
      Write it as `(long long)t`, where `t` is a `long double` that follows the
      listing's x87 sequence on the original constants (`CM_GLOBAL(double, VA)`);
      narrow the 64-bit result as the listing uses EAX/EDX, never `(int)t`. Name the
-     original call VA in a comment. A pass is not enough: break each converted
+     original call VA in a comment. Before the mutation sweep, inspect standard
+     O0/O2 emission across the complete reachable body: intermediate precision,
+     64-bit conversion/control-word behavior, and original call/store/RNG order.
+     Resolve compiler-lowering discrepancies against the original contract,
+     then freeze the corrected pair and its passing baseline. Break each converted
      value once in a scratch copy (for example drop one FADD) and run
      `cmre test fn_X --c --source COPY`. If that copy also passes, add evidenced
      `c_hints` fixtures that reach the value before accepting.

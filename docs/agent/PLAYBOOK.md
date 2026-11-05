@@ -71,6 +71,9 @@ establish throughput. The parent reviews source evidence and accepts serially.
 - Use `cmre brief`, `show`, `explain --c`, `next --c` and `status` instead of
   ad-hoc `py -c` probes. If you need the same probe twice, add it to `cmre`
   with a test (tooling task) rather than a script under `CM0102/Analysis/`.
+- Inspect JSON keys and project scalar status/exit/path fields before opening
+  nested payloads. Keep fixture corpora and `inputs_before` behind artifact
+  paths. Check command help when syntax is unknown.
 - Harness modules (`HARNESS_MODULES` in `cmre/recover.py`) are frozen during a
   recovery session. For tooling changes, inspect `cmre revalidate --plan`, batch
   fixes and follow [HARNESS.md](HARNESS.md). Global/unknown impact requires the
@@ -150,6 +153,11 @@ For continuation, replace `docs/NEXT-SESSION-PROMPT.md` with at most 40 lines:
 next task and workflow, progress line, unresolved failures with commands,
 any active job receipt/PID, and WIP function IDs. Keep history out of it;
 archive detail under `CM0102/Analysis/` and link it.
+The linked pack is the index: current source/hint hashes, terminal or live job
+receipts, independent verdicts, evidence stages, retained blockers and ordered
+next commands. Reuse immutable artifacts instead of copying raw corpora into
+the prompt. Completion: the prompt starts the next bounded task from that pack
+without rediscovering a gate, claim or input witness.
 `checkpoint --write-handoff` also replaces that file; add `--workflow HARNESS.md`
 for tooling rather than recovery. Review the handoff for task-specific facts
 outside the work registry. During an active supervised job, retain its receipt

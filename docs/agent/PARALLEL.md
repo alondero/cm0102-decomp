@@ -50,6 +50,10 @@ Before launching any child, check UTF-8 prompts, artifact schema and stage, sour
 and hint hashes, current claims/bindings, recorded execution environment and the
 selected protocol's capabilities. Record command, exit status and receipt paths;
 surface failed stages promptly and resume from retained successful stages.
+Group diagnostic commands by function VA: run each group's commands serially
+and parallelize different VAs. The per-VA fence also covers private source
+copies. Retain rejected-stage receipts and resume only unexecuted stages;
+administrative fence rejections are separate from canonical test failures.
 
 Controller changes need focused deterministic tests before wider dispatch. Cover
 encoding rejection before launch, stale or missing evidence, changed hashes and

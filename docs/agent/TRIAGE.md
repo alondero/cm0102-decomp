@@ -103,8 +103,12 @@ Use this loop for a named input gap or several consumers of the same layout.
    Keep unknown helper/OS behavior, scratch initialization and callee outputs unknown.
 3. Save reusable components in the family's ignored evidence directory: layout
    and producer/consumer pins, exact initial writes and prerequisites, fixture
-   schema/hash, original observations and consuming function IDs. Record whether
-   a component is proposed or original-observed. Reuse unchanged evidence and
+   schema/hash, original observations and consuming function IDs. Record its
+   stage as `aggregate-screen`, `static-proposal` or `original-observed`.
+   Mark `original-observed` only when the exact initial case/options and raw
+   witness pins from step 1 are present; an aggregate stop and an unrelated
+   case are not that witness.
+   Reuse unchanged evidence and
    combine compatible components instead of rediscovering each consumer's graph.
 4. Preserve existing shared/C fixture prefixes, ordinary random cases and all
    execution/acceptance policies when proposing a canonical update. Claim edited
