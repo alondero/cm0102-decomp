@@ -82,6 +82,16 @@ Lift acceptance is a prerequisite where needed; it has a separate progress measu
    is separate supplemental evidence. Selecting an accepted leaf can also expose
    an unowned original caller outside the selection. Retain that escape boundary
    until its caller or execution binding has been recovered and reviewed.
+   Composition currently compares ABI-normalized state, including physical
+   registers at faults and the fault instruction address unless an admitted
+   mapping applies. New plain C acceptance uses the semantic profile. The same
+   data fault at a different generated instruction can therefore pass the routine
+   gate and fail composition. Inspect the first differing field and its contract;
+   preserve the failure without inferring a source defect or weakening comparison.
+   Linking selected direct calls does not rebind original function VAs stored in
+   fixture vtables, callbacks or globals. An indirect call into a selected original
+   extent is an escape even when recovered direct calls were observed. Retain the
+   original fixture and resolve that execution binding explicitly.
 5. For an M2/M4 or subsystem-parity claim, run the independent primary-runtime
    lane below. Local C recovery records the outstanding runtime experiment without
    promoting that gate. Completion for a runtime claim: repeated observed
