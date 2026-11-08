@@ -1,5 +1,11 @@
 # Next-phase plan: measured limits, design and sequence
 
+Current timed provider operations and roles are in
+[PROVIDER-CAMPAIGN.md](PROVIDER-CAMPAIGN.md), updated after the November 8 pilots.
+Use that workflow for the next 150-minute run. Counts, concurrency estimates and
+day plans below are historical measurements; refresh supply before dispatch.
+The current provider workflow takes precedence over historical lane counts.
+
 Written 2026-11-03 from live `cmre status`, `shards`, `work list` and job receipts
 in the authoritative checkout, plus read-only scratch measurements (scripts and
 outputs are listed in section 9). Counts move: re-read them before acting. This
@@ -167,16 +173,18 @@ input authoring becomes a lane; otherwise arm B starts.
 
 | Role | Count | Rule |
 | --- | --- | --- |
-| Integrator | 1 | Claims, serial accept, hourly check, handoff. Never delegates acceptance. |
-| Family owner | 1–2 | Writes a family contract and its regressions. Strongest model. |
-| Input author | from spike result | Writes fixtures for coverage and sensitivity. |
-| Translator | ready KB / 20, at most 8 | Cheapest model passing the adapter checks; families of up to three. |
-| Reviewer | 1 per 2–4 translators | Different model family; reviews surviving mutants first. |
+| Coordinator / family owner | 1 | Codex: original evidence, shared contracts, final review, serial accept, gates, retro and handoff. |
+| Translator | Within two external workers total | MiniMax initially; eligible functions with prepared evidence, up to three related IDs per fresh assignment. |
+| Preliminary reviewer / second translator | Within the same cap | DeepSeek Go initially; independent evidence review or disjoint translation. Final authority stays with the coordinator. |
+| Input proposal author | Within the same cap | Either provider in a bounded trial; private evidenced proposals, coordinator adoption and validation. |
 
-Providers follow the adapter rule in the 2026-11-03 plan
-([MULTI-PROVIDER-PROPOSAL.md](MULTI-PROVIDER-PROPOSAL.md),
-[PROVIDER-RESEARCH.md](PROVIDER-RESEARCH.md); re-verify capabilities and quota).
-Scale translators only while `cmre next --c --min-bytes 129` is non-empty.
+Use [PROVIDER-CAMPAIGN.md](PROVIDER-CAMPAIGN.md) and the implemented single-worker
+adapter in [PROVIDER-WORKERS.md](PROVIDER-WORKERS.md). The old multi-provider
+proposal and research retain history, not current dispatch instructions. Re-verify
+account/model access. Scale translation only with prepared substantial supply
+and demonstrated review capacity; an empty `cmre next --c --min-bytes 129`
+redirects work to blockers and inputs. No measured result authorizes more workers
+than the user's cap.
 
 ## 4. Sequence
 

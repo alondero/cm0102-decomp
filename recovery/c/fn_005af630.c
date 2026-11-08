@@ -1,4 +1,7 @@
-/* WIP: original instruction coverage 0.4783; successful callee return path not exercised. */
+/* CM0102 3.9.68, preferred-image VA 005af630, base 00400000.
+   SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+   Original callees remain explicit boundaries. The root always
+   returns self after its ordered stores, guards and sixteen-row loop. */
 #include "cmre.h"
 
 extern u32 CM_THISCALL cm_fn_005af6e0(u32 self, u32 input);

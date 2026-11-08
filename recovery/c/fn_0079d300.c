@@ -1,82 +1,63 @@
-/* WIP: regs (EAX high word) mismatch, case 13: the null-argument path returns the
-   incoming EAX high word, which plain C cannot read. Blocker recorded as evidence-needed.
-   fn_0079d300 (module unknown), preferred-image VA 0x0079d300, 170 bytes.
-   Convention: thiscall (ECX = this) with one stack argument (ret 4).
-   Return: EAX at full width. Failure paths use `xor ax, ax` and the cap path uses
-   `mov ax, 0x64`, so the high word of EAX is kept from the value already in EAX. */
+/* Preferred-image VA 0x0079d300, base 0x00400000; CM0102 3.9.68,
+   SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+   Physical EAX/EDX/ECX prefix preserves the genuine incoming EAX high word
+   on the null argument path. EDX is positional only and unused natively. */
 #include "cmre.h"
 
-extern u32 CM_CDECL cm_fn_004b0700(u32 v);
-extern int cm_fn_0090cfc0(int param_1);
+extern u32 CM_CDECL cm_fn_004b0700(u32 key);
+/* Original boundary: only EAX is consumed; bound is at native ESP+4. */
+extern u32 CM_CDECL cm_fn_0090cfc0(u32 bound);
 
-u32 CM_THISCALL cm_fn_0079d300(u32 self, u32 arg1)
+__attribute__((regparm(3)))
+u32 CM_STDCALL cm_fn_0079d300(u32 incoming_eax, u32 unused_edx,
+                             u32 self, u32 arg1)
 {
-    u32 key;
-    u32 entry;
-    u32 flag;
-    u32 ptr;
-    s32 idx;
-    u32 block;
-    s32 cnt;
-    s32 n;
-    u32 row;
-    u32 value;
+    u32 key, eax, block, row;
     u8 low;
-
-    if (arg1 == 0) {
-        /* 0x79d30d: no load happens; the function returns the incoming EAX with
-           `xor ax, ax` applied. Its high word is an input that C cannot read. */
-        return 0;
-    }
-
-    key = *(u32 *)arg1;
-    entry = *(u32 *)(CM_GLOBAL(u32, 0x00adadfc) + key * 4);
-    if (entry == 0) {
-        return 0;
-    }
-    low = *(u8 *)(entry + 0x42);
-    if (low == 4) {
-        return entry & 0xffff0000u;
-    }
-    if (low == 2) {
-        return entry & 0xffff0000u;
-    }
-    if (cm_fn_004b0700(key) == 0) {
-        return 0;
-    }
-
-    ptr = *(u32 *)(arg1 + 0x5d);
-    if (ptr == 0) {
-        idx = cm_fn_0090cfc0((int)CM_GLOBAL(u32, 0x00ae2350));
-    } else {
-        idx = (s32)*(u32 *)ptr;
-    }
-
-    block = *(u32 *)(self + 0xc) + (u32)idx * 0x102u;
-    cnt = (s32)*(s16 *)(block + 0x10);
-
-    flag = 0;
-    value = 0;
-    if (cnt > 0) {
-        row = block + 0x16;
-        n = cnt;
+    u8 found = 0;
+    s32 count;
+    (void)unused_edx;
+    if (arg1 == 0)
+        return incoming_eax & 0xffff0000u;
+    key = *(volatile u32 *)arg1;
+    eax = CM_GLOBAL(volatile u32, 0x00adadfc);
+    eax = *(volatile u32 *)(eax + key * 4u);
+    if (eax == 0)
+        return eax & 0xffff0000u;
+    low = *(volatile u8 *)(eax + 0x42u);
+    eax = (eax & 0xffffff00u) | low;
+    if (low == 4 || low == 2)
+        return eax & 0xffff0000u;
+    eax = cm_fn_004b0700(key);
+    if (eax == 0)
+        return eax & 0xffff0000u;
+    eax = *(volatile u32 *)(arg1 + 0x5du);
+    if (eax != 0)
+        eax = *(volatile u32 *)eax;
+    else
+        eax = cm_fn_0090cfc0(CM_GLOBAL(volatile u32, 0x00ae2350));
+    block = *(volatile u32 *)(self + 0xcu);
+    block += eax * 0x102u;
+    count = *(volatile s16 *)(block + 0x10u);
+    if (count > 0) {
+        eax = arg1; /* Native stack argument reload at VA0079d36d. */
+        row = block + 0x16u;
         do {
-            if (flag == 0 && *(u32 *)(row + 8) == *(u32 *)arg1) {
-                value = *(u32 *)row;
-                flag = 1;
+            if (found == 0) {
+                u32 row_key = *(volatile u32 *)(row + 8u);
+                key = *(volatile u32 *)arg1;
+                if (row_key == key) {
+                    eax = *(volatile u32 *)row;
+                    found = 1;
+                }
             }
-            row = row + 0x10;
-            n = n - 1;
-        } while (n != 0);
-        if (flag != 0) {
-            goto check;
-        }
+            row += 0x10u;
+            --count;
+        } while (count != 0);
     }
-    value = *(u32 *)(block + 4);
-
-check:
-    if ((s32)value > 100) {
-        return (value & 0xffff0000u) | 0x64u;
-    }
-    return value;
+    if (found == 0)
+        eax = *(volatile u32 *)(block + 4u);
+    if ((s32)eax > 100)
+        eax = (eax & 0xffff0000u) | 100u;
+    return eax;
 }

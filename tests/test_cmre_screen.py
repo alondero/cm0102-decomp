@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cmre import build, difftest, emu, env, lift, recover, screen
+from cmre import build, difftest, emu, env, image, lift, recover, screen
 
 VA = 0x401000
 
@@ -35,8 +35,9 @@ def simulation(tmp_path, monkeypatch):
     outcomes = ['fault'] * 4
 
     class Machine:
-        def __init__(self, img, *, watch):
+        def __init__(self, img, *, watch, arena_size=emu.ARENA_SIZE):
             assert watch == (VA, VA + 8)
+            assert arena_size == opts.hints.get('arena_size', emu.ARENA_SIZE)
 
         def run(self, va, case, budget):
             assert va == VA and budget == opts.budget
@@ -127,6 +128,79 @@ def test_mid_run_input_drift_never_publishes_reusable_result(simulation, monkeyp
     with pytest.raises(ValueError, match='changed during'):
         screen.run(VA)
     assert not list(env.ANALYSIS.rglob('latest.json'))
+
+
+@pytest.mark.parametrize('capacity', [None, 0x150000], ids=['implicit-default', 'expanded-c-only'])
+def test_screen_executes_full_fixture_corpus_with_effective_c_arena(tmp_path, monkeypatch, capacity):
+    # Authored mov eax,[ecx]; ret. Run the real VM and case generator, with no C build.
+    size = emu.ARENA_SIZE if capacity is None else capacity
+    offset = size - 4
+    pointer, value = emu.ARENA + offset, 0x12345678
+    code = bytes.fromhex('8b01c3')
+    section = image.Section('.text', VA, 0x1000, code, 0x60000000)
+    img = SimpleNamespace(base=0x400000, headers=bytes(0x1000), imports={},
+                          sections=[section],
+                          section_at=lambda address: section if VA <= address < section.end else None)
+    monkeypatch.setattr(image, 'primary', lambda: img)
+    monkeypatch.setattr(difftest, '_entries', lambda: frozenset({VA}))
+    fixture = {'regs': {name: 0 for name in emu.REG_NAMES}, 'stack': [],
+               'arena_template': 0, 'arena_writes': {hex(offset): value},
+               'globals': {}, 'import_seed': 0}
+    fixture['regs'].update(ecx=pointer, eflags=0x602)
+    # Random cases use small unmapped ECX values; fixtures reach the arena's last dword.
+    c_hints = {'ecx': 'small', 'fixtures': [fixture]}
+    if capacity is not None:
+        c_hints['arena_size'] = capacity
+    monkeypatch.setattr(env, 'HINTS_DIR', tmp_path)
+    (tmp_path / 'fn_00401000.json').write_text(
+        json.dumps({'arg_count': 0, 'c_hints': c_hints}), encoding='utf-8')
+    opts = difftest.Options.for_function(VA, {'cases': 32, 'budget': 20, 'discovery': 3}, tier='c')
+    opts.inputs = 'v2'
+    lifted = SimpleNamespace(va=VA, region_end=VA + len(code), tables={}, insns={
+        VA: lift.Insn(VA, code[:2], 'mov', 'eax, dword ptr [ecx]'),
+        VA + 2: lift.Insn(VA + 2, code[2:], 'ret', '', kind='ret')})
+    runs = []
+    real_machine = emu.Machine
+
+    class RecordingMachine(real_machine):
+        def run(self, va, case, budget):
+            result = super().run(va, case, budget)
+            runs.append((case, result, self.attribute_reads))
+            return result
+
+    monkeypatch.setattr(emu, 'Machine', RecordingMachine)
+    result = screen.observe(VA, lifted, opts)
+    fixture_runs = [(case, outcome) for case, outcome, _ in runs if case.regs['ecx'] == pointer]
+    random_runs = [(case, outcome) for case, outcome, _ in runs if case.regs['ecx'] != pointer]
+    assert len(runs) == opts.cases == result['cases']
+    assert fixture_runs and random_runs
+    assert all(len(case.arena) == size for case, _, _ in runs)
+    assert all(case.arena[offset:offset + 4] == bytes.fromhex('78563412')
+               and outcome.outcome == 'return' and outcome.regs[0] == value
+               for case, outcome in fixture_runs)
+    assert all(outcome.outcome == 'fault' for _, outcome in random_runs)
+    assert result['outcomes'] == {'fault': len(random_runs), 'return': len(fixture_runs)}
+    assert result['status'] == 'return-observed' and result['coverage'] == 1.0
+    assert result['first_return_case'] == next(i for i, (_, outcome, _) in enumerate(runs)
+                                              if outcome.outcome == 'return')
+    assert [attributed for _, _, attributed in runs] == [i < opts.discovery for i in range(opts.cases)]
+    # A C-only expansion does not change the lifted lane's effective inputs.
+    assert 'arena_size' not in difftest.Options.for_function(VA).hints
+
+
+def test_observer_source_change_invalidates_screen_cache(simulation, monkeypatch):
+    first = screen.run(VA)
+    simulation.calls.clear()
+    original_digest = env.digest
+    observer = screen.Path(screen.__file__)
+    monkeypatch.setattr(env, 'digest',
+                        lambda path: 'different-observer' if screen.Path(path) == observer
+                        else original_digest(path))
+    second = screen.run(VA)
+    assert not second['reused'] and second['receipt'] != first['receipt']
+    assert second['identity']['observer'] == 'different-observer'
+    assert len(simulation.calls) == simulation.opts.cases
+    assert (env.ROOT / first['receipt']).is_file()
 
 
 def test_real_original_screen_matches_c_differential_input_outcomes(tmp_path):

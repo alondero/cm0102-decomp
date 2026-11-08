@@ -1,68 +1,62 @@
 #include "cmre.h"
+/* Preferred-image VA 0x00403200, base 0x00400000; CM0102 3.9.68
+   SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+   EAX/unused EDX/ECX are physical entry registers; only index_slot is a
+   stack argument (RET 4). Early AX writes preserve incoming EAX high bits.
+   The original rereads the low word of the stack argument after shifting. */
+#define D(a) CM_GLOBAL(volatile u32, (a))
+#define W(a) CM_GLOBAL(volatile u16, (a))
 
-/* WIP: caller-visible EAX mismatch, case 0 */
-
-u32 CM_THISCALL cm_fn_00403200(void *self, s16 index)
+u32 CM_STDCALL __attribute__((regparm(3))) cm_fn_00403200(
+    u32 incoming_eax, u32 incoming_edx, u32 self, volatile u32 index_slot)
 {
-    volatile u8 *base = (volatile u8 *)self;
-    s16 count;
-    u32 table;
-    u32 minimum;
-    u32 item_offset;
-    u32 item_value;
+    u32 eax = incoming_eax, table, minimum, item_offset, item_address;
+    u32 current, maximum, previous_index, position_address;
+    u16 index = (u16)index_slot, count, position, previous;
+    (void)incoming_edx;
 
-    if (index == -1)
-        return (u32)(s32)index;
-    count = *(volatile s16 *)(base + 0xb74);
-    if (count >= 0x4b0)
-        return (u32)(s32)count;
-    if ((*(volatile u32 *)(base + 0x18) & 0x80000u) != 0)
-        return (u32)(s32)count;
+    if (index == 0xffffu) return eax;
+    count = W(self + 0xb74u);
+    eax = (eax & 0xffff0000u) | count;
+    if ((s16)count >= 0x4b0) return eax;
+    if (D(self + 0x18u) & 0x80000u) return eax;
 
-    item_offset = (u32)(s32)index * 0x18cu;
-    table = *(volatile u32 *)(base + 0x208);
-    minimum = *(volatile u32 *)(base + 0x10);
-    *(volatile u16 *)(base + 0xb74) = (u16)(count + 1);
-    item_value = *(volatile u32 *)(u8 *)(table + item_offset + 0x24);
-    if ((s32)item_value < (s32)minimum)
-        *(volatile u32 *)(base + 0x10) = item_value;
+    position = (u16)(count + 1u);
+    item_offset = (u32)(s32)(s16)index * 396u;
+    table = D(self + 0x208u);
+    minimum = D(self + 0x10u);
+    W(self + 0xb74u) = position;
+    item_address = table + item_offset + 0x24u;
+    current = D(item_address);
+    if ((s32)current < (s32)minimum) D(self + 0x10u) = current;
+    eax = D(item_address);
+    maximum = D(self + 0x14u);
+    if ((s32)eax > (s32)maximum) D(self + 0x14u) = eax;
 
-    item_value = *(volatile u32 *)(u8 *)(table + item_offset + 0x24);
-    {
-        u32 maximum = *(volatile u32 *)(base + 0x14);
-        if ((s32)item_value > (s32)maximum)
-            *(volatile u32 *)(base + 0x14) = item_value;
+    position = (u16)(position - 2u);
+    if ((s16)position < 0) {
+        W(self + 0x212u) = index;
+        return eax;
     }
-
-    {
-        s16 position = (s16)((u16)(count + 1) - 2);
-        if (position < 0) {
-            *(volatile s16 *)(base + 0x212) = index;
-            return item_value;
+    for (;;) {
+        position_address = self + (u32)(s32)(s16)position * 2u;
+        table = D(self + 0x208u);
+        previous = W(position_address + 0x212u);
+        previous_index = (u32)(s32)(s16)previous;
+        current = D(item_offset + table + 0x24u);
+        eax = previous_index * 99u;
+        maximum = D(table + eax * 4u + 0x24u);
+        if ((s32)current >= (s32)maximum) {
+            index = (u16)index_slot;
+            eax = (eax & 0xffff0000u) | index;
+            W(position_address + 0x214u) = index;
+            return eax;
         }
-        for (;;) {
-            s16 previous;
-            s32 previous_index;
-            u32 previous_value;
-            u32 current_table;
-            s16 old_position = position;
-
-            current_table = *(volatile u32 *)(base + 0x208);
-            previous = *(volatile s16 *)(base + 0x212 + (u32)(s32)old_position * 2u);
-            previous_index = (s32)previous;
-            previous_value = *(volatile u32 *)(u8 *)(current_table +
-                (u32)previous_index * 0x18cu + 0x24u);
-            item_value = *(volatile u32 *)(u8 *)(current_table + item_offset + 0x24u);
-            if ((s32)item_value >= (s32)previous_value) {
-                *(volatile s16 *)(base + 0x214 + (u32)(s32)old_position * 2u) = index;
-                return ((u32)previous_index * 0x18cu & 0xffff0000u) | (u16)index;
-            }
-            position = (s16)((u16)position - 1u);
-            *(volatile s16 *)(base + 0x214 + (u32)(s32)old_position * 2u) = previous;
-            if (position < 0)
-                break;
-        }
+        position = (u16)(position - 1u);
+        W(position_address + 0x214u) = previous;
+        if ((s16)position < 0) break;
     }
-    *(volatile s16 *)(base + 0x212) = index;
-    return item_value;
+    index = (u16)index_slot;
+    W(self + 0x212u) = index;
+    return eax;
 }

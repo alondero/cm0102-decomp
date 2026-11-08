@@ -31,6 +31,116 @@ def test_queue_skips_existing_source_and_known_blocker_before_limiting(workspace
     assert [i.va for i in queue.c_frontier(1)] == [0x401100]
 
 
+@pytest.fixture
+def source_frontier(workspace, monkeypatch):
+    functions = {va: SimpleNamespace(name=f"test_{va:x}", body_bytes=100)
+                 for va in range(0x401000, 0x402000, 0x100)}
+    inv = SimpleNamespace(functions=functions, callees={}, modules={})
+    entries = [SimpleNamespace(va=0x401000, size=90, record={})]
+    monkeypatch.setattr(inventory, "load", lambda: inv)
+    monkeypatch.setattr(ledger, "cmre_entries", lambda: entries)
+    monkeypatch.setattr(ledger, "blocked", lambda: {})
+    monkeypatch.setattr(queue.image, "primary", lambda: SimpleNamespace(
+        text=SimpleNamespace(va=0x401000, end=0x402000)))
+    return inv, entries
+
+
+def test_c_frontier_unlifted_is_opt_in_and_merges_without_duplicates(source_frontier, monkeypatch):
+    inv, entries = source_frontier
+    # Accepted lifts outside inventory retain their existing extent fallback.
+    entries.append(SimpleNamespace(va=0x403000, size=110, record={}))
+    with monkeypatch.context() as default_only:
+        default_only.setattr(queue.image, "primary", lambda: pytest.fail("default queue loaded game image"))
+        default_only.setattr(ledger, "blocked", lambda: pytest.fail("default queue changed blocked policy"))
+        assert [i.va for i in queue.c_frontier(30)] == [0x401000, 0x403000]
+    items = queue.c_frontier(30, include_unlifted=True)
+    assert [i.va for i in items] == list(inv.functions) + [0x403000]
+    assert items[0].name == "test_401000" and items[0].body_bytes == 100
+    assert items[-1].name == "" and items[-1].body_bytes == 110
+
+
+@pytest.mark.parametrize("no_static_callees", [False, True])
+def test_c_frontier_unlifted_respects_exclusions_before_limit(source_frontier, monkeypatch, no_static_callees):
+    inv, entries = source_frontier
+    (env.C_DIR / "fn_00401000.c").write_text("old lifted C source")
+    (env.C_DIR / "fn_00401100.c").write_text("old unlifted C source")
+    entries.append(SimpleNamespace(va=0x401200, size=100, record={"c": {"source": "accepted"}}))
+    monkeypatch.setattr(ledger, "legacy_entries", lambda: [SimpleNamespace(va=0x401300)])
+    work.update(0x401400, "harness-blocker", "old ABI hold", "ABI supported")
+    work.update(0x401500, "evidence-needed", "caller evidence", "caller recovered")
+    work.claim([0x401600], "other")
+    monkeypatch.setattr(ledger, "blocked", lambda: {0x401700: {"reason": "unsupported"}})
+    monkeypatch.setattr(queue, "compiler_generated", lambda va: "import-thunk" if va == 0x401800 else None)
+    inv.functions[0x402000] = SimpleNamespace(name="outside_text", body_bytes=1)
+    filters = dict(include_unlifted=True, no_static_callees=no_static_callees)
+    assert [i.va for i in queue.c_frontier(1, **filters)] == [0x401900]
+    assert [i.va for i in queue.c_frontier(1, owner="other", **filters)] == [0x401600]
+    assert [i.va for i in queue.c_frontier(1, include_generated=True, **filters)] == [0x401800]
+    # Existing triage override keeps its established meaning; accepted/blocked stay excluded.
+    vas = {i.va for i in queue.c_frontier(30, include_held=True, **filters)}
+    assert vas == set(inv.functions) - {0x401200, 0x401300, 0x401700, 0x401800, 0x402000}
+
+
+@pytest.mark.parametrize("no_static_callees", [False, True])
+def test_c_frontier_unlifted_filters_and_callee_ordering(source_frontier, monkeypatch, no_static_callees):
+    inv, entries = source_frontier
+    inv.functions = {va: SimpleNamespace(name="test", body_bytes=size) for va, size in (
+        (0x401500, 20), (0x401400, 40), (0x401300, 40), (0x401200, 80),
+        (0x401100, 10), (0x401000, 100))}
+    inv.modules = {va: [r"C:\code\MATCH\unit.cpp"] for va in inv.functions}
+    inv.modules[0x401000] = [r"C:\code\elsewhere.cpp"]
+    inv.callees = {0x401500: [0x401400], 0x401300: [0x400000]}
+    entries.append(SimpleNamespace(va=0x401400, size=40, record={}))
+    monkeypatch.setattr(ledger, "legacy_entries", lambda: [SimpleNamespace(va=0x400000)])
+    filters = dict(include_unlifted=True, min_bytes=20, max_bytes=80, module="match",
+                   no_static_callees=no_static_callees)
+    expected = [0x401400, 0x401200] if no_static_callees else [0x401300, 0x401400, 0x401200, 0x401500]
+    items = queue.c_frontier(2, **filters)
+    assert [(i.va, i.ready, i.pending_callees) for i in items] == [(va, True, 0) for va in expected[:2]]
+    assert [i.va for i in queue.c_frontier(30, **filters)] == expected
+
+
+@pytest.mark.parametrize("no_static_callees", [False, True])
+def test_c_frontier_unlifted_shards_and_claims(source_frontier, no_static_callees):
+    inv, _ = source_frontier
+    filters = dict(include_unlifted=True, no_static_callees=no_static_callees)
+    shards = [{i.va for i in queue.c_frontier(30, shard=(k, 3), **filters)}
+              for k in (1, 2, 3)]
+    assert set().union(*shards) == set(inv.functions)
+    assert sum(map(len, shards)) == len(inv.functions)
+    assert [i.va for i in queue.claim_next(2, "coordinator", **filters)] == [0x401000, 0x401100]
+    assert [i.va for i in queue.c_frontier(1, **filters)] == [0x401200]
+
+
+def test_c_frontier_no_static_callees_is_opt_in_before_limit(workspace, monkeypatch):
+    inv = inventory.load()
+    monkeypatch.setattr(inventory, "load", lambda: inv)
+    inv.callees = {0x401000: [0x400000], 0x401100: [0x401200]}
+    monkeypatch.setattr(ledger, "legacy_entries", lambda: [SimpleNamespace(va=0x400000)])
+    expected = [0x401000, 0x401200, 0x401100]
+    assert [i.va for i in queue.c_frontier(3)] == expected
+    assert [i.va for i in queue.c_frontier(3, no_static_callees=False)] == expected
+    # A ready function can still have an accepted static callee. Filter before limiting.
+    assert [i.va for i in queue.c_frontier(1, no_static_callees=True)] == [0x401200]
+
+
+def test_c_frontier_no_static_callees_with_unlifted(source_frontier):
+    inv, _ = source_frontier
+    inv.callees = {0x401000: [0x400000], 0x401100: [0x400000], 0x401200: []}
+    assert queue.c_frontier(2, no_static_callees=True) == []
+    # Explicit empty and absent metadata both pass this selection-only filter.
+    assert [i.va for i in queue.c_frontier(2, include_unlifted=True, no_static_callees=True)] == [
+        0x401200, 0x401300]
+
+
+def test_claim_next_forwards_no_static_callees(workspace, monkeypatch):
+    inv = inventory.load()
+    inv.callees = {0x401000: [0x401100]}
+    monkeypatch.setattr(inventory, "load", lambda: inv)
+    assert [i.va for i in queue.claim_next(1, "coordinator", no_static_callees=True)] == [0x401100]
+    assert set(work.claims()) == {"fn_00401100"}
+
+
 def test_changed_retry_requires_a_real_change_and_preserves_attempt_history(workspace):
     source = env.C_DIR / "fn_00401000.c"
     source.write_text("first")

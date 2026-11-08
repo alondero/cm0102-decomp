@@ -5,6 +5,10 @@ Use the native C loop, work-state registry and family index. The retired
 `CM0102/Analysis/workflow-upgrade-20261020/retired/`; they are not a second source
 of scheduling truth. `cmre task` remains optional for tool-less workers only.
 
+For a timed multi-provider run, use [PROVIDER-CAMPAIGN.md](PROVIDER-CAMPAIGN.md):
+it defines the 150-minute budget, roles, supply checks, closing reserve and
+coordinator-led retro. The measurement rules here apply inside that workflow.
+
 ## Select comparable work
 
 1. Start from `cmre family -n 10 --json` within the selected subsystem. Families
@@ -46,6 +50,9 @@ of scheduling truth. `cmre task` remains optional for tool-less workers only.
 
   Omit unknown token fields. A lower price is not fewer tokens. Report cached
   input separately from fresh input and output; do not sum unlike billing rates.
+  Retain reasoning tokens separately when the client exposes them; the pilot's
+  output field alone may omit them. An unfinished exported message's initialized
+  zeros are unknown usage. Keep raw exports and an explicit reconciliation note.
 - `cmre pilot report NAME` reports measured elapsed time, new accepted bytes,
   test invocations, failures, recorded usage and review corrections. Reconcile
   provider logs before `cmre pilot finish NAME --usage-complete`; otherwise finish

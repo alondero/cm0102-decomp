@@ -45,6 +45,17 @@ closure; a delegated reviewer inherits the parent's baseline.
 | Fidelity | Original behavior only; complete control flow; caller/callee ABI and cleanup; integer widths/signedness/overflow; aliasing and memory effects; uninitialized storage; x87 rounding/intermediates; RNG calls/state/order; indirect calls, jump tables and shared exits; observed bugs retained |
 | Evidence and scope | Pinned bytes and convention; original compiler facts versus Ghidra assumptions; genuine `cmre accept` record and matching source/report identity; finite-corpus limits and API stubs named; original-code/data dependencies listed; no unsupported runtime or milestone claim; owned files and preservation contract respected |
 
+Apply the comparison profile named in the claim. Under
+[ADR 0002](../adr/0002-semantic-c-profile.md), semantic C compares FPU control
+word and depth on return. Fault outcomes retain the access kind, data address,
+size, non-stack memory and import effects, and exclude fault-time registers and
+FPU state. Retain raw differences and this profile limit; a fault-only x87 depth
+difference alone does not establish a semantic blocker. Numerical or return-state
+differences, live original-callee inputs, reordered observable effects and changed
+fault accesses still require resolution. Native exception delivery needs separate
+evidence. Transient compiler allocation can differ when values and all effects
+within the claimed profile remain equivalent.
+
 For x86, check stack cleanup at both call and return, `this`/fastcall registers,
 callee-saved registers, stack probing, float-to-integer helpers and SEH lifetime
 updates where relevant. A compiler idiom is a hypothesis until its instructions

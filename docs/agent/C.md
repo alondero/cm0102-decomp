@@ -162,10 +162,17 @@ A draft can be tried without touching `recovery/c/`:
 
 ## What the gate compares (ADR 0002, `semantic`)
 
-Return value at its declared width, EBX/ESI/EDI/EBP/ESP, FPU control word and
-depth, all non-stack memory, import calls with arguments, and a fault's data
-address. Register allocation, stack layout and the faulting instruction are not
-compared. An indirect call whose target is not a function entry stops both runs
+On return, the gate compares the declared return value, EBX/ESI/EDI/EBP/ESP,
+FPU control word and stack depth. It compares non-stack memory and import calls
+with arguments on every outcome. At a fault it compares the access kind, data
+address and size; fault-time registers, including FPU state, are outside this
+profile. See [ADR 0002](../adr/0002-semantic-c-profile.md). A raw fault-time x87
+depth difference alone is therefore a profile limit, not a semantic C blocker.
+Still verify numerical precision, caller-visible return state, live inputs to
+original callees, and memory/read/call order; a passing profile does not establish
+native exception delivery. Register allocation, stack layout and the faulting
+instruction are not compared. An indirect call whose target is not a function
+entry stops both runs
 (`interior`/`bad-target`); the target, memory, and the ECX and pushed arguments
 the listing sets up are compared there. Coverage must reach 0.6; low coverage is fixed with
 `recovery/hints/fn_X.json` input hints, never by weakening the comparison.

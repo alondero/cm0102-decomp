@@ -124,6 +124,14 @@ def _write_status(s: dict) -> None:
 def cmd_next(a) -> int:
     from . import ledger, queue
 
+    include_unlifted = getattr(a, "include_unlifted", False)
+    if include_unlifted and not a.c:
+        print("--include-unlifted requires --c", file=sys.stderr)
+        return 2
+    no_static_callees = getattr(a, "no_static_callees", False)
+    if no_static_callees and not a.c:
+        print("--no-static-callees requires --c", file=sys.stderr)
+        return 2
     if a.blocked:
         items = sorted(ledger.blocked().items(), key=lambda kv: (kv[1].get("by") != "batch", kv[0]))
         for va, r in items[: a.n]:
@@ -134,7 +142,8 @@ def cmd_next(a) -> int:
         print("--claim and --shard apply to the C queue (--c)", file=sys.stderr)
         return 2
     filters = dict(max_bytes=a.max_bytes, include_generated=a.include_generated, min_bytes=a.min_bytes,
-                   module=a.module, shard=shard)
+                   module=a.module, shard=shard, include_unlifted=include_unlifted,
+                   no_static_callees=no_static_callees)
     if claim:
         items = queue.claim_next(a.n, claim, a.claim_hours, **filters)
     elif a.c:
@@ -350,6 +359,17 @@ def cmd_test(a) -> int:
 def cmd_mutate(a) -> int:
     from . import mutate
     va = _va(a.va)
+    if getattr(a, 'plan', None) is not None:
+        if a.output is None:
+            raise ValueError('Selected control plans require --output')
+        plan, _ = mutate._plan(a.plan)
+        if int(plan['va'], 16) != va:
+            raise ValueError('Control plan VA differs from command VA')
+        result = mutate.run_plan(a.plan, a.output, resume=a.resume, fence=_diagnostic_source)
+        print(json.dumps(result, indent=2))
+        return 0 if result['status'] == 'controls-complete' else 1
+    if getattr(a, 'resume', False) or getattr(a, 'output', None) is not None:
+        raise ValueError('--output and --resume require --plan')
     result = mutate.run(va, env.C_DIR / f'fn_{va:08x}.c', fence=_diagnostic_source)
     print(json.dumps(result, indent=2))
     return 0
@@ -660,6 +680,9 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser('mutate', help='report surviving C operator and constant mutants')
     s.add_argument('va')
+    s.add_argument('--plan', type=Path, help='strict UTF-8 named control plan; selected controls only')
+    s.add_argument('--output', type=Path, help='new retained control bundle directory')
+    s.add_argument('--resume', action='store_true', help='reuse matching terminal stages; pending stages require investigation')
     s.set_defaults(func=cmd_mutate)
     sub.add_parser("doctor", help="check environment, pins and ledgers").set_defaults(func=cmd_doctor)
     s = sub.add_parser("status", help="coverage summary")
@@ -679,6 +702,13 @@ def main(argv=None) -> int:
         if name == "next":
             s.add_argument("--blocked", action="store_true", help="list blocked items to triage")
             s.add_argument("--c", action="store_true", help="tier-2 queue: lifted functions still needing C")
+            s.add_argument("--include-unlifted", action="store_true",
+                           help="with --c: coordinator source preparation from unlifted inventory too; "
+                                "lift still required before C acceptance or isolated worker dispatch")
+            s.add_argument("--no-static-callees", action="store_true",
+                           help="with --c: only empty inventory static-callee lists; imports and indirect "
+                                "transfers may remain, and absent metadata is not proof of call-free code; "
+                                "screen full original instructions and follow normal acceptance")
             s.add_argument("--include-held", action="store_true", help="with --c: include WIP and pending-review sources")
             s.add_argument("--include-generated", action="store_true",
                            help="with --c: keep compiler-generated unwind funclets and import thunks")

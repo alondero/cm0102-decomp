@@ -1,4 +1,5 @@
-/* WIP: ESI mismatch, cases 5/9/17 (eflags 0x602, DF set); report path calls 0x0090bde0 (string ops, DF gap) */
+/* Preferred-image VA 0x0041c410, base 0x00400000; CM0102 3.9.68.
+   SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86. */
 #include "cmre.h"
 
 /* Plain cdecl routine with three stack arguments (the caller pops them):
@@ -7,8 +8,8 @@
    immediate address (not a memory read) passed as `this` or fastcall argument.
    Structure mirrors 0x0041c100 with 0x0041cbd0, 0x004afd80 and [arg1+0x5d]. */
 
-extern u32 CM_FASTCALL cm_fn_007fee80(u32 p);
-extern void CM_THISCALL cm_fn_007feeb0(u32 self, u32 p);
+extern u32 CM_THISCALL cm_fn_007fee80(u32 p);
+extern u32 CM_THISCALL cm_fn_007feeb0(u32 self, u32 p);
 extern u32 CM_CDECL cm_fn_0041c9d0(u32 p1, u32 p2);
 extern u32 CM_CDECL cm_fn_0090bde0(u32 p1, u32 p2);
 extern u32 CM_CDECL cm_fn_0041cad0(u32 argument, u32 lane);

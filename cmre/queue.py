@@ -93,36 +93,52 @@ def in_shard(va: int, shard: tuple[int, int]) -> bool:
 
 def c_frontier(limit: int = 10, max_bytes: int | None = None, include_generated: bool = False,
                min_bytes: int = 0, module: str | None = None, include_held: bool = False,
-               owner: str | None = None, shard: tuple[int, int] | None = None) -> list[Item]:
+               owner: str | None = None, shard: tuple[int, int] | None = None,
+               include_unlifted: bool = False, no_static_callees: bool = False) -> list[Item]:
     """Tier-2 queue: accepted lifted functions without C, callee-complete first, then smallest.
     Compiler-generated funclets and thunks are excluded unless requested. Live claims of
-    other agents are held work; `owner` sees its own claims."""
+    other agents are held work; `owner` sees its own claims. `include_unlifted`
+    also selects unblocked inventory functions for coordinator source preparation;
+    it does not waive the lift gate for C acceptance or isolated worker dispatch.
+    `no_static_callees` requires an empty inventory static-callee list, before limiting.
+    Imports and indirect transfers may remain; absent metadata is not proof of call-free
+    code. Screen the full original instructions; normal acceptance remains required."""
     inv = inventory.load()
     entries = ledger.cmre_entries()
     from . import work
     held = work.read()["functions"]
     claimed = {k for k, c in work.claims().items() if c["owner"] != owner}
     with_c = {e.va for e in entries if e.record.get("c")} | {e.va for e in ledger.legacy_entries()}
+    sizes = {e.va: e.size for e in entries}
+    blocked = set()
+    if include_unlifted:
+        blocked = set(ledger.blocked())
+        text = image.primary().text
+        for va, f in inv.functions.items():
+            if text.va <= va < text.end:
+                sizes.setdefault(va, f.body_bytes)
     items = []
-    for e in entries:
-        if e.va in with_c:
+    for va, extent_size in sizes.items():
+        if va in with_c or va in blocked:
             continue
-        if shard and not in_shard(e.va, shard):
+        if no_static_callees and len(inv.callees.get(va, [])) != 0:
             continue
-        if not include_held and (work.held(e.va, held) or f"fn_{e.va:08x}" in claimed):
+        if shard and not in_shard(va, shard):
             continue
-        f = inv.functions.get(e.va)
-        size = f.body_bytes if f else e.size
+        if not include_held and (work.held(va, held) or f"fn_{va:08x}" in claimed):
+            continue
+        f = inv.functions.get(va)
+        size = f.body_bytes if f else extent_size
         if size < min_bytes or (max_bytes is not None and size > max_bytes):
             continue
-        if not include_generated and compiler_generated(e.va):
+        if not include_generated and compiler_generated(va):
             continue
-        paths = inv.modules.get(e.va, [])
+        paths = inv.modules.get(va, [])
         mod = paths[0].split("\\code\\")[-1] if paths else ""
         if module and module.lower() not in mod.lower():
             continue
-        pending = [c for c in inv.callees.get(e.va, []) if c not in with_c]
-        items.append(Item(e.va, f.name if f else "", size, not pending, len(pending), mod))
+        pending = [c for c in inv.callees.get(va, []) if c not in with_c]
+        items.append(Item(va, f.name if f else "", size, not pending, len(pending), mod))
     items.sort(key=lambda i: (not i.ready, i.body_bytes, i.va))
     return items[:limit]
 

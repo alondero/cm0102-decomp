@@ -28,6 +28,7 @@ First matching row wins; an explicit user task outranks the queue.
 
 | Task | Read next |
 | --- | --- |
+| Timed MiniMax/Go campaign, provider roles, 150-minute run and end-of-run retro | [Provider campaign](PROVIDER-CAMPAIGN.md) |
 | Continue / make progress / translate functions (default) | [C translation](C.md) |
 | Agent instructions, skills, scripts, guard, CLI, queue, harness | [Tooling](HARNESS.md) |
 | Compare recovery throughput or model/context choices | [Measured recovery](THROUGHPUT.md) |

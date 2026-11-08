@@ -5,6 +5,9 @@ primary-runtime observations. Parent preflight and closure remain in
 [PLAYBOOK.md](PLAYBOOK.md). The source campaign's result is a connected accepted
 C slice with an observable contract and a named next executable checkpoint.
 Lift acceptance is a prerequisite where needed; it has a separate progress measure.
+For a 150-minute campaign using MiniMax and Go, follow
+[PROVIDER-CAMPAIGN.md](PROVIDER-CAMPAIGN.md) for roles, time allocation and retro;
+this file continues to own dependency and composition evidence.
 
 1. Select exact function IDs for one observable slice. Create the manifest under
    ignored analysis storage, then inspect its live dependency report:

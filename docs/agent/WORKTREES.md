@@ -27,6 +27,12 @@ increase concurrency only from measured throughput. Harness experiments use a
 separate tree in the same container. Workers inherit the parent receipt and use
 the coordinator's broker, never their own copied game or acceptance ledger.
 
+For a [provider campaign](PROVIDER-CAMPAIGN.md), the coordinator initially supplies
+the independent final review. Any external preliminary reviewer consumes one of
+the two external-worker slots; it is not an additional third provider worker.
+Private input proposals use the selected triage/control workflow, not this C-only
+broker. The campaign workflow owns its 150-minute budget and end-of-run retro.
+
 At the batch boundary, stop workers and reconcile live claims through the normal
 work protocol. Preserve candidate source, reports, bindings and attempts. Archive
 any unique or pending files with a hash manifest outside the disposable tree and

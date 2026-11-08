@@ -3,6 +3,69 @@ from cmre import cli
 import pytest
 
 
+@pytest.mark.parametrize("claim", [False, True])
+@pytest.mark.parametrize("include_unlifted", [False, True])
+@pytest.mark.parametrize("no_static_callees", [False, True])
+def test_next_routes_unlifted_opt_in(monkeypatch, claim, include_unlifted, no_static_callees):
+    from cmre import queue
+
+    calls = []
+    monkeypatch.setattr(queue, "claim_next", lambda *a, **kw: calls.append((a, kw)) or [])
+    monkeypatch.setattr(queue, "c_frontier", lambda *a, **kw: calls.append((a, kw)) or [])
+    args = ["next", "--c", "-n", "2", "--min-bytes", "129", "--max-bytes", "600",
+            "--module", "util", "--shard", "1/2"]
+    if claim:
+        args += ["--claim", "coordinator"]
+    if include_unlifted:
+        args += ["--include-unlifted"]
+    if no_static_callees:
+        args += ["--no-static-callees"]
+    assert cli.main(args) == 0
+    assert len(calls) == 1
+    positional, filters = calls[0]
+    assert positional == ((2, "coordinator", None) if claim else (2,))
+    assert filters["include_unlifted"] is include_unlifted
+    assert filters["no_static_callees"] is no_static_callees
+    assert (filters["min_bytes"], filters["max_bytes"], filters["module"], filters["shard"]) == (
+        129, 600, "util", (1, 2))
+
+
+@pytest.mark.parametrize("extra", [[], ["--blocked"]])
+def test_next_rejects_include_unlifted_without_c(monkeypatch, capsys, extra):
+    from cmre import ledger, queue
+
+    monkeypatch.setattr(queue, "frontier", lambda *a, **kw: pytest.fail("selection before validation"))
+    monkeypatch.setattr(ledger, "blocked", lambda: pytest.fail("blocked read before validation"))
+    assert cli.main(["next", "--include-unlifted", *extra]) == 2
+    assert "--include-unlifted requires --c" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("extra", [[], ["--blocked"], ["--claim", "coordinator"], ["--shard", "1/2"]])
+def test_next_rejects_no_static_callees_without_c_before_reads(monkeypatch, capsys, extra):
+    from cmre import inventory, image, ledger, queue, work
+
+    def no_read(*args, **kwargs):
+        pytest.fail("file access or selection before validation")
+
+    for module, names in ((inventory, ("load",)), (image, ("primary",)),
+                          (ledger, ("blocked", "cmre_entries", "legacy_entries")),
+                          (work, ("read", "claims")), (queue, ("frontier", "c_frontier", "claim_next"))):
+        for name in names:
+            monkeypatch.setattr(module, name, no_read)
+    assert cli.main(["next", "--no-static-callees", *extra]) == 2
+    assert "--no-static-callees requires --c" in capsys.readouterr().err
+
+
+def test_next_blocked_retains_precedence_over_c_filters(monkeypatch, capsys):
+    from cmre import ledger, queue
+
+    monkeypatch.setattr(ledger, "blocked", lambda: {0x401000: {"reason": "held"}})
+    monkeypatch.setattr(queue, "c_frontier", lambda *a, **kw: pytest.fail("blocked must take precedence"))
+    monkeypatch.setattr(queue, "claim_next", lambda *a, **kw: pytest.fail("blocked must take precedence"))
+    assert cli.main(["next", "--c", "--blocked", "--no-static-callees", "--claim", "coordinator"]) == 0
+    assert "fn_00401000  held" in capsys.readouterr().out
+
+
 def test_build_failure_prints_compiler_errors_once(capsys):
     stderr = ("fn.c: In function 'cm_fn_007862d0':\n"
               "fn.c:46:17: error: too many arguments to function 'cm_fn_0090d130'; expected 0, have 3\n"

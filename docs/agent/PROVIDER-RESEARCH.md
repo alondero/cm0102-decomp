@@ -1,5 +1,11 @@
 # External agent runner research
 
+Historical capability research. Current roles, the 150-minute session and its
+coordinator-led retro are in [PROVIDER-CAMPAIGN.md](PROVIDER-CAMPAIGN.md); the
+implemented adapter is in [PROVIDER-WORKERS.md](PROVIDER-WORKERS.md). The November
+2026 pilots exercised both MiniMax and Go; this older assessment is not dispatch
+or authentication guidance.
+
 Research checked 2026-10-23. This is a capability assessment, not an enabled
 workflow or a claim that these clients have passed this project's harness.
 No agent was launched, installed, authenticated, or reconfigured for this note.

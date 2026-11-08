@@ -28,7 +28,8 @@ def observe(va: int, lifted, opts) -> dict:
     """Replay every C case, including discovery, fixtures and indirect boundaries."""
     img = image.primary()
     region = (lifted.va, lifted.region_end)
-    machine = emu.Machine(img, watch=region)
+    machine = emu.Machine(img, watch=region,
+                          arena_size=opts.hints.get('arena_size', emu.ARENA_SIZE))
     difftest._stop_indirect(machine, None, region, None, recover._indirect_calls(lifted))
     rng = random.Random(opts.seed)
     templates = difftest.arena_templates()
