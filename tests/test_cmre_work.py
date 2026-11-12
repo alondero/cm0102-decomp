@@ -247,6 +247,45 @@ def test_recording_report_does_not_mutate_it(workspace):
     assert report["problems"] == []
 
 
+def test_work_show_returns_one_function_and_every_hold_without_mutation(workspace, monkeypatch, capsys):
+    import json
+    directory = workspace / 'ledger'
+    directory.mkdir()
+    monkeypatch.setattr(env, 'LEDGER_DIR', directory)
+    work.update(0x401000, 'evidence-needed', 'Old return-input hold', 'Returning witness', 'return-input')
+    work.update(0x401000, 'evidence-needed', 'Preserve upper EBX', 'Explicit state carrier', 'register-home')
+    work.update(0x401100, 'needs-review', 'Unrelated function')
+    before = work.path().read_bytes()
+    monkeypatch.setattr(ledger, 'cmre_entries', lambda: pytest.fail('single lookup scanned all ledgers'))
+    assert cli.main(['work', 'show', 'fn_00401000', '--json']) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['function'] == 'fn_00401000'
+    assert result['work']['reason'] == 'Old return-input hold'
+    assert result['work']['additional_holds'][0]['retry_when'] == 'Explicit state carrier'
+    assert 'Unrelated function' not in json.dumps(result)
+    assert work.path().read_bytes() == before
+
+
+@pytest.mark.parametrize('change', ['matching', 'changed', 'missing'])
+def test_work_show_separates_accepted_source_from_queue_history(workspace, monkeypatch, capsys, change):
+    import json
+    directory = workspace / 'ledger'
+    directory.mkdir()
+    monkeypatch.setattr(env, 'LEDGER_DIR', directory)
+    source = env.C_DIR / 'fn_00401000.c'
+    source.write_text('reviewed source')
+    ledger.record_path(0x401000).write_text(json.dumps({'c': {'source_sha256': env.digest(source)}}))
+    work.update(0x401000, 'needs-review', 'Historical passing test')
+    if change == 'changed':
+        source.write_text('later edit')
+    elif change == 'missing':
+        source.unlink()
+    assert cli.main(['work', 'show', 'fn_00401000', '--json']) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['acceptance']['state'] == ('accepted-c' if change == 'matching' else 'c-source-drift')
+    assert result['work']['state'] == 'needs-review'
+
+
 def test_pass_for_changed_source_does_not_become_pending_review(workspace):
     (env.C_DIR / "fn_00401000.c").write_text("changed after run")
     result = work.record_test(0x401000, {"status": "pass", "source_sha256": "old"})

@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -47,6 +48,46 @@ def coverage() -> dict:
 
     summary = queue.coverage_summary()
     return {k: summary[k] for k in PROGRESS_KEYS}
+
+
+def receipt_status(path: Path) -> dict:
+    """Bounded navigation view; raw input inventories stay in the receipt."""
+    path = path.resolve()
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("steps"), list):
+        raise ValueError("Session receipt requires an object with steps")
+
+    def fields(record, names):
+        result = {}
+        for name in names:
+            value = record.get(name)
+            if value is None or type(value) in (bool, int):
+                result[name] = value
+            elif isinstance(value, str):
+                result[name] = value[:240]
+            else:
+                raise ValueError(f"Invalid session status field: {name}")
+        return result
+
+    steps = []
+    for index, step in enumerate(data["steps"][:8], 1):
+        if not isinstance(step, dict):
+            raise ValueError("Session receipt steps must be objects")
+        row = fields(step, ("state", "pid", "exit_code", "started", "ended", "evidence"))
+        command = step.get("command", [])
+        if not isinstance(command, list) or not all(isinstance(word, str) for word in command):
+            raise ValueError("Session step command must be a string list")
+        row.update(index=index, command=[word[:120] for word in command[:6]])
+        log = step.get("log")
+        if log is not None:
+            if not isinstance(log, str) or Path(log).name != log or len(log) > 120:
+                raise ValueError("Session step log must be a local filename")
+            row["log"] = str(path.parent / log)
+        steps.append(row)
+    return {"receipt": str(path), **fields(data, ("mode", "state", "pid", "exit_code", "started", "ended")),
+            "step_count": len(data["steps"]), "steps": steps,
+            "omitted_steps": max(0, len(data["steps"]) - len(steps)),
+            "note": "Recorded state only; no current-input validation or process ownership proof."}
 
 
 def last_start(sessions: Path, exclude: Path) -> dict | None:
@@ -104,24 +145,126 @@ def latest_gate(parent: dict, sessions: Path) -> dict | None:
     return None
 
 
-def handoff(parent: dict, workflow: str, next_task: str, functions: list[str], states: dict,
-            gate: dict | None = None) -> str:
-    """Bounded continuation context, explicitly separate from validation evidence."""
+def validate_handoff(workflow: str, next_task: str, functions: list[str]) -> None:
+    """Bound context before reading per-function records or publishing a receipt."""
     if len(functions) > 20:
         raise ValueError("A checkpoint contains at most 20 function IDs")
     if workflow not in {"C.md", "HARNESS.md", "TRIAGE.md", "SUBSYSTEM.md", "REVIEW.md",
                         "CAMPAIGN.md", "PORT.md", "BATCH.md", "THROUGHPUT.md", "REA.md",
-                        "PARALLEL.md", "TASKS.md"}:
+                        "PARALLEL.md", "TASKS.md", "PROVIDER-CAMPAIGN.md",
+                         "PROVIDER-CONTROLLER.md", "PIPELINE.md", "NATIVE-COORDINATION.md"}:
         raise ValueError("Select a workflow from docs/agent/PLAYBOOK.md")
     if not next_task.strip() or len(next_task) > 500 or any(c in next_task for c in "\r\n"):
         raise ValueError("Next task must be a nonempty single line of at most 500 characters")
     if any(not re.fullmatch(r"fn_[0-9a-f]{8}", f) for f in functions):
         raise ValueError("Function IDs must have the form fn_00401000")
+
+
+def unresolved_allocation() -> dict:
+    return {"schema": "cmre-worker-allocation/1", "mode": "unresolved", "authorization": "",
+            "assignments": [], "reason": "No worker allocation was recorded",
+            "retry_when": "Resolve current and inherited user authorization before recovery"}
+
+
+def validate_allocation(data: dict) -> dict:
+    """Validate navigation context; this neither grants authorization nor dispatches."""
+    def line(value, limit=500):
+        return (isinstance(value, str) and bool(value.strip()) and len(value) <= limit
+                and not any(c in value for c in "\r\n\x00"))
+
+    allowed = {"schema", "mode", "authorization", "assignments", "reason", "retry_when", "native_plan"}
+    if (not isinstance(data, dict) or set(data) - allowed
+            or data.get("schema") != "cmre-worker-allocation/1"
+            or data.get("mode") not in ("providers", "solo", "unresolved", "coordination-only")):
+        raise ValueError("Worker allocation requires schema cmre-worker-allocation/1 and a mode")
+    mode = data["mode"]
+    if mode == "coordination-only":
+        from scripts.cmre_native_plan import validate_plan
+
+        validate_plan(data.get("native_plan"), root=ROOT)
+    elif "native_plan" in data:
+        raise ValueError("native_plan requires coordination-only allocation")
+    if (not line(data.get("authorization"))
+            and not (mode == "unresolved" and data.get("authorization") == "")):
+        raise ValueError("Worker allocation requires the user authorization or solo scope")
+    assignments = data.get("assignments")
+    if (not isinstance(assignments, list) or len(assignments) > 20
+            or mode not in ("providers", "coordination-only") and assignments):
+        raise ValueError("Worker allocation requires a bounded assignments list; only providers can have assignments")
+    if mode not in ("providers", "coordination-only") or not assignments:
+        if not all(line(data.get(k)) for k in ("reason", "retry_when")):
+            raise ValueError("Worker allocation without assignments requires reason and retry_when")
+    for assignment in assignments:
+        if (not isinstance(assignment, dict)
+                or set(assignment) - {"provider", "task", "state", "receipt", "reason", "retry_when"}
+                or not line(assignment.get("provider"), 100) or not line(assignment.get("task"))
+                or assignment.get("state") not in ("pending", "running", "completed", "held")):
+            raise ValueError("Worker allocation assignments require provider, task and state")
+        if assignment["state"] == "held" and not all(
+                line(assignment.get(k)) for k in ("reason", "retry_when")):
+            raise ValueError("Held worker allocation requires reason and retry_when")
+        if assignment["state"] in ("running", "completed"):
+            if not line(assignment.get("receipt")) or not (ROOT / assignment["receipt"]).is_file():
+                raise ValueError("Running/completed worker allocation requires an existing receipt")
+    for record in (data, *assignments):
+        if any(not line(record[k]) for k in ("reason", "retry_when", "receipt") if k in record):
+            raise ValueError("Worker allocation context must contain bounded single-line text")
+    return data
+
+
+def latest_checkpoint(parent: dict, sessions: Path) -> tuple[Path, dict] | None:
+    for path in sorted(sessions.glob("*-checkpoint/receipt.json"), reverse=True):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if (data.get("parent") == parent["receipt"] and data.get("state") == "finished"
+                and data.get("exit_code", 0) == 0):
+            return path, data
+    return None
+
+
+def checkpoint_allocation(previous: tuple[Path, dict] | None) -> dict:
+    if previous is None or "worker_allocation" not in previous[1]:
+        return unresolved_allocation()
+    allocation = validate_allocation(previous[1]["worker_allocation"])
+    path = previous[0].parent / "worker-allocation.json"
+    if json.loads(path.read_text(encoding="utf-8")) != allocation:
+        raise ValueError("Worker allocation snapshot differs from the checkpoint receipt; supply --allocation to replace it")
+    return allocation
+
+
+def allocation_summary(allocation: dict, path: Path | str | None) -> str:
+    if allocation["mode"] == "unresolved":
+        return ("Worker allocation: unresolved; complete docs/agent/PLAYBOOK.md#worker-allocation "
+                "before recovery.")
+    if path is None:
+        raise ValueError("Worker allocation requires its snapshot path")
+    counts = {state: sum(a["state"] == state for a in allocation["assignments"])
+              for state in ("pending", "running", "completed", "held")}
+    return (f"Worker allocation: {allocation['mode']}; "
+            + ", ".join(f"{k}={v}" for k, v in counts.items()) + f"; read {path}")
+
+
+def handoff(parent: dict, workflow: str, next_task: str, functions: list[str], states: dict,
+            gate: dict | None = None, *, acceptances: dict | None = None,
+            allocation: dict | None = None, allocation_path: Path | str | None = None) -> str:
+    """Bounded continuation context, explicitly separate from validation evidence."""
+    validate_handoff(workflow, next_task, functions)
+    allocation = validate_allocation(unresolved_allocation() if allocation is None else allocation)
     lines = ["# Recovery continuation", "", f"Next: {next_task}", f"Workflow: docs/agent/{workflow}",
+             allocation_summary(allocation, allocation_path),
              f"Parent preflight: {parent['receipt']}",
              "Resume this parent receipt; retain function tests and acceptance.",
              "Checkpoint only; not a green gate. Run the parent closing check when the session ends.",
-             "Read relevant evidence packets; follow every unresolved review obligation."]
+              "Read relevant evidence packets; follow every unresolved review obligation."]
+    if allocation["mode"] == "coordination-only":
+        lines[0] = "# Coordination-only native continuation"
+        lines[3] = "Workflow: docs/agent/NATIVE-COORDINATION.md; task workflow: docs/agent/" + workflow
+        lines[6:9] = [
+            "Policy: docs/agent/NATIVE-COORDINATION.md (all substantive work delegated).",
+            "Assigned expert steward resumes preflight and executes gates; parent reads bounded receipts only.",
+            "Checkpoint only; not a green gate. Preserve independent review and serialized acceptance."]
     if gate:
         lines.append(f"Latest recorded parent gate: state={gate['state']} exit={gate['exit_code']} {gate['receipt']}")
         lines.extend("Unresolved gate obligation: " + json.dumps(line) for line in gate["failures"])
@@ -136,11 +279,19 @@ def handoff(parent: dict, workflow: str, next_task: str, functions: list[str], s
                 continue
             value = state[field]
             if len(encoded := json.dumps(value, ensure_ascii=True)) > 240:
-                value = encoded[:237] + "... [full value in cmre work list]"
+                value = encoded[:237] + f"... [full value: cmre work show {fn}]"
             detail[field] = value
-        lines.append(f"{fn} {state.get('state', 'unrecorded')} failures={state.get('failures', 0)} "
+        if state.get('additional_holds'):
+            detail['additional_holds'] = [
+                {'state': hold.get('state'), 'blocker': hold.get('blocker')}
+                for hold in state['additional_holds']]
+        accepted = (acceptances or {}).get(fn, {}).get('state', 'not-inspected')
+        lines.append(f"{fn} acceptance={accepted} work-history={state.get('state', 'unrecorded')} "
+                     f"failures={state.get('failures', 0)} "
                      + json.dumps(detail, ensure_ascii=True))
-    lines.append("Use cmre work list for all other held work; counts above do not reset retry limits.")
+    lines.append("Assigned workers inspect full work records and retained holds; parent consumes bounded receipts. Retry limits unchanged."
+                 if allocation["mode"] == "coordination-only" else
+                 "Use cmre work show fn_X for full selected records; work list for other holds. Retry limits remain unchanged.")
     return "\n".join(lines) + "\n"
 
 
@@ -148,25 +299,43 @@ def continuation(args, parent: dict, directory: Path) -> int:
     """No doctor, pytest, verification, acceptance or generated status writes."""
     from cmre import coordination, work
 
+    previous = latest_checkpoint(parent, directory.parent)
+    allocation = (unresolved_allocation() if getattr(args, "allocation", None)
+                   else checkpoint_allocation(previous))
+    if allocation["mode"] == "coordination-only":
+        validate_native_parent(allocation, parent)
     if args.mode == "resume":
         print(f"Reuse preflight: {parent['receipt']}")
         print("No validation rerun. Checkpoints are navigation context, not green gates.")
-        candidates = sorted(directory.parent.glob("*-checkpoint/receipt.json"), reverse=True)
-        for path in candidates:
-            try:
-                checkpoint = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if checkpoint.get("parent") == parent["receipt"] and checkpoint.get("state") == "finished":
-                print(f"Latest checkpoint: {path.parent / 'handoff.md'}")
-                break
+        if previous:
+            print(f"Latest checkpoint: {previous[0].parent / 'handoff.md'}")
+        print(allocation_summary(allocation, previous[0].parent / "worker-allocation.json" if previous else None))
+        print("Allocation is navigation context; recheck assignment receipts and pending work before recovery.")
         return 0
+    validate_handoff(args.workflow, args.next_task, args.functions)
+    allocation_source = {"checkpoint": str(previous[0])} if previous else None
+    if args.allocation:
+        source = args.allocation.resolve()
+        payload = source.read_bytes()
+        if len(payload) > 65536:
+            raise ValueError("Worker allocation input exceeds 64 KiB")
+        allocation = validate_allocation(json.loads(payload.decode("utf-8-sig")))
+        validate_native_parent(allocation, parent)
+        allocation_source = {"path": str(source), "sha256": hashlib.sha256(payload).hexdigest()}
+    allocation_path = directory / "worker-allocation.json"
     gate = latest_gate(parent, directory.parent)
-    text = handoff(parent, args.workflow, args.next_task, args.functions, work.read()["functions"], gate)
+    states = work.read()['functions']
+    details = {fn: work.describe(int(fn[3:], 16), states) for fn in args.functions}
+    text = handoff(parent, args.workflow, args.next_task, args.functions, states, gate,
+                   acceptances={fn: detail['acceptance'] for fn, detail in details.items()},
+                   allocation=allocation, allocation_path=allocation_path)
     journal = Journal(directory, "checkpoint")
     journal.data.update(parent=parent["receipt"], workflow=args.workflow, functions=args.functions,
-                        next_task=args.next_task, validation="not-run", last_gate=gate)
+                        next_task=args.next_task, validation="not-run", last_gate=gate,
+                        function_details=details, worker_allocation=allocation,
+                        allocation_source=allocation_source)
     try:
+        coordination.atomic_bytes(allocation_path, (json.dumps(allocation, indent=2) + "\n").encode("utf-8"))
         coordination.atomic_bytes(directory / "handoff.md", text.encode("utf-8"))
         if args.write_handoff:
             coordination.atomic_bytes(ROOT / "docs/NEXT-SESSION-PROMPT.md", text.encode("utf-8"))
@@ -178,6 +347,14 @@ def continuation(args, parent: dict, directory: Path) -> int:
     print(f"Checkpoint: {journal.path}; not a green gate")
     print(f"Handoff: {directory / 'handoff.md'}")
     return 0
+
+
+def validate_native_parent(allocation: dict, parent: dict) -> None:
+    """A native allocation cannot silently switch the session's inherited preflight."""
+    if allocation["mode"] == "coordination-only":
+        path = (ROOT / allocation["native_plan"]["parent_receipt"]["path"]).resolve()
+        if path != Path(parent["receipt"]).resolve():
+            raise ValueError("Native plan preflight differs from checkpoint parent")
 
 
 class BusyError(RuntimeError):
@@ -338,6 +515,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_subparsers(dest="mode", required=True)
     modes.add_parser("start", help="one full parent preflight")
+    status = modes.add_parser("status", help="bounded read-only receipt summary; no tests or lease")
+    status.add_argument("receipt", type=Path)
     modes.add_parser('split-audit', help='experimental split audit; does not replace or seed a full gate')
     check = modes.add_parser("check", help="full parent closing gate")
     check.add_argument("--parent", type=Path, help="bind progress to this preflight, not another session's")
@@ -351,6 +530,8 @@ def main(argv=None) -> int:
     checkpoint.add_argument("--next", dest="next_task", required=True)
     checkpoint.add_argument("--functions", nargs="*", default=[])
     checkpoint.add_argument("--write-handoff", action="store_true", help="also replace docs/NEXT-SESSION-PROMPT.md")
+    checkpoint.add_argument("--allocation", type=Path,
+                            help="worker-allocation JSON; omitted inherits this parent's latest checkpoint")
     args = parser.parse_args(argv)
     if args.mode == "run" and (not args.command or args.command[0] not in ("batch", "revalidate")):
         parser.error("run requires batch or revalidate; consult py -3.13 -m cmre <command> --help")
@@ -358,6 +539,13 @@ def main(argv=None) -> int:
         parser.error("invoke this script with py -3.13")
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
+    if args.mode == "status":
+        try:
+            print(json.dumps(receipt_status(args.receipt), indent=2))
+            return 0
+        except (OSError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
     sessions = ROOT / "CM0102/Analysis/cmre/sessions"
     directory = sessions / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + f"-{os.getpid()}-{args.mode}")
     # Scripts run with scripts/ on sys.path. Use the same mutation lease as

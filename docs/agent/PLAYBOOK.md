@@ -7,6 +7,18 @@ the selected workflow holds its procedure. Acceptance policy:
 
 ## 1. Preflight
 
+For authorized coordination-only native work, first apply
+[NATIVE-COORDINATION.md](NATIVE-COORDINATION.md). It assigns technical work and
+commands below to workers, including one expert preflight/acceptance/gate steward;
+parent-execution wording in other workflows does not apply in this mode.
+
+Authorized native continuations route through the durable prepared queue in
+[NATIVE-CONTINUATION.md](NATIVE-CONTINUATION.md) by default: the steward
+prepares private packets and runs short queue commands, the parent performs the
+actual native calls and routes automatic notifications, and the queue stores
+decisions and events only. This route authorizes no recovery campaign and
+resets no failure budget.
+
 Run `py -3.13 scripts/cmre_session.py start` once per parent session (doctor,
 status, full pytest or exact-input receipt reuse; prints a receipt path). Workers inherit it. If pytest fails,
 record the failing node IDs: a recovery continuation starts with that defect;
@@ -24,11 +36,13 @@ input repair uses the [input-family loop](TRIAGE.md#input-family-loop).
 
 ## 2. Route the task
 
-First matching row wins; an explicit user task outranks the queue.
+First matching row selects the task workflow; an explicit user task outranks the queue.
+Complete [worker allocation](#worker-allocation) before coordinator recovery work.
+Provider execution supplements the selected task workflow.
 
 | Task | Read next |
 | --- | --- |
-| Timed MiniMax/Go campaign, provider roles, 150-minute run and end-of-run retro | [Provider campaign](PROVIDER-CAMPAIGN.md) |
+| Explicitly timed MiniMax/Go campaign and end-of-run retro | [Provider campaign](PROVIDER-CAMPAIGN.md#timed-campaigns-only-when-requested) |
 | Continue / make progress / translate functions (default) | [C translation](C.md) |
 | Agent instructions, skills, scripts, guard, CLI, queue, harness | [Tooling](HARNESS.md) |
 | Compare recovery throughput or model/context choices | [Measured recovery](THROUGHPUT.md) |
@@ -50,7 +64,28 @@ A continuation means translating functions with the C loop until the user's
 time or token budget is used. A short handoff is not a reason to open a new
 investigation; the queue and `cmre brief` supply the next unit.
 
-### Delegation (only when the user authorizes it)
+### Worker allocation
+
+At each recovery batch and continuation, resolve worker allocation from the current
+user instructions and inherited allocation record. Retain existing authorization;
+a task workflow such as `C.md` does not imply solo execution. When MiniMax/DeepSeek
+use is authorized, complete [provider batch intake](PROVIDER-CAMPAIGN.md#batch-intake)
+before coordinator implementation. That workflow covers ordinary batches as well
+as timed campaigns; use a timed schedule only when requested.
+
+Completion: scoped assignments have dispatch receipts, or provider use has a named
+hold and retry condition. Pending assignments still need intake work. With no
+delegation authorization, record the solo scope and continue the selected task.
+Checkpoint the allocation separately from the task workflow so regeneration and
+resume retain both. Legacy checkpoints mark allocation unresolved, requiring this
+decision before recovery.
+
+In native mode the same allocation becomes durable prepared queue entries:
+author and reviewer caps are bounded separately, a task-local hold applied only
+after live ownership is terminal returns its slot to unrelated eligible supply,
+and no queue or global writer lease is held while a worker runs.
+
+### Delegated recovery
 
 Give each worker at most three distinct function IDs from one family or subsystem,
 the selected protocol and its exact writable paths. The worker owns routine input
@@ -74,7 +109,10 @@ establish throughput. The parent reviews source evidence and accepts serially.
   with a test (tooling task) rather than a script under `CM0102/Analysis/`.
 - Inspect JSON keys and project scalar status/exit/path fields before opening
   nested payloads. Keep fixture corpora and `inputs_before` behind artifact
-  paths. Check command help when syntax is unknown.
+  paths. For session receipts, use `py -3.13 scripts/cmre_session.py status RECEIPT`;
+  it prints bounded recorded steps, PIDs and log paths without starting work.
+  This view does not prove live process ownership or current-input validity.
+  Check command help when syntax is unknown.
 - Harness modules (`HARNESS_MODULES` in `cmre/recover.py`) are frozen during a
   recovery session. For tooling changes, inspect `cmre revalidate --plan`, batch
   fixes and follow [HARNESS.md](HARNESS.md). Global/unknown impact requires the
@@ -90,10 +128,15 @@ establish throughput. The parent reviews source evidence and accepts serially.
   work states, failure counts and retry obligations. It also retains the latest
   parent gate receipt and a bounded summary of its failures, including pytest
   node IDs; complete failures remain in the linked logs. It runs no closing gate.
+  Supply `--allocation ALLOCATION.json` to establish or update worker allocation;
+  omission inherits this parent's latest finished checkpoint. Each checkpoint
+  freezes its own `worker-allocation.json`; resume prints its mode and path.
+  See [batch intake](PROVIDER-CAMPAIGN.md#batch-intake) for the record format.
   Select at most 20 relevant IDs; the work registry retains all other holds.
   Start the next context from that handoff and the selected workflow, then
   read only the evidence packets needed for its batch.
-- `cmre work list` owns pending review and blocker reasons. Use `work set` to
+- `cmre work list` discovers pending work; `cmre work show fn_X` gives one
+  function's source acceptance, queue history and all holds. Use `work set` to
   group a shared blocker and name its retry condition; return to held work only
   after that condition is resolved. The five-failure allowance is a ceiling,
   not a reason to repeat a known harness failure.
