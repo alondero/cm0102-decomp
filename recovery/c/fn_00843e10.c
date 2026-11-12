@@ -2,9 +2,9 @@
 
 #define D(a) CM_GLOBAL(volatile u32, (u32)(a))
 #define B(a) CM_GLOBAL(volatile u8, (u32)(a))
-extern u32 CM_FASTCALL cm_fn_0068d020(u32);
-extern u32 CM_FASTCALL cm_fn_0068d040(u32);
-extern u32 CM_FASTCALL cm_fn_0068d1b0(u32);
+extern u32 CM_THISCALL cm_fn_0068d020(u32);
+extern u32 CM_THISCALL cm_fn_0068d040(u32);
+extern u32 CM_THISCALL cm_fn_0068d1b0(u32);
 extern u32 CM_THISCALL cm_fn_00842180(u32, u32, u32, u32, u32, u32);
 extern u32 CM_CDECL cm_fn_00946464(u32, u32, u32, u32, u32);
 extern u32 CM_CDECL cm_fn_00600a50(u32, u32, u32, u32, u32);

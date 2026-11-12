@@ -1,160 +1,214 @@
-/* WIP for preferred-image VA 0x006d3610, image base 0x00400000. Original VA
-   0x006d391f-0x006d3cea keeps values in x87 ST0/ST1 across repeated __ftol calls
-   at 0x006d399c, 0x006d39bc, 0x006d39de, 0x006d3a54, 0x006d3abf, 0x006d3beb,
-   0x006d3c60 and 0x006d3cea. Plain C cannot transport that stack faithfully;
-   partial WORD markers also remain unresolved. No test run claimed. */
-/* Draft for preferred-image VA 0x006d3610, image base 0x00400000, converted from Ghidra 12.1.4
-   pseudocode by `cmre draft`. Unvalidated: check names, widths and signedness against
-   `cmre show --asm`; acceptance comes only from `cmre test --c` and `cmre accept --c`. */
 #include "cmre.h"
-#ifndef NULL
-#define NULL ((void *)0)
-#endif
-#define true 1
-#define false 0
-extern u8 cm_fn_0053b900(int *param_1);
-extern /* Library Function - Single Match cm_fn_00945640 Library: Visual Studio */ long long cm_fn_00945640(void);
-/* NEEDS-REVIEW: ._0_2_, extraout_ST1 */
+#pragma GCC target("no-sse3")
 
-void cm_fn_006d3610(short *param_1,int param_2,int param_3,int *param_4,u32 param_5,
-                 u32 param_6,char param_7)
+/* Preferred-image VAs, base 0x00400000; CM0102 3.9.68 SHA-256
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+   No local address escapes: native scratch and argument slots are scalar
+   spills/reassignments, not buffers or aliased inputs. */
+extern u32 CM_CDECL cm_fn_0053b900(u32 *input);
+#define R8(p,o) (*(volatile s8 *)((u32)(p)+(u32)(o)))
+#define R16(p,o) (*(volatile s16 *)((u32)(p)+(u32)(o)))
+#define R32(p,o) (*(volatile u32 *)((u32)(p)+(u32)(o)))
+#define RD(p,o) (*(volatile double *)((u32)(p)+(u32)(o)))
+#define GD(a) CM_GLOBAL(volatile double,a)
+#define GF(a) CM_GLOBAL(volatile float,a)
 
+static long double ratio(u8 flag)
 {
-  short sVar1;
-  short sVar2;
-  short sVar3;
-  short sVar4;
-  short sVar5;
-  int iVar6;
-  int iVar7;
-  char cVar8;
-  long double extraout_ST1;
-  short local_2c;
-  short local_28;
-  
-  local_28 = 2;
-  iVar7 = *(int *)((int)param_1 + 0x1b);
-  if ((iVar7 != 0) && (*(int *)(iVar7 + 0x69) != 0)) {
-    if (*param_4 == -2) {
-      cVar8 = '\x05';
-    }
+    u32 p = CM_GLOBAL(volatile u32,0x00b74350u);
+    u32 offset = flag ? 0x28u : 0x18u;
+    long double d = RD(p,offset);
+    long double z = GD(0x009689a0u);
+    /* FCOMP's C3 is set on equality and unordered. */
+    if (!(d < z || d > z)) return GD(0x00968998u);
+    d = RD(p,offset-8);
+    return d / (long double)RD(p,offset);
+}
+
+static s16 native_denominator(s16 value, s8 coefficient, s8 floor)
+{
+    s8 byte = (s8)((u32)(value / 1000) + 16u);
+    if (byte < floor) byte = floor;
+    return (s16)((s32)byte - coefficient);
+}
+
+void CM_CDECL cm_fn_006d3610(u32 output,u32 input,u32 other,u32 record,
+                            float amount,u8 flag,u8 adjust)
+{
+    u32 object = R32(output,0x1b), stats, p, result;
+    s8 coefficient;
+    s16 den_a,den_b,den_c,div_b=2,div_c=2;
+    volatile s16 raw_a,raw_b,raw_c;
+    volatile s32 a,b,c;
+    s32 cap,limit,total;
+    long double delta,contribution,t;
+    volatile long long converted;
+    volatile double base_a,base_b,base_c;
+    volatile float range_a,range_b,range_c,rounded_raw,rounded_target;
+    if (!object) return;
+    stats = R32(object,0x69);
+    if (!stats) return;
+    if (R32(record,0) == 0xfffffffeu) coefficient=5;
     else {
-      if ((char)param_4[0x10] == '\0') {
-        cVar8 = *(char *)(param_4[5] + 0x69);
-      }
-      else {
-        cVar8 = (char)(((int)*(short *)(param_3 + 0x80) / 500 + (int)*(short *)(param_4[5] + 0x69))
-                      / 2);
-      }
-      if ('\x14' < cVar8) {
-        cVar8 = '\x14';
-      }
-    }
-    iVar6 = cm_fn_0053b900(param_2);
-    if (((iVar6 != 0) ||
-        (((*param_4 == -2 && (*(int *)(param_2 + 0x53) != 0)) &&
-         (*(int *)(param_2 + 0x53) == *(int *)(iVar7 + 0x1a))))) ||
-       (((param_4[5] != 0 && (*(int *)(param_4[5] + 0x5d) == *(int *)(iVar7 + 0x1a))) ||
-        (*(int *)(param_2 + 0x53) == *(int *)(iVar7 + 0x1a))))) {
-      local_28 = 1;
-    }
-    iVar6 = cm_fn_0053b900(param_2);
-    if (iVar6 == 0) {
-      sVar5 = 2;
-      if (*(char *)((int)param_4 + 0x3a) == '\b') {
-        sVar1 = *(short *)((int)param_4 + 0x32);
-        local_2c = 1;
-        sVar5 = local_2c;
-        if ((((sVar1 != 0x41f) && (sVar1 != 0x420)) &&
-            ((sVar1 != 0x421 &&
-             ((((sVar1 != 0x422 && (sVar1 != 0x423)) && (sVar1 != 0x424)) &&
-              ((sVar1 != 0x425 && (sVar1 != 0x426)))))))) &&
-           ((((sVar1 = (short)param_4[0xc], sVar1 == 0x78 || ((sVar1 == 0x79 || (sVar1 == 0x7a))))
-             || ((((sVar1 == 0x7b || (((sVar1 == 0x7c || (sVar1 == 0x82)) || (sVar1 == 0x83)))) ||
-                  (((sVar1 == 0x84 || (sVar1 == 0x85)) || (sVar1 == 0x86)))) ||
-                 ((sVar1 == 0x87 || (sVar1 == 0x96)))))) ||
-            (((sVar1 == 0x97 || (((sVar1 == 0x98 || (sVar1 == 0x99)) || (sVar1 == 0x9a)))) ||
-             (sVar5 = 1, sVar1 == 0x9b)))))) {
-          cVar8 = *(char *)(param_4[5] + 0x69);
-          sVar5 = local_2c;
+        if (R8(record,0x40)) {
+            s32 q = R16(other,0x80) / 500;
+            p = R32(record,0x14);
+            q += R16(p,0x69);
+            coefficient = (s8)(q/2);
+        } else {
+            p=R32(record,0x14);
+            coefficient=R8(p,0x69);
         }
-      }
+        if (coefficient>20) coefficient=20;
     }
-    else {
-      local_2c = 1;
-      sVar5 = local_2c;
+    den_b=native_denominator(R16(stats,0xa),coefficient,22);
+    result=cm_fn_0053b900((u32 *)input);
+    if (result) goto related;
+    if (R32(record,0)==0xfffffffeu) {
+        p=R32(input,0x53);
+        if (p && p==R32(object,0x1a)) goto related;
     }
-    local_2c = sVar5;
-    iVar7 = *(int *)(iVar7 + 0x69);
-    sVar5 = *(short *)(iVar7 + 8);
-    cm_fn_00945640();
-    sVar1 = *(short *)(iVar7 + 10);
-    cm_fn_00945640();
-    sVar2 = *(short *)(iVar7 + 0xc);
-    cm_fn_00945640();
-    if ((param_7 != '\0') && (cm_fn_00945640(), extraout_ST1 < (long double)0.0)) {
-      cm_fn_00945640();
+    p=R32(record,0x14);
+    if (p) {
+        u32 team=R32(p,0x5d);
+        if (team==R32(object,0x1a)) goto related;
     }
-    param_4._0_2_ = cm_fn_00945640();
-    param_6._0_2_ = cm_fn_00945640();
-    sVar3 = cm_fn_00945640();
-    iVar6 = cVar8 * 400;
-    iVar7 = iVar6 / (int)local_28;
-    if (iVar7 < 5000) {
-      iVar7 = 5000;
+    p=R32(input,0x53);
+    if (p==R32(object,0x1a)) goto related;
+    stats=R32(object,0x69);
+    den_a=native_denominator(R16(stats,8),coefficient,22);
+    den_a=(s16)(((s32)(s16)(202-10*coefficient)+(s32)den_a)/2);
+    if (den_a<4) den_a=4;
+    goto second;
+related:
+    stats=R32(object,0x69);
+    den_a=native_denominator(R16(stats,8),coefficient,22);
+    div_b=1;
+second:
+    result=cm_fn_0053b900((u32 *)input);
+    if (result) {
+        stats=R32(object,0x69);
+        den_c=native_denominator(R16(stats,0xc),coefficient,21);
+        div_c=1;
+    } else if (R8(record,0x3a)==8) {
+        s16 code=R16(record,0x32);
+        div_c=1;
+        if (code>=0x41f && code<=0x426) {
+            stats=R32(object,0x69);
+            den_c=(s16)(native_denominator(R16(stats,0xc),coefficient,21)+1);
+        } else {
+            code=R16(record,0x30);
+            if ((code>=0x78 && code<=0x7c) ||
+                (code>=0x82 && code<=0x87) || (code>=0x96 && code<=0x9b)) {
+                stats=R32(object,0x69);
+                den_c=native_denominator(R16(stats,0xc),0,21);
+                p=R32(record,0x14);
+                coefficient=R8(p,0x69);
+                den_c=(s16)(den_c-coefficient);
+            } else den_c=(s16)(202-10*coefficient);
+        }
+    } else den_c=(s16)(202-10*coefficient);
+
+    delta=ratio(flag);
+    delta=(long double)amount-delta;
+    delta=delta*(long double)GF(0x0096d490u);
+    stats=R32(object,0x69);
+    t=(long double)coefficient;
+    raw_a=R16(stats,8);
+    t=t*(long double)GD(0x00968968u);
+    t=t+(long double)GD(0x009688a0u);
+    contribution=t*delta;
+    contribution=contribution*(long double)GD(0x00968ff8u);
+    base_a=(long double)raw_a;
+    t=(long double)raw_a+contribution;
+    a=(s32)(u32)(converted=(long long)t); /* __ftol at VA 0x006d399c */
+    raw_b=R16(stats,0xa);
+    base_b=(long double)raw_b;
+    t=(long double)raw_b+contribution;
+    b=(s32)(u32)(converted=(long long)t); /* __ftol at VA 0x006d39bc */
+    raw_c=R16(stats,0xc);
+    base_c=(long double)raw_c;
+    t=(long double)raw_c+contribution;
+    c=(s32)(u32)(converted=(long long)t); /* __ftol at VA 0x006d39de */
+    if (adjust) {
+        long double r=ratio(flag);
+        t=(long double)(250*(s32)coefficient)*(long double)amount;
+        t=t/r;
+        cap=(s32)(u32)(converted=(long long)t); /* __ftol at VA 0x006d3a54 */
+        /* FCOMP tests C0, including unordered. */
+        if (!(delta >= (long double)GF(0x00968970u))) {
+            r=ratio(flag);
+            t=(long double)(s16)cap*(long double)amount;
+            t=t/r;
+            cap=(s32)(u32)(converted=(long long)t); /* __ftol at VA 0x006d3abf */
+        }
+        if ((s16)cap>(s16)b) b=cap;
+        if ((s16)cap>(s16)a) a=cap;
+        if ((s16)cap>(s16)c) c=cap;
     }
-    else if (10000 < iVar7) {
-      iVar7 = 10000;
+    t=(long double)base_b*(long double)GD(0x0096a5c0u);
+    range_b=(long double)GD(0x00968950u)-t;
+    t=(long double)base_a*(long double)GD(0x0096a5c0u);
+    range_a=(long double)GD(0x00968950u)-t;
+    t=(long double)base_c*(long double)GD(0x0096a5c0u);
+    b=(s32)((u32)((s32)den_b-1)*(u32)(s32)raw_b+(u32)(s32)(s16)b)/(s32)den_b;
+    range_c=(long double)GD(0x00968950u)-t;
+    a=(s32)((u32)((s32)den_a-1)*(u32)(s32)raw_a+(u32)(s32)(s16)a)/(s32)den_a;
+    c=(s32)((u32)((s32)den_c-1)*(u32)(s32)raw_c+(u32)(s32)(s16)c)/(s32)den_c;
+    limit=4000+300*(s32)coefficient;
+    cap=(s16)limit>raw_b ? limit : raw_b;
+    if ((s16)b >= (s16)cap) b=(s16)limit>raw_b ? limit : raw_b;
+    rounded_raw=(long double)raw_b;
+    t=(long double)range_b*(long double)GF(0x0096d210u);
+    t=(long double)rounded_raw-t;
+    rounded_target=(long double)(s16)b;
+    if (!(t>(long double)rounded_target)) {
+        t=(long double)range_b*(long double)GF(0x0096d20cu);
+        t=t+(long double)rounded_raw;
+        if (t >= (long double)rounded_target) t=rounded_target;
     }
-    sVar4 = (short)iVar7;
-    if ((short)iVar7 <= sVar5) {
-      sVar4 = sVar5;
+    b=(s32)(u32)(converted=(long long)t); /* __ftol at VA 0x006d3beb */
+    cap=(s16)limit>raw_a ? limit : raw_a;
+    if ((s16)a >= (s16)cap) a=(s16)limit>raw_a ? limit : raw_a;
+    rounded_raw=(long double)raw_a;
+    t=(long double)range_a*(long double)GF(0x0096d210u);
+    t=(long double)rounded_raw-t;
+    rounded_target=(long double)(s16)a;
+    if (!(t>(long double)rounded_target)) {
+        t=(long double)range_a*(long double)GF(0x0096d208u);
+        t=t+(long double)rounded_raw;
+        if (t >= (long double)rounded_target) t=rounded_target;
     }
-    if (sVar4 < (short)param_6) {
-      param_6._0_2_ = sVar4;
+    a=(s32)(u32)(converted=(long long)t); /* __ftol at VA 0x006d3c60 */
+    cap=(s16)limit>raw_c ? limit : raw_c;
+    if ((s16)c >= (s16)cap) c=(s16)limit>raw_c ? limit : raw_c;
+    rounded_raw=(long double)raw_c;
+    t=(long double)range_c*(long double)GF(0x0096d1a8u);
+    t=(long double)rounded_raw-t;
+    rounded_target=(long double)(s16)c;
+    if (!(t>(long double)rounded_target)) {
+        t=(long double)(100*(s32)coefficient)*(long double)range_c;
+        t=t+(long double)rounded_raw;
+        if (t >= (long double)rounded_target) t=rounded_target;
     }
-    if ((short)param_6 < 1) {
-      param_6._0_2_ = 1;
-    }
-    if (iVar6 < 5000) {
-      iVar7 = 5000;
-    }
-    else {
-      iVar7 = 10000;
-      if (iVar6 < 0x2711) {
-        iVar7 = iVar6;
-      }
-    }
-    sVar5 = (short)iVar7;
-    if ((short)iVar7 <= sVar1) {
-      sVar5 = sVar1;
-    }
-    if (sVar5 < (short)param_4) {
-      param_4._0_2_ = sVar5;
-    }
-    if ((short)param_4 < 1) {
-      param_4._0_2_ = 1;
-    }
-    iVar6 = iVar6 / (int)local_2c;
-    if (iVar6 < 3000) {
-      iVar6 = 3000;
-    }
-    else if (10000 < iVar6) {
-      iVar6 = 10000;
-    }
-    sVar5 = (short)iVar6;
-    if ((short)iVar6 <= sVar2) {
-      sVar5 = sVar2;
-    }
-    if (sVar5 < sVar3) {
-      sVar3 = sVar5;
-    }
-    if (sVar3 < 1) {
-      sVar3 = 1;
-    }
-    *param_1 = (short)param_4;
-    param_1[1] = (short)param_6;
-    param_1[2] = sVar3;
-  }
-  return;
+    c=(s32)(u32)(converted=(long long)t); /* __ftol at VA 0x006d3cea */
+    total=400*(s32)coefficient;
+    cap=total/(s32)div_b;
+    if (cap<5000) cap=5000; else if (cap>10000) cap=10000;
+    if ((s16)cap<=raw_a) cap=raw_a;
+    if ((s16)a>(s16)cap) a=cap;
+    if ((s16)a<1) a=1;
+    cap=total;
+    if (cap<5000) cap=5000; else if (cap>10000) cap=10000;
+    if ((s16)cap<=raw_b) cap=raw_b;
+    if ((s16)b>(s16)cap) b=cap;
+    if ((s16)b<1) b=1;
+    cap=total/(s32)div_c;
+    if (cap<3000) cap=3000; else if (cap>10000) cap=10000;
+    if ((s16)cap<=raw_c) cap=raw_c;
+    if ((s16)c>(s16)cap) c=cap;
+    if ((s16)c<1) c=1;
+    *(volatile s16 *)output=(s16)b;
+    *(volatile s16 *)(output+2u)=(s16)a;
+    *(volatile s16 *)(output+4u)=(s16)c;
 }

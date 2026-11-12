@@ -1,20 +1,26 @@
-/* WIP: detail mismatch, case 1 */
+/* Translation of the original listing at preferred-image VA 0x005ac920.
+   The original reserves 0x14 bytes (`sub esp, 0x14`) and keeps four saved
+   registers below it.  With L = E-0x14 the locals are:
+     L+0x00  word  <- *(u16*)arg1, later the dword counter i
+     L+0x04  word  <- (u16)*(u8*)arg2, later the dword counter j
+     L+0x08  word  <- *(u16*)arg0, later the dword counter k
+     L+0x0c  byte  <- al, the low byte returned by 0x0048dd70
+     L+0x10  dword <- ecx, the incoming this pointer
+   Only the low word of the first three slots is written at entry; the upper
+   bytes stay uninitialized and are read back through dword accesses, exactly
+   as the original does.  Stack arguments: arg0 at E+4, arg1 at E+8, arg2 at
+   E+0xc, arg3 at E+0x10, arg4 at E+0x14, arg5 at E+0x18, arg6 at E+0x1c,
+   arg7 at E+0x20; the 0x2c-byte pop also covers the three unused words.
+   The 0x0048dd70 lookup index is arg4 (0x005ac949 reads E+0x14), while arg3
+   is the flag that selects the ascending or descending scan. */
+
 #include "cmre.h"
 
-/* Stack model: E is the entry esp; the one-word-wide local area is frame[0..0x14)
-   at E-0x14 (L). Locals: frame+0 counter i (word from *arg1, later dword),
-   frame+4 counter j (word from the byte at arg2, later dword), frame+8 counter k
-   (word from *arg0, later dword), frame+0xc byte result of 0x0048dd70. Only the
-   low word of the first store is initialized; the upper bytes stay uninitialized
-   as in the original and are read through volatile dword accesses.
-   Stack arguments: arg0 at E+4 (short *), arg1 at E+8 (short *), arg2 at E+0xc
-   (byte *), arg3 at E+0x10 (index), arg4 at E+0x14, arg5 at E+0x18, arg6 at
-   E+0x1c, arg7 at E+0x20. Arguments 8-10 are part of the 0x2c-byte pop but
-   unused by this routine. */
-
 extern u8 CM_CDECL cm_fn_0048dd70(u32 param_1, u32 param_2);
-extern u32 CM_THISCALL cm_fn_005abf10(void *self, u32 p2, u32 p3, u32 p4, u8 p5);
-extern u32 CM_FASTCALL cm_fn_0068d1b0(u32 self);
+extern u32 CM_THISCALL cm_fn_005abf10(u32 self, volatile u32 first,
+                                      volatile u32 second, volatile u32 third,
+                                      volatile s8 fourth);
+extern u32 CM_THISCALL cm_fn_0068d1b0(u32 self);
 
 #define FR_U8(off)  (*(volatile u8 *)(frame + (off)))
 #define FR_U16(off) (*(volatile u16 *)(frame + (off)))
@@ -22,12 +28,12 @@ extern u32 CM_FASTCALL cm_fn_0068d1b0(u32 self);
 #define FR_U32(off) (*(volatile u32 *)(frame + (off)))
 
 u32 CM_THISCALL cm_fn_005ac920(u32 self, u32 arg0, u32 arg1, u32 arg2,
-                               u32 arg3, u32 arg4, u32 arg5, u32 arg6,
-                               u32 arg7, u32 arg8, u32 arg9, u32 arg10)
+                                u32 arg3, u32 arg4, u32 arg5, u32 arg6,
+                                u32 arg7, u32 arg8, u32 arg9, u32 arg10)
 {
     u8 frame[0x14];
-    u8 bres;
-    u8 bval;
+    u8 al_res;
+    u32 ebx;
     u32 r;
     u32 esi_v;
     u32 g;
@@ -38,17 +44,24 @@ u32 CM_THISCALL cm_fn_005ac920(u32 self, u32 arg0, u32 arg1, u32 arg2,
     (void)arg10;
     in_z = 0;
 
-    /* Entry loads, in listing order: *arg0 (word) -> k; *arg1 (word) -> i;
-       *arg2 (byte, zero-extended) -> j. */
+    /* 005ac92b: the incoming ecx is kept at L+0x10 and read back as the
+       thiscall receiver of 0x005abf10. */
+    FR_U32(0x10) = self;
+
+    /* 005ac930..005ac95a: entry loads, in listing order. */
     FR_U16(8) = *(volatile u16 *)arg0;
     FR_U16(0) = *(volatile u16 *)arg1;
     FR_U16(4) = (u16)*(volatile u8 *)arg2;
 
+    /* 005ac94e..005ac96a: global at 0x00ae23d0 indexed by arg4, second
+       argument zero. */
     g = CM_GLOBAL(volatile u32, 0x00ae23d0);
-    bres = cm_fn_0048dd70(g + (u32)arg3 * 107u, 0u);
-    FR_U8(0xc) = bres;
-    bval = bres;
+    al_res = cm_fn_0048dd70(g + (u32)arg4 * 107u, 0u);
+    FR_U8(0xc) = al_res;
+    ebx = FR_U32(0xc);
 
+    /* 005ac96f..005ac988: arg7 -> edi, arg6 -> ebp, arg3 -> eax; the zero
+       flag selects the descending scan. */
     if (arg3 == 0u) {
         in_z = 1;
         goto z_top;
@@ -63,7 +76,7 @@ main_j:
         goto i_inc;
     }
 body:
-    esi_v = cm_fn_005abf10((void *)self, FR_U32(8), FR_U32(0), FR_U32(4), bval);
+    esi_v = cm_fn_005abf10(FR_U32(0x10), FR_U32(8), FR_U32(0), FR_U32(4), ebx);
     if (esi_v == 0u) {
         goto body_fail;
     }

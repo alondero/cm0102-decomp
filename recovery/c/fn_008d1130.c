@@ -1,6 +1,8 @@
 /* Preferred-image VA008d1130/base00400000, CM0102 3.9.68 SHA256
    0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
-   THIS4 RET16, signed byte result. Original callees remain numeric boundaries. */
+   THIS4 RET16, u32 result. Original normal return calls 0068d040, then
+   replaces only AL with the compact count (008d1d84), preserving the upper
+   24 bits from the actual destructor result. Original callees remain numeric boundaries. */
 #include "cmre.h"
 #define D(a) CM_GLOBAL(volatile u32,(u32)(a))
 #define W(a) CM_GLOBAL(volatile u16,(u32)(a))
@@ -14,7 +16,7 @@ extern u32 CM_CDECL cm_fn_00540a50(u32,u32,u32);
 extern void CM_FASTCALL cm_fn_0054a110(u32);
 extern void CM_CDECL cm_fn_005e8290(const char *,const char *,u32);
 extern u32 CM_THISCALL cm_fn_0068d020(u32);
-extern void CM_THISCALL cm_fn_0068d040(u32);
+extern u32 CM_THISCALL cm_fn_0068d040(u32);
 extern u32 CM_THISCALL cm_fn_0068d1b0(u32);
 extern u32 CM_STDCALL cm_fn_007875e0(u32);
 extern long double CM_THISCALL cm_fn_007c1e30(u32,u32,u32,u32,float);
@@ -37,7 +39,7 @@ static void report(u32 first,u32 second,u32 line)
 static s32 capped(s32 x) {return x<0x2616 ? x : 0x2616;}
 
 __attribute__((target("no-sse3")))
-s8 CM_THISCALL cm_fn_008d1130(u32 self,u32 offer,u32 flags,u32 output,s8 capacity)
+u32 CM_THISCALL cm_fn_008d1130(u32 self,u32 offer,u32 flags,u32 output,s8 capacity)
 {
     volatile struct {u32 prev,handler,state;} frame;
     /* Base corresponds to original ESP+4c after saving the four registers.
@@ -252,7 +254,7 @@ deduplicate:
         ptr=output;remaining=count;
         do {value=D(ptr);if(value) {D(output+(u32)(s32)compact*4u)=value;compact=(s8)(compact+1);}ptr+=4u;}while(--remaining);
     }
-    frame.state=0xffffffffu;cm_fn_0068d040(work);
-    version=frame.prev;CM_FS(u32,0)=version;
-    return compact;
+    frame.state=0xffffffffu;version=cm_fn_0068d040(work);
+    CM_FS(u32,0)=frame.prev;
+    return (version&0xffffff00u)|(u8)compact;
 }
