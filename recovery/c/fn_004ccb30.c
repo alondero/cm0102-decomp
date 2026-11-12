@@ -7,7 +7,7 @@
 #define MEM_U32(addr) (*(volatile u32 *)(addr))
 #define MEM_U8(addr) (*(volatile u8 *)(addr))
 
-extern u32 CM_FASTCALL cm_fn_0068d1b0(u32 p);
+extern u32 CM_THISCALL cm_fn_0068d1b0(u32 p);
 extern u32 CM_THISCALL cm_fn_0068d1f0(u32 self, u32 target);
 extern void CM_THISCALL cm_fn_007a81a0(u32 self, u32 p2, u32 p3, u32 p4);
 extern void CM_THISCALL cm_fn_008c5430(u32 self, u32 p2);

@@ -17,11 +17,16 @@ Original files may remain inputs to local extraction and differential tests.
 
 ## How to work (read this, then the playbook)
 
+For authorized **coordination-only native** work (including the current next-session
+directive), first read [NATIVE-COORDINATION](docs/agent/NATIVE-COORDINATION.md).
+Its expert steward executes preflight and gates below; the parent only coordinates
+and consumes bounded receipts. All substantive work is delegated.
+
 1. Run `py -3.13 scripts/cmre_session.py start` once per parent session: doctor,
    status, baseline pytest, with an exit-code receipt. Resumes reuse that receipt;
    workers inherit it. Use `py -3.13` for all Python commands.
-2. Route the user's task through [docs/agent/PLAYBOOK.md](docs/agent/PLAYBOOK.md).
-   Read the selected workflow only. Explicit tasks take priority over queued work.
+2. Route the task and worker allocation through [docs/agent/PLAYBOOK.md](docs/agent/PLAYBOOK.md).
+   Read the task workflow and any authorized provider workflow. Explicit tasks take priority over queued work.
 3. Run `py -3.13 scripts/cmre_session.py check` at batch and handoff boundaries,
    not after each accept ([validation budget](docs/agent/PLAYBOOK.md#validation-budget)).
    Green means **both pytest and cmre verify exit 0**. Report baseline failures as

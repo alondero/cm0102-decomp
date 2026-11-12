@@ -4,7 +4,7 @@
    decremented byte on the success exit (the last `mov eax` before ret). */
 #include "cmre.h"
 
-extern u32 CM_FASTCALL cm_fn_0068d1b0(int param_1);
+extern u32 CM_THISCALL cm_fn_0068d1b0(int param_1);
 extern u32 CM_THISCALL cm_fn_0068d1f0(u8 *self, const u8 *target);
 extern void CM_THISCALL cm_fn_007a81a0(int param_1,u32 param_2,u32 param_3,u32 param_4);
 extern void CM_THISCALL cm_fn_008c5430(int param_1,int *param_2);

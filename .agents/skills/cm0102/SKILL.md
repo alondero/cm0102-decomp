@@ -6,8 +6,9 @@ description: Routes CM0102 faithful decompilation, subsystem recovery, evidence 
 # CM0102 project work
 
 Read `AGENTS.md`, then `docs/agent/PLAYBOOK.md`. Follow its preflight, the first
-matching task route, and closure. An explicit task outranks the generic queue.
-Read only the selected workflow; it owns the commands and completion criteria.
+matching task route, worker allocation, and closure. An explicit task outranks the generic queue.
+Read the task workflow and, when provider use is authorized, the provider workflow.
+Resolve allocation before coordinator recovery work, including on continuations.
 
 For example, a request for a readable date subsystem uses `SUBSYSTEM.md`; a
 native-port request uses `PORT.md` and its current milestone entry gate.

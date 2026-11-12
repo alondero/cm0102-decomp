@@ -102,6 +102,32 @@ def identity(va):
             **{k: env.digest(p) if p.is_file() else None for k, p in files.items()}}
 
 
+def describe(va, records=None):
+    """One read-only view; queue history never substitutes for acceptance."""
+    from . import ledger
+
+    name = f'fn_{va:08x}'
+    state = (read()['functions'] if records is None else records).get(name)
+    legacy = next((entry for entry in ledger.legacy_entries() if entry.va == va), None)
+    path = ledger.record_path(va)
+    acceptance = {'state': 'unaccepted'}
+    if legacy:
+        acceptance = {'state': 'legacy', 'ledger': legacy.source,
+                      'symbol': legacy.record.get('symbol')}
+    elif path.is_file():
+        record = json.loads(path.read_text(encoding='utf-8'))
+        c = record.get('c')
+        acceptance = {'state': 'accepted-lift', 'ledger': env.rel(path)}
+        if c:
+            source = env.C_DIR / f'{name}.c'
+            digest = env.digest(source) if source.is_file() else None
+            matches = bool(digest and digest == c.get('source_sha256'))
+            acceptance.update(state='accepted-c' if matches else 'c-source-drift',
+                              source=env.rel(source), source_sha256=digest,
+                              accepted_source_sha256=c.get('source_sha256'))
+    return {'function': name, 'acceptance': acceptance, 'work': state}
+
+
 def update(va, state, reason, retry_when="", blocker="", *, report=None, event_id=None,
            preserve_hold=False, expected_previous=_UNSET, _remaining_holds=_UNSET, _resolution=None):
     if event_id is not None and (not isinstance(event_id, str) or not event_id or report is None):
@@ -326,6 +352,10 @@ def blocker_families(records):
 def add_commands(sub):
     parser = sub.add_parser("work", help="persistent C queue reasons; never accepts source")
     commands = parser.add_subparsers(dest="action", required=True)
+    p = commands.add_parser('show', help='one function: acceptance, queue history and every hold')
+    p.add_argument('va')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(func=command)
     p = commands.add_parser('families', help='catalogue recorded blocker families')
     p.add_argument('--json', action='store_true')
     p.set_defaults(func=command)
@@ -362,6 +392,24 @@ def add_commands(sub):
 
 def command(args):
     from .cli import _va
+    if args.action == 'show':
+        result = describe(_va(args.va))
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            record = result['work'] or {}
+            print(f"{result['function']} acceptance={result['acceptance']['state']} "
+                  f"work-history={record.get('state', 'unrecorded')} failures={record.get('failures', 0)}")
+            for key, value in result['acceptance'].items():
+                if key != 'state':
+                    print(f'  {key}: {value}')
+            for number, hold in enumerate([record, *record.get('additional_holds', [])]):
+                if not hold:
+                    continue
+                print(f"  {'primary' if number == 0 else 'additional'} queue record: "
+                      + json.dumps({key: hold[key] for key in ('state', 'blocker', 'reason', 'retry_when')
+                                    if hold.get(key)}, ensure_ascii=True))
+        return 0
     if args.action == 'families':
         result = blocker_families(read()['functions'])
         if args.json:
