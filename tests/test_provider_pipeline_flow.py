@@ -1,6 +1,7 @@
 """Production scheduling regressions: supply, fairness and isolated capacity."""
 from threading import Event
 from pathlib import Path
+from time import sleep
 
 from cmre import pipeline, provider_campaign as pc
 import pytest
@@ -54,7 +55,8 @@ def test_fast_worker_refills_before_slow_worker_finishes(tmp_path, monkeypatch):
             assert slow_started.wait(3)
         else:
             refilled.set()
-        pc._update(directory, job, {'state': 'held'}, lambda _: None)
+        # Real workers contend on the state lock; retries must yield to its owner.
+        pc._update(directory, job, {'state': 'held'}, sleep)
         return True
 
     monkeypatch.setattr(pc, '_step_job', step)
