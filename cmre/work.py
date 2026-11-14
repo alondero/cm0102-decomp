@@ -260,12 +260,12 @@ def _write_claims(live):
     coordination.atomic_json(_claims_path(), {"schema": "cmre-claims/1", "claims": live})
 
 
-def _claim_unlocked(vas, owner, hours):
+def _claim_unlocked(vas, owner, hours, *, include_held=False):
     from . import tasks
     records = read()['functions']
     for va in vas:
         hold = dispatch_hold(va, records)
-        if hold:
+        if hold and not include_held:
             raise ValueError(f"Function has a scheduling hold: {hold['reason']}; {hold['retry_when']}")
         if tasks.attempts_used(va, records.get(f'fn_{va:08x}', {})) >= tasks.MAX_ATTEMPTS:
             raise ValueError(f'fn_{va:08x} exhausted its five-attempt budget')
@@ -289,13 +289,13 @@ def _claim_unlocked(vas, owner, hours):
     return {f"fn_{va:08x}": live[f"fn_{va:08x}"] for va in vas}
 
 
-def claim(vas, owner, hours=CLAIM_HOURS):
-    """Claim functions for one agent, all or nothing; renewing your own claim is allowed."""
+def claim(vas, owner, hours=CLAIM_HOURS, *, include_held=False):
+    """Reserve work without clearing holds; held inspection is explicitly opt-in."""
     if not owner.strip() or hours <= 0:
         raise ValueError("A claim requires an owner name and a positive duration")
     vas = list(vas)
     with attempt_fences(vas), locked():
-        return _claim_unlocked(vas, owner, hours)
+        return _claim_unlocked(vas, owner, hours, include_held=include_held)
 
 
 def release(owner, vas=None):

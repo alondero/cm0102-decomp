@@ -3,6 +3,7 @@
 No test starts a paid model or runs the real gate.
 """
 import importlib.util
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,15 @@ sys.modules['cmre_farm'] = farm
 spec.loader.exec_module(farm)
 
 GOOD = '#include "cmre.h"\nu32 cm_fn_00401000(u32 a) { return a + 1; }\n'
+
+
+@pytest.mark.parametrize("include_held", [False, True])
+def test_real_adapter_forwards_explicit_held_claim_option(monkeypatch, tmp_path, include_held):
+    from cmre import work
+    calls = []
+    monkeypatch.setattr(work, "claim", lambda *args, **kwargs: calls.append((args, kwargs)))
+    farm.CmreAdapter(tmp_path, include_held=include_held).claim("fn_00401000", "farm-t", 2)
+    assert calls == [(([0x401000], "farm-t", 2), {"include_held": include_held})]
 
 
 class FakeCmre:
@@ -133,6 +143,52 @@ def make(root, items, behaviour, holds=None, accept_codes=None, **cfg):
 
 def item(fn, size=200):
     return farm.Item(fn, size, True, 0, 'mod.cpp')
+
+
+@pytest.mark.parametrize("valid", [False, True])
+def test_hash_bound_interrupted_candidate_seeds_private_worker(root, valid):
+    f, _, _ = make(root, [], writes(GOOD))
+    saved = f.run_dir / "retained.c"
+    saved.write_bytes(GOOD.encode())
+    (f.run_dir / "resume-candidates.json").write_text(json.dumps({
+        "schema": "cmre-farm-resume-candidates/1",
+        "sources": {"fn_00401000": {
+            "path": saved.name,
+            "sha256": hashlib.sha256(saved.read_bytes()).hexdigest() if valid else "0" * 64,
+        }},
+    }))
+    job = f._new_job("translate", "fn_00401000", "m/cheap", bytes=200)
+    f._launch(job)
+    assert Path(job["source"]).exists() is valid
+    if valid:
+        assert Path(job["source"]).read_bytes() == saved.read_bytes()
+        assert job["seeded"] is True
+    assert not (root / "recovery/c/fn_00401000.c").exists()
+    assert f.state_path.exists()  # dispatch heartbeat precedes the next tick
+
+
+def test_interrupted_seed_cannot_escape_run_directory(root):
+    f, _, _ = make(root, [], writes(GOOD))
+    outside = root / "outside.c"
+    outside.write_bytes(GOOD.encode())
+    (f.run_dir / "resume-candidates.json").write_text(json.dumps({
+        "schema": "cmre-farm-resume-candidates/1",
+        "sources": {"fn_00401000": {
+            "path": "../outside.c", "sha256": hashlib.sha256(outside.read_bytes()).hexdigest(),
+        }},
+    }))
+    job = f._new_job("translate", "fn_00401000", "m/cheap", bytes=200)
+    f._launch(job)
+    assert not Path(job["source"]).exists()
+
+
+def test_run_saves_heartbeat_before_first_tick(root, monkeypatch):
+    f, _, _ = make(root, [], writes(GOOD))
+    def first_tick():
+        assert f.state_path.exists()
+        f.frontier = []
+    monkeypatch.setattr(f, "tick", first_tick)
+    f.run(poll=0)
 
 
 def drain(f, ticks=20):
