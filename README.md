@@ -17,7 +17,8 @@ Accepted C/legacy coverage is weighted by original function body bytes; it does
 not mean that the same percentage of a playable game is finished. Lift-inclusive
 recovery, composed calls and live integration are separate measurements.
 See [current recovery status](docs/STATUS.md), the
-[downloadable progress atlas](public/progress/index.html), the
+[live progress atlas](https://alondero.github.io/cm0102-decomp/)
+([offline copy](public/progress/index.html)), the
 [progress atlas and hosting instructions](docs/agent/PROGRESS.md), and the
 [public launch and tracker assessment](docs/PUBLIC-LAUNCH.md).
 

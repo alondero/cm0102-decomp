@@ -1,8 +1,19 @@
 # Public repository and progress tracking
 
-Assessment date: 2026-11-14. Repository: `alondero/cm0102-decomp`.
-This is preparation for publication; repository visibility and tracker listings
-have not been changed by this work.
+Assessment and launch date: 2026-11-14. Repository: `alondero/cm0102-decomp`.
+
+The [repository](https://github.com/alondero/cm0102-decomp) is public and the
+[progress atlas](https://alondero.github.io/cm0102-decomp/) is live. PR #35 was
+merged at reviewed commit `f12833c9df0103aa4f2cd467457adfea8b9503ca`.
+[The Pages deployment](https://github.com/alondero/cm0102-decomp/actions/runs/43597315211)
+succeeded; the served HTML matched the reviewed file byte-for-byte and loaded
+without browser console errors. Secret scanning and push protection are enabled.
+The Pages environment permits deployments from `main` only.
+
+Submitted to unbaked as an AI-assisted decompilation. Its confirmation page
+states that the submission is queued for human review; this is not yet an
+accepted directory listing. No email address was supplied. Decomp 720 currently
+has no public submission route, so no listing there is claimed.
 
 ## Recommended destination
 
@@ -11,8 +22,8 @@ discovery. Keep the atlas as the authoritative explanation of progress.
 
 | Service | Fit for this project | Next step |
 | --- | --- | --- |
-| [Decomp 720](https://decomp720.com/about) | Best metric fit: accepts project-defined progress and distinguishes decompilation, recompilation and ports. | Request a listing linking the public repository and atlas, explicitly defining accepted-source coverage. The inspected pages did not establish a submission API. |
-| [unbaked](https://unbaked.games/submit/) | Has a project submission form and an AI-assisted decompilation category. Useful additional discovery, rather than the authoritative numerical tracker. | Submit after the repository is public; the form requires confirmation about content and provenance. |
+| [unbaked](https://unbaked.games/submit/) | Has a project submission form and an AI-assisted decompilation category. Use for discovery; the atlas remains the authoritative numerical tracker. | Submitted 2026-11-14; awaiting human review. |
+| [Decomp 720](https://decomp720.com/about) | Fits project-defined progress, but its [current submission policy](https://decomp720.com/privacy) says visitors cannot submit or modify listings. | Reconsider if a public submission/contact route becomes available. |
 | [decomp.fun](https://decomp.fun/about/) | Its progress means byte-identical matching code and consumes objdiff reports. That is not the current CM0102 metric. | Do not convert behavioral acceptance percentages into matching percentages. Reconsider only with actual matching-build evidence. |
 | [decmp.dev](https://decmp.dev/) | Its homepage describes objdiff-based matching progress. | Same metric incompatibility; do not fabricate an objdiff report. |
 
@@ -119,15 +130,23 @@ reviews, `main` at `6b03b9368cfaecac530c903eb2c7ff38a495cbb8` and both recent
 from today's accepted source identities. No asset, credential, original-content
 or private-history findings remained. These older tips are not current accepted
 source snapshots and must not be represented as passing current acceptance.
-Resolve their publication disposition before claiming all refs pass; no remote
-branches were deleted or rewritten by this preparation.
+Launch disposition: retain these refs as historical revisions, not current
+acceptance snapshots. This does not waive their identity findings or authorize
+republishing an old tip as current accepted source. No remote branches were
+deleted or rewritten, and no claim that all historical tips pass current
+acceptance is made.
 
 The scanner also checked 34 issue/PR records, 9 issue comments, 10 PR bodies,
 zero inline review comments, and all three retained Actions logs. It reported
 zero findings and found no attachment links in those texts. This is a bounded
 content audit, not proof that all possible credentials or rights issues are
 detectable. GitHub-hosted packages and non-advertised retained objects were
-not audited. Refresh this inventory before changing visibility.
+not audited. At launch, the maintainer explicitly confirmed that no GitHub
+Packages had ever been published for this repository; this is maintainer
+confirmation rather than an API audit. The refreshed pre-launch audit covered
+all 11 then-retained Actions logs with zero findings. The later Pages artifact
+contains only the reviewed HTML. Refresh the inventory for future exposure
+changes.
 
 A source-only worktree passed all 153 selected publication, guard and atlas
 tests without game or local evidence directories; atlas JavaScript syntax also
