@@ -10,17 +10,37 @@ and [publication workflow](docs/agent/PUBLICATION.md). Recovery tooling currentl
 requires Python 3.13 with `unicorn`, `capstone`, `pefile`, `numpy`, `pytest`, and
 the documented MinGW/Ghidra dependencies.
 
+## Progress and contributing
+
+This is an AI-assisted behavioral decompilation, not a byte-matching project.
+Accepted C/legacy coverage is weighted by original function body bytes; it does
+not mean that the same percentage of a playable game is finished. Lift-inclusive
+recovery, composed calls and live integration are separate measurements.
+See [current recovery status](docs/STATUS.md), the
+[downloadable progress atlas](public/progress/index.html), the
+[progress atlas and hosting instructions](docs/agent/PROGRESS.md), and the
+[public launch and tracker assessment](docs/PUBLIC-LAUNCH.md).
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting changes. Game files,
+databases, extracted content and raw analysis must remain on your own machine.
+Project contributions are offered under the [MIT License](LICENSE), to the
+extent contributors hold the relevant rights. Original game content is excluded;
+see [license scope and precedents](docs/LICENSING.md).
+
 ## Local workspace and repository
 
 The authoritative recovery checkout is on the same machine as the supplied game and local analysis. Its agents follow the local `AGENTS.md` and `docs/agent/PLAYBOOK.md`. Use `py -3.13` for Python. The executable, supplied assets, raw analysis, generated lifts, recovery records, hints, and evidence remain local and are not distributed by this repository.
 
 This source repository contains reviewed recovery tooling, tests, scripts, workflow documentation and a subset of reconstructed C and legacy sources. It is not a complete game or an independently runnable copy of the authoritative recovery workspace: original inputs and full local acceptance records are intentionally absent. `recovery/c/STATUS.tsv` records the published source hashes and accepted/WIP status. [docs/PUBLICATION.md](docs/PUBLICATION.md) defines the publication boundary, the scan every commit and push must pass, the local-only components, and historical migration evidence. A clean Git status does not mean those local-only or unreviewed files are backed up or synchronized. See [issue #22](https://github.com/alondero/cm0102-decomp/issues/22) for the completed source migration.
 
-The local authoritative checkout also uses a Git exclude rule that hides untracked files by default. Review a file and its contents before explicitly adding it; never publish supplied assets, raw executable bytes, original instruction streams, local analysis, or credentials. The prior local Git history is retained separately and must not be pushed to this repository.
+The local authoritative checkout also uses exact Git exclude rules for withheld recovery sources. Review a file and its contents before explicitly adding it; never publish supplied assets, raw executable bytes, original instruction streams, local analysis, or credentials. The prior local Git history is retained separately and must not be pushed to this repository.
 
 ## Parallel work
 
-See [PLAN.md](PLAN.md), [START-WORKER.md](START-WORKER.md), and the [issues](https://github.com/alondero/cm0102-decomp/issues). Eight stable shards divide function ownership. Workers claim bounded batches in the authoritative checkout, independent reviewers inspect them, and one integrator accepts results serially. The current isolated worker protocol is documented in [docs/agent/WORKTREES.md](docs/agent/WORKTREES.md); legacy `worker.ps1` entry points do not replace its packet, claim and review gates.
+See the [issues](https://github.com/alondero/cm0102-decomp/issues) and
+[recovery farm workflow](docs/agent/FARM.md). The authoritative workspace uses
+coordinated workers and acceptance gates. External contributions need maintainer
+review and local validation before they count as recovered source.
 
 ## Local checks
 

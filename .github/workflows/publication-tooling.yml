@@ -1,0 +1,25 @@
+name: Publication and progress tooling (no game assets)
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-tests:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install test dependencies
+        run: py -3.13 -m pip install pytest==9.0.3 capstone==5.0.9 unicorn==2.1.4 pefile==2024.8.26 numpy==2.4.4
+      - name: Test scanner, guard and progress exporter with synthetic inputs
+        run: py -3.13 -m pytest tests/test_cmre_publication.py tests/test_cmre_guard.py tests/test_cmre_progress.py tests/test_cmre_progress_atlas.py -q
+      - name: Check atlas JavaScript
+        run: node --check scripts/progress/app.js

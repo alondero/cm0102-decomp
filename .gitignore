@@ -50,3 +50,18 @@ __pycache__/
 /.opencode/
 /04-builds-and-tooling.md
 /Launch-Game.ps1
+
+# Local credentials, environments, scratch output and packaged inputs.
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+*.pem
+*.key
+*.pfx
+*.zip
+*.7z
+*.iso
+*.cab
+/out.txt
