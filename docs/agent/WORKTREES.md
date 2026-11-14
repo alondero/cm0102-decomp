@@ -1,5 +1,8 @@
 # Same-machine isolated C recovery workers
 
+The [farm](FARM.md) does not use worktrees: its workers write scratch sources
+and test with `cmre test --source`. This page is for isolated by-hand workers.
+
 One authoritative checkout owns the local game, pinned inventory, hints, queue,
 task leases and attempts, review receipts and acceptance ledger. Separate Git
 worktrees own worker C edits and ignored evidence/report snapshots. The coordinator
@@ -26,12 +29,6 @@ nested inside the coordinator. Start with two translation workers and an indepen
 increase concurrency only from measured throughput. Harness experiments use a
 separate tree in the same container. Workers inherit the parent receipt and use
 the coordinator's broker, never their own copied game or acceptance ledger.
-
-For a [provider campaign](PROVIDER-CAMPAIGN.md), the coordinator initially supplies
-the independent final review. Any external preliminary reviewer consumes one of
-the two external-worker slots; it is not an additional third provider worker.
-Private input proposals use the selected triage/control workflow, not this C-only
-broker. The campaign workflow owns its 150-minute budget and end-of-run retro.
 
 At the batch boundary, stop workers and reconcile live claims through the normal
 work protocol. Preserve candidate source, reports, bindings and attempts. Archive

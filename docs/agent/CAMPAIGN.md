@@ -5,9 +5,8 @@ primary-runtime observations. Parent preflight and closure remain in
 [PLAYBOOK.md](PLAYBOOK.md). The source campaign's result is a connected accepted
 C slice with an observable contract and a named next executable checkpoint.
 Lift acceptance is a prerequisite where needed; it has a separate progress measure.
-For a 150-minute campaign using MiniMax and Go, follow
-[PROVIDER-CAMPAIGN.md](PROVIDER-CAMPAIGN.md) for roles, time allocation and retro;
-this file continues to own dependency and composition evidence.
+MiniMax/DeepSeek translation runs through the [farm](FARM.md); this file owns
+dependency and composition evidence.
 
 1. Select exact function IDs for one observable slice. Create the manifest under
    ignored analysis storage, then inspect its live dependency report:
@@ -24,7 +23,7 @@ this file continues to own dependency and composition evidence.
 2. For shell-capable agents, use `cmre next --c --module NAME`, `cmre family`
    and `cmre work list` within the selected manifest. Give each worker exact
    nonoverlapping IDs and the direct [C loop](C.md). Review held sources before
-   reassigning them. Use [THROUGHPUT.md](THROUGHPUT.md) for measured cohorts.
+   reassigning them.
 
    For tool-less workers only, inspect the read-only packet dispatch plan:
 
@@ -50,7 +49,11 @@ this file continues to own dependency and composition evidence.
    closure within this slice. Return unknown ABI/layout/indirect-call/SEH/x87
    questions to the parent with the first mismatch. Completion: accepted records
    or preserved bounded discrepancies, with no unreviewed shared changes.
-4. When every selected member has a source in `recovery/c/`, test the composition:
+4. Inspect campaign status `states.c` and `cmre work show` for each selected
+   member before composing. A source file can be unaccepted WIP with a recorded
+   hold. Reuse a matching source-hash witness for that hold; name the new
+   composition question before rerunning its individual diagnosis.
+   When every selected member has a source in `recovery/c/`, test the composition:
 
    ```powershell
    py -3.13 -m cmre compose-test CM0102/Analysis/cmre/campaigns/getter-slice.json
@@ -91,6 +94,18 @@ this file continues to own dependency and composition evidence.
    data fault at a different generated instruction can therefore pass the routine
    gate and fail composition. Inspect the first differing field and its contract;
    preserve the failure without inferring a source defect or weakening comparison.
+   For a plain-C integer/void selection, `cmre compose-diagnose MANIFEST` can
+   separate observable differences from compiler register/frame differences.
+   It uses the existing semantic return-width/caller checks and normalizer,
+   retains ABI differences from the same executions, and keeps the normal
+   corpus, coverage, normal-return and zero-inconclusive requirements. Selected
+   indirect/x87 instructions, floating returns and ABI transports are refused.
+   Reads or writes of selected original instruction bytes on either side fail,
+   including extra C reads whose values are unused.
+   Reports go under `cmre/composition-diagnostics/`, outside the composition
+   gate receipt namespace. A passing diagnostic never passes `compose-test`,
+   accepts source, closes a milestone or proves live integration.
+
    Linking selected direct calls does not rebind original function VAs stored in
    fixture vtables, callbacks or globals. An indirect call into a selected original
    extent is an escape even when recovered direct calls were observed. Retain the

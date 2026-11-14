@@ -7,18 +7,6 @@ the selected workflow holds its procedure. Acceptance policy:
 
 ## 1. Preflight
 
-For authorized coordination-only native work, first apply
-[NATIVE-COORDINATION.md](NATIVE-COORDINATION.md). It assigns technical work and
-commands below to workers, including one expert preflight/acceptance/gate steward;
-parent-execution wording in other workflows does not apply in this mode.
-
-Authorized native continuations route through the durable prepared queue in
-[NATIVE-CONTINUATION.md](NATIVE-CONTINUATION.md) by default: the steward
-prepares private packets and runs short queue commands, the parent performs the
-actual native calls and routes automatic notifications, and the queue stores
-decisions and events only. This route authorizes no recovery campaign and
-resets no failure budget.
-
 Run `py -3.13 scripts/cmre_session.py start` once per parent session (doctor,
 status, full pytest or exact-input receipt reuse; prints a receipt path). Workers inherit it. If pytest fails,
 record the failing node IDs: a recovery continuation starts with that defect;
@@ -37,21 +25,19 @@ input repair uses the [input-family loop](TRIAGE.md#input-family-loop).
 ## 2. Route the task
 
 First matching row selects the task workflow; an explicit user task outranks the queue.
-Complete [worker allocation](#worker-allocation) before coordinator recovery work.
-Provider execution supplements the selected task workflow.
 
 | Task | Read next |
 | --- | --- |
-| Explicitly timed MiniMax/Go campaign and end-of-run retro | [Provider campaign](PROVIDER-CAMPAIGN.md#timed-campaigns-only-when-requested) |
-| Continue / make progress / translate functions (default) | [C translation](C.md) |
+| Continue / make progress / decompile / use DeepSeek, MiniMax or other model credits (default) | [Recovery farm](FARM.md) |
+| Translate one named function by hand, or a farm worker's rules | [C translation](C.md) |
 | Agent instructions, skills, scripts, guard, CLI, queue, harness | [Tooling](HARNESS.md) |
-| Compare recovery throughput or model/context choices | [Measured recovery](THROUGHPUT.md) |
 | Failing baseline tests | [Tooling](HARNESS.md) |
 | One named blocked function | [Triage](TRIAGE.md) |
 | Recover or plan a named subsystem / coherent source slice | [Subsystem recovery](SUBSYSTEM.md) |
 | Review recovered code, evidence or a milestone claim | [Evidence review](REVIEW.md) |
 | Composition, campaign manifests, primary-runtime checkpoints | [Campaign](CAMPAIGN.md) |
-| Planning remaining work, lanes, providers, or autonomous runs | [Next-phase plan](NEXT-PHASE-PLAN.md) |
+| Planning remaining work, supply, accepted-byte targets | [Farm supply lane](FARM.md#supply-lane-codex--gpt) |
+| Most remaining bytes are `unlifted`, or a lifted test is `low-coverage` | [Capture supply](CAPTURE.md) |
 | Several concurrent agent sessions (any client) | [Parallel sessions](PARALLEL.md) |
 | Git history, local-only files, or retiring worker directories | [Publication](PUBLICATION.md), then [workspace lifecycle](WORKTREES.md#workspace-lifecycle) |
 | Tool-less or untrusted model workers (packets, leases) | [Task packets](TASKS.md) |
@@ -60,47 +46,24 @@ Provider execution supplements the selected task workflow.
 | Modern native port | [Port](PORT.md), then the relevant M6/M7 gate |
 | Explicit lift campaign | [Batch](BATCH.md) |
 
-A continuation means translating functions with the C loop until the user's
-time or token budget is used. A short handoff is not a reason to open a new
+A continuation means running the [farm](FARM.md) until the user's time or
+token budget is used, while an expert session works its supply lane. A short handoff is not a reason to open a new
 investigation; the queue and `cmre brief` supply the next unit.
 
 ### Worker allocation
 
-At each recovery batch and continuation, resolve worker allocation from the current
-user instructions and inherited allocation record. Retain existing authorization;
-a task workflow such as `C.md` does not imply solo execution. When MiniMax/DeepSeek
-use is authorized, complete [provider batch intake](PROVIDER-CAMPAIGN.md#batch-intake)
-before coordinator implementation. That workflow covers ordinary batches as well
-as timed campaigns; use a timed schedule only when requested.
+Adam authorized MiniMax, DeepSeek and Codex/GPT use for decompilation
+(2026-11-13). The [farm](FARM.md) is the allocation: cheap models translate and
+audit, an expert model works the supply lane, and no allocation record or
+dispatch receipt is needed. Older checkpoints with an `allocation` record still
+resume; their workflow is archived under `archive/`.
 
-Completion: scoped assignments have dispatch receipts, or provider use has a named
-hold and retry condition. Pending assignments still need intake work. With no
-delegation authorization, record the solo scope and continue the selected task.
-Checkpoint the allocation separately from the task workflow so regeneration and
-resume retain both. Legacy checkpoints mark allocation unresolved, requiring this
-decision before recovery.
+### Delegated recovery (Claude Code subagents)
 
-In native mode the same allocation becomes durable prepared queue entries:
-author and reviewer caps are bounded separately, a task-local hold applied only
-after live ownership is terminal returns its slot to unrelated eligible supply,
-and no queue or global writer lease is held while a worker runs.
-
-### Delegated recovery
-
-Give each worker at most three distinct function IDs from one family or subsystem,
-the selected protocol and its exact writable paths. The worker owns routine input
-repair, translation, testing and computation controls through a frozen
-acceptance-ready bundle or an evidence-bound hold; see
-[candidate ownership](PARALLEL.md#candidate-ownership). The parent assigns
-independent review and runs `cmre accept fn_X --c` serially.
-Packets and leases ([TASKS.md](TASKS.md)) are for tool-less model workers only.
-Start a fresh worker at the batch boundary; do not refill a worker indefinitely.
-Give it the exact IDs, header path, representative and member delta paths, and
-the selected workflow. After 30 assistant messages, finish the current bounded
-attempt and return its result; the parent assigns any remaining IDs afresh.
-Measure worker, coordinator and review costs through [THROUGHPUT.md](THROUGHPUT.md)
-before changing model tier or increasing concurrency. Model names alone do not
-establish throughput. The parent reviews source evidence and accepts serially.
+Outside the farm, give each `cm-decompiler` worker distinct function IDs. It
+stops at a passing test and returns the ID; the parent accepts serially
+(accept holds an exclusive lease). Packets and leases ([TASKS.md](TASKS.md))
+are for tool-less model workers only.
 
 ### Throughput rules
 
@@ -131,7 +94,7 @@ establish throughput. The parent reviews source evidence and accepts serially.
   Supply `--allocation ALLOCATION.json` to establish or update worker allocation;
   omission inherits this parent's latest finished checkpoint. Each checkpoint
   freezes its own `worker-allocation.json`; resume prints its mode and path.
-  See [batch intake](PROVIDER-CAMPAIGN.md#batch-intake) for the record format.
+  See [batch intake](archive/PROVIDER-CAMPAIGN.md#batch-intake) for the record format.
   Select at most 20 relevant IDs; the work registry retains all other holds.
   Start the next context from that handoff and the selected workflow, then
   read only the evidence packets needed for its batch.

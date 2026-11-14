@@ -22,7 +22,12 @@ class BusyError(RuntimeError):
     pass
 
 
-def _atomic_bytes(path: Path, data: bytes) -> None:
+REPLACE_ATTEMPTS = 20
+REPLACE_RETRY_DELAY = 0.025
+_TRANSIENT_REPLACE_WINERRORS = frozenset({5, 32, 33})
+
+
+def _atomic_bytes(path: Path, data: bytes, *, lease=None) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f'.{path.name}.', suffix='.tmp', dir=path.parent)
@@ -31,7 +36,20 @@ def _atomic_bytes(path: Path, data: bytes) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        # Windows readers need not share delete access. Retain this exact,
+        # fsynced temporary until a short reader closes; never remove the old
+        # destination first or hide a persistent publication failure.
+        for attempt in range(REPLACE_ATTEMPTS):
+            if lease is not None and not _live(*lease):
+                raise BusyError('Inherited command lease expired before publication')
+            try:
+                os.replace(temporary, path)
+                break
+            except OSError as error:
+                if (getattr(error, 'winerror', None) not in _TRANSIENT_REPLACE_WINERRORS
+                        or attempt + 1 == REPLACE_ATTEMPTS):
+                    raise
+                time.sleep(REPLACE_RETRY_DELAY)
     finally:
         Path(temporary).unlink(missing_ok=True)
 
@@ -44,9 +62,7 @@ def atomic_bytes(path: Path, data: bytes) -> None:
         # An in-flight orphan may finish computing, but cannot publish after its
         # parent releases ownership or a new command replaces the lease.
         with _gate(_path()):
-            if not _live(_path(), token):
-                raise BusyError('Inherited command lease expired before publication')
-            _atomic_bytes(path, data)
+            _atomic_bytes(path, data, lease=(_path(), token))
     else:
         _atomic_bytes(path, data)
 

@@ -1,6 +1,6 @@
 ---
 name: cm-decompile
-description: Translate CM0102 lifted functions to plain C and accept them (brief, write, test, accept loop). Use for readable C, "continue the decompilation", or a named fn_XXXXXXXX.
+description: Translate CM0102 lifted functions to plain C by hand and accept them (brief, write, test, accept loop). Use for a named fn_XXXXXXXX or a by-hand batch; bulk continuation uses the farm via cm-session.
 ---
 
 # Translate functions to C

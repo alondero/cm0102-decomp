@@ -1,8 +1,9 @@
 # Next-phase plan: measured limits, design and sequence
 
-Current timed provider operations and roles are in
+Current provider batch intake and roles are in
 [PROVIDER-CAMPAIGN.md](PROVIDER-CAMPAIGN.md), updated after the November 8 pilots.
-Use that workflow for the next 150-minute run. Counts, concurrency estimates and
+Use that workflow whenever provider use is authorized; its timed schedule applies
+only when requested. Counts, concurrency estimates and
 day plans below are historical measurements; refresh supply before dispatch.
 The current provider workflow takes precedence over historical lane counts.
 

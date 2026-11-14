@@ -40,6 +40,32 @@ def test_inexpressible_registers_are_reported():
     assert problems == ["extraout_ECX", "unaff_ESI"]
 
 
+def test_brief_identifies_frozen_legacy_before_generating_another_draft(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from cmre import inventory, ledger, lift, semantic
+
+    monkeypatch.setattr(inventory, 'load', lambda: SimpleNamespace(
+        functions={0x401000: SimpleNamespace(name='date', body_bytes=51, signature='unknown')}, modules={}))
+    monkeypatch.setattr(lift, 'discover', lambda va: SimpleNamespace(
+        insns={}, callees=[], imports=[], problems=[], tables={}, data=[]))
+    monkeypatch.setattr(semantic, '_call_sites', lambda: {})
+    monkeypatch.setattr(semantic, 'edx_readers', lambda va: [])
+    monkeypatch.setattr(drafts, '_globals_table', lambda va: {})
+    source = tmp_path / 'cm_date.c'
+    source.write_text('authored date source')
+    frozen = tmp_path / 'legacy.json'
+    frozen.write_text(json.dumps({'source': str(source)}))
+    monkeypatch.setattr(ledger, 'legacy_entries', lambda: [SimpleNamespace(
+        va=0x401000, source=str(frozen), record={'symbol': 'cm_date_assign'})])
+    monkeypatch.setattr(ledger, 'recovered', lambda: {})
+    monkeypatch.setattr(drafts, 'write', lambda va: pytest.fail('duplicated a frozen legacy draft'))
+    text = drafts.brief(0x401000, asm=False)
+    assert 'frozen legacy recovery' in text and 'cm_date_assign' in text
+    assert 'cm_date.c' in text and env.digest(source) in text
+    assert 'binding not inferred' in text
+
+
 @pytest.mark.skipif(not (drafts.DRAFTS / "fn_006869a0.c").exists(), reason="local Ghidra drafts not exported")
 def test_converted_draft_passes_semantic_gate(tmp_path, monkeypatch):
     # This function's recorded input hints supply the coverage its acceptance uses.

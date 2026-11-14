@@ -145,14 +145,23 @@ def latest_gate(parent: dict, sessions: Path) -> dict | None:
     return None
 
 
+# Retired coordination workflows (2026-11-13, replaced by FARM.md). Their names stay valid
+# so older checkpoints resume, but they resolve under docs/agent/archive/.
+ARCHIVED_WORKFLOWS = {"THROUGHPUT.md", "PROVIDER-CAMPAIGN.md", "PROVIDER-CONTROLLER.md",
+                      "PIPELINE.md", "NATIVE-COORDINATION.md"}
+
+
+def workflow_path(workflow: str) -> str:
+    return ("docs/agent/archive/" if workflow in ARCHIVED_WORKFLOWS else "docs/agent/") + workflow
+
+
 def validate_handoff(workflow: str, next_task: str, functions: list[str]) -> None:
     """Bound context before reading per-function records or publishing a receipt."""
     if len(functions) > 20:
         raise ValueError("A checkpoint contains at most 20 function IDs")
     if workflow not in {"C.md", "HARNESS.md", "TRIAGE.md", "SUBSYSTEM.md", "REVIEW.md",
-                        "CAMPAIGN.md", "PORT.md", "BATCH.md", "THROUGHPUT.md", "REA.md",
-                        "PARALLEL.md", "TASKS.md", "PROVIDER-CAMPAIGN.md",
-                         "PROVIDER-CONTROLLER.md", "PIPELINE.md", "NATIVE-COORDINATION.md"}:
+                        "CAMPAIGN.md", "PORT.md", "BATCH.md", "REA.md", "FARM.md",
+                        "PARALLEL.md", "TASKS.md"} | ARCHIVED_WORKFLOWS:
         raise ValueError("Select a workflow from docs/agent/PLAYBOOK.md")
     if not next_task.strip() or len(next_task) > 500 or any(c in next_task for c in "\r\n"):
         raise ValueError("Next task must be a nonempty single line of at most 500 characters")
@@ -252,7 +261,7 @@ def handoff(parent: dict, workflow: str, next_task: str, functions: list[str], s
     """Bounded continuation context, explicitly separate from validation evidence."""
     validate_handoff(workflow, next_task, functions)
     allocation = validate_allocation(unresolved_allocation() if allocation is None else allocation)
-    lines = ["# Recovery continuation", "", f"Next: {next_task}", f"Workflow: docs/agent/{workflow}",
+    lines = ["# Recovery continuation", "", f"Next: {next_task}", f"Workflow: {workflow_path(workflow)}",
              allocation_summary(allocation, allocation_path),
              f"Parent preflight: {parent['receipt']}",
              "Resume this parent receipt; retain function tests and acceptance.",
@@ -260,9 +269,10 @@ def handoff(parent: dict, workflow: str, next_task: str, functions: list[str], s
               "Read relevant evidence packets; follow every unresolved review obligation."]
     if allocation["mode"] == "coordination-only":
         lines[0] = "# Coordination-only native continuation"
-        lines[3] = "Workflow: docs/agent/NATIVE-COORDINATION.md; task workflow: docs/agent/" + workflow
+        lines[3] = ("Workflow: docs/agent/archive/NATIVE-COORDINATION.md; task workflow: "
+                    + workflow_path(workflow))
         lines[6:9] = [
-            "Policy: docs/agent/NATIVE-COORDINATION.md (all substantive work delegated).",
+            "Policy: docs/agent/archive/NATIVE-COORDINATION.md (all substantive work delegated).",
             "Assigned expert steward resumes preflight and executes gates; parent reads bounded receipts only.",
             "Checkpoint only; not a green gate. Preserve independent review and serialized acceptance."]
     if gate:

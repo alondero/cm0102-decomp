@@ -103,4 +103,12 @@ and compiled PE identities, optimization and case policy. Do not substitute
 direct fixture indexing, a regenerated seed, `explain` slices or a truncated
 prefix. Test selected-case identity against the ordinary complete run and a
 nearby discovery-dependent case before integrating it as a harness release.
-Until that API exists, full traces and acceptance readiness remain incomplete.
+Until that API exists, full raw gate traces and actual gate PEs remain unavailable,
+and these selected-control bundles remain proposals even with `controls-complete`.
+They cannot accept a function or clear a work hold. This bundle readiness is
+separate from ordinary semantic C acceptance under [C.md](C.md),
+[ADR 0001](../adr/0001-automated-acceptance-and-two-tier-recovery.md) and
+[ADR 0006](../adr/0006-compiler-inserted-helpers-in-plain-c.md): original-derived
+source and inputs, independent review, the unchanged O0/O2 gate, and the required
+per-site sensitivity evidence still apply. Ordinary C acceptance does not establish
+full-trace collection, composed execution, live integration or a standalone milestone.

@@ -1,11 +1,17 @@
 # Translate functions to C
 
+The [farm](FARM.md) runs this loop with many workers and is the default; use
+this page directly for one named function or a by-hand batch. Farm workers
+read the Rules in step 2 and write to their scratch source instead of `recovery/c/`.
+
 Input: function IDs from the parent. Otherwise inspect `py -3.13 -m cmre family -n 5`
 for a bounded family in the current subsystem, then use
 `py -3.13 -m cmre next --c -n 20 --module NAME` for remaining dependencies.
 Without an established subsystem, select a family with an accepted representative
 or use the ordinary queue. Existing unaccepted sources and recorded holds are
 excluded; `cmre work list` exposes them and `next --c --include-held` is for triage.
+For one ID, `cmre work show fn_X` separates matching source acceptance from queue
+history and retains every recorded hold and retry condition.
 When other agents work concurrently, select with `next --c --claim NAME`
 ([PARALLEL.md](PARALLEL.md)) so no two agents translate the same function.
 Bytes are the progress measure: prefer `--min-bytes 129` once small leaves are
@@ -118,8 +124,15 @@ callees as explicit boundaries. C acceptance does not establish composed executi
      frame layout, or a pass at only one optimization level, is not source evidence.
    - Reconstruct partial-register arithmetic through the declared return width:
      `setcc al; dec eax; and al, mask; add eax, K` can return a nonzero low byte
-     on both branches. A write to a stack argument slot reassigns that local;
-     distinguish it from a store through the pointer the slot originally held.
+     on both branches. A write to a stack argument slot updates its caller-owned
+     home; preserve its access width and exact later reload. Use a volatile home
+     when stores can alias it, and cache its value only where the original does.
+     A BYTE load needs a BYTE lvalue, as in `fn_00775070`'s mode-home regression.
+     Verify physical offsets in both compiler outputs: even a volatile aggregate
+     or 64-bit formal can be copied at entry. Preserve the original alignment
+     and alias-compatible word views where needed, then check that later loads
+     still use the caller-owned homes.
+     Distinguish the home from the object the argument originally pointed to.
      Trace each backward branch to its exact target: register copies before that
      target stay cached even when their source register changes inside the loop.
    - Plain C. Inline assembly, naked functions and `CM_ORIGINAL_CALL` belong only
@@ -181,6 +194,10 @@ Fixture `arena_template` selects a deterministic random arena, including templat
 Every fixture requires `regs`, `stack`, `arena_template`, `arena_writes`, `globals`
 (use `{}` when empty), and `import_seed`. Argument kinds are `any`, `ptr`, `small`
 or `struct`; a rejected fixture or kind still counts as a failed invocation.
+Before testing a new complete hint JSON, run
+`py -3.13 scripts/cmre_hint_check.py PATH` for a read-only schema preflight.
+It reuses the gate's validator without building or executing game code; it does
+not establish fixture provenance or acceptance.
 Existing `abi` records keep `abi`; to replace one with plain C, rewrite it and run
 `cmre accept fn_X --c --profile semantic`.
 New C uses input policy `v2` ([ADR 0004](../adr/0004-versioned-c-input-policy.md)):

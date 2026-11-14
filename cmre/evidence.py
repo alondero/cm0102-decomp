@@ -27,7 +27,13 @@ def dependencies(va: int, peer: int | None) -> list[Path]:
     paths.update((env.ROOT / "recovery/include").rglob("*.*"))
     paths.update(Path(env.tool(name)) for name in ("gcc", "as", "ld", "nm"))
     if env.REGISTRY.exists():
-        paths.update(env.ROOT / p for p in json.loads(env.REGISTRY.read_text(encoding="utf-8"))["current"])
+        for name in json.loads(env.REGISTRY.read_text(encoding='utf-8'))['current']:
+            frozen = env.ROOT / name
+            paths.add(frozen)
+            data = json.loads(frozen.read_text(encoding='utf-8'))
+            paths.update(drafts.legacy_sources(data).values())
+            for function in data.get('functions', []):
+                paths.update(drafts.legacy_sources(data, function).values())
     for owner in {va, peer} - {None}:
         callees = set(lift.discover(owner).callees)
         raw = drafts.DRAFTS / f"fn_{owner:08x}.c"
@@ -82,12 +88,19 @@ def caller_windows(va: int) -> str:
 
 
 def provenance(va: int) -> str:
+    from . import ledger
+
     lines = ["Callee declaration provenance (a declaration is not ABI evidence):"]
     inv = inventory.load()
+    legacy = {entry.va: entry for entry in ledger.legacy_entries()}
     for callee in sorted(lift.discover(va).callees):
         name = f"fn_{callee:08x}"
         source = env.C_DIR / f"{name}.c"
         ghidra = drafts.DRAFTS / f"{name}.c"
+        if callee in legacy:
+            entry = legacy[callee]
+            lines.append(f'{name}: {drafts.legacy_provenance(entry)}')
+            continue
         if drafts.accepted_prototype(callee):
             record = env.LEDGER_DIR / f"{name}.json"
             data = json.loads(record.read_text(encoding="utf-8")) if record.exists() else {}

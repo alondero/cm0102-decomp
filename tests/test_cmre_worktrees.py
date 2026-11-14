@@ -164,6 +164,58 @@ def test_five_attempts_survive_expiry_reclaim_and_snapshot_replacement(worker, w
         worktrees.claim(worker, VA, 'replacement')
 
 
+@pytest.mark.parametrize('report,expected', [
+    ({'status': 'fail', 'builds': {'-O0': {'status': 'build-failed',
+       'stderr': 'fn.c:7: error: too many arguments\n' + 'details\n' * 200}}},
+     {'kind': 'build-failed', 'opt': '-O0'}),
+    ({'status': 'fail', 'builds': {'-O0': {'status': 'fail', 'difftest': {
+       'mismatches': [{'case': 17, 'field': 'eax', 'original': 0, 'recovered': 1}],
+       'coverage': 0.9, 'inconclusive': 0}}}},
+     {'kind': 'mismatch', 'opt': '-O0', 'case': 17}),
+    ({'status': 'fail', 'builds': {'-O2': {'status': 'fail', 'difftest': {
+       'mismatches': [], 'coverage': 0.1, 'inconclusive': 8, 'code_as_data_cases': 0}}}},
+     {'kind': 'difftest', 'opt': '-O2', 'coverage': 0.1, 'inconclusive': 8}),
+    ({'status': 'fail', 'problems': ['Original return contract is incomplete']},
+     {'kind': 'problem'}),
+])
+def test_failed_report_exports_actionable_numbered_feedback_without_resetting_attempts(
+        worker, monkeypatch, report, expected):
+    claimed = worktrees.claim(worker, VA, 'translator')
+    candidate(worker)
+    monkeypatch.setattr(tasks.recover, 'test_c', lambda *a, **k: report)
+    for number in (1, 2):
+        result = worktrees.submit(worker, VA)
+        assert result['report_status'] == 'fail'
+        assert result['status'] == 'claimed'
+        assert result['attempt_count'] == number
+        assert result['report'] == (worktrees.LOCAL / f'fn_00401000/report-{number}.json').as_posix()
+        assert json.loads((worker / result['report']).read_text()) == report
+        failure = result['first_failure']
+        assert all(failure[k] == v for k, v in expected.items())
+        assert failure['detail'] and len(failure['detail']) <= 600
+        assert work.read()['functions']['fn_00401000']['failures'] == number
+    assert len(tasks.status(claimed['task_id'])['attempts']) == 2
+
+
+def test_passing_report_has_explicit_status_and_no_failure(worker):
+    worktrees.claim(worker, VA, 'translator')
+    candidate(worker)
+    result = worktrees.submit(worker, VA)
+    assert result['status'] == 'submitted' and result['report_status'] == 'pass'
+    assert result['first_failure'] is None
+
+
+@pytest.mark.parametrize('report_status,exit_code', [('fail', 1), ('pass', 0)])
+def test_worktree_cli_exit_uses_report_status_independently_of_lifecycle(
+        monkeypatch, capsys, tmp_path, report_status, exit_code):
+    from cmre import cli
+    result = {'status': 'submitted', 'report_status': report_status,
+              'report': 'CM0102/Analysis/cmre/worktree/fn_00401000/report-2.json'}
+    monkeypatch.setattr(worktrees, 'submit', lambda *a, **k: result)
+    assert cli.main(['worktree', 'submit', str(tmp_path), hex(VA)]) == exit_code
+    assert json.loads(capsys.readouterr().out) == result
+
+
 def test_expired_claim_and_changed_code_reject_worker(worker, monkeypatch):
     manifest = worktrees.claim(worker, VA, 'translator', seconds=1)
     candidate(worker)

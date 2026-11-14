@@ -111,17 +111,25 @@ def _snapshot(va, reason, witness):
     witness_bytes = retain('witness.json', witness)
     try:
         proof = json.loads(witness_bytes)
-        verdict, difference = proof['after_classifier']
-        valid = (int(proof['function'].removeprefix('fn_'), 16) == va
+        identity_valid = (int(proof['function'].removeprefix('fn_'), 16) == va
                  and proof['accepted_source_sha256'] == c['source_sha256']
-                 and proof['accepted_ledger_sha256'] == _digest(before_bytes)
-                 and type(proof['case']) is int and proof['case'] >= 0
-                 and proof['opt'] in ('-O0', '-O2')
-                 and verdict == 'mismatch' and isinstance(difference, dict) and bool(difference.get('field')))
+                 and proof['accepted_ledger_sha256'] == _digest(before_bytes))
+        if proof.get('kind') == 'semantic-inline-assembly':
+            from .source_policy import inline_assembly_lines
+            lines = inline_assembly_lines(files['accepted-source.c']['bytes'].decode('utf-8'))
+            profiles = {row.get('profile') for row in c.get('validation', {}).values()
+                        if isinstance(row, dict)}
+            valid = identity_valid and profiles == {'semantic'} and bool(lines) and proof.get('lines') == lines
+        else:
+            verdict, difference = proof['after_classifier']
+            valid = (identity_valid and type(proof['case']) is int and proof['case'] >= 0
+                     and proof['opt'] in ('-O0', '-O2') and verdict == 'mismatch'
+                     and isinstance(difference, dict) and bool(difference.get('field')))
     except (ValueError, KeyError, TypeError, AttributeError):
         valid = False
     if not valid:
-        raise ValueError('Witness must pin this accepted ledger/source and a named compared mismatch')
+        raise ValueError('Witness must pin this accepted ledger/source and a named compared mismatch '
+                         'or mechanically verified semantic inline assembly')
     run_key = c.get('run_key', '')
     if len(run_key) != 16 or any(x not in '0123456789abcdef' for x in run_key):
         raise ValueError('Accepted C run key is malformed')
@@ -131,6 +139,8 @@ def _snapshot(va, reason, witness):
             or report.get('source_sha256') != c['source_sha256']
             or report.get('harness_sha256') != c.get('harness_sha256')):
         raise ValueError('Retained report does not match the active accepted C provenance')
+    if proof.get('kind') == 'semantic-inline-assembly' and report.get('profile') != 'semantic':
+        raise ValueError('Source-policy withdrawal requires a semantic accepted report')
     c_bytes = _bytes(c)
     files['accepted-c-metadata.json'] = {'original': _workspace_relative(path) + '#c',
                                          'sha256': _digest(c_bytes), 'bytes': c_bytes}
@@ -191,7 +201,10 @@ def _snapshot(va, reason, witness):
                                'c_tier_body_bytes': -function.body_bytes, 'source_body_bytes': -function.body_bytes,
                                'lifted_functions': 0, 'recovered_functions': 0, 'recovered_body_bytes': 0},
                'work_after': {'state': 'evidence-needed', 'blocker': 'withdrawn-c-evidence',
-                              'reason': reason.strip(), 'retry_when': 'Resolve the archived named mismatch, independently review retained C source, then explicitly retry and use normal cmre test/accept; withdrawal never reaccepts.'},
+                              'reason': reason.strip(), 'retry_when':
+                                  ('Resolve the archived source-policy violation' if proof.get('kind') == 'semantic-inline-assembly'
+                                   else 'Resolve the archived named mismatch')
+                                  + ', independently review retained C source, then explicitly retry and use normal cmre test/accept; withdrawal never reaccepts.'},
                'preserved': ['canonical C bytes', 'hints bytes', 'validated lift and source', 'old reports', 'prior accepted ledger and C metadata']}
     preview['plan_sha256'] = _digest(_bytes(preview))
     return preview, files, manifest_bytes, old_work

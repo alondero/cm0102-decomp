@@ -24,8 +24,11 @@ import json
 import random
 import struct
 from dataclasses import dataclass
+from pathlib import Path
 
 import unicorn
+
+import zlib
 
 from . import emu, env, image, inventory, semantic, x87_transport
 
@@ -51,6 +54,7 @@ class Options:
     seed: int
     hints: dict
     inputs: str = "v1"  # set by the caller from the record's policy, never by hints
+    va: int = 0  # names the function whose local captures the hints may list
 
     @classmethod
     def for_function(cls, va: int, overrides: dict | None = None, *, tier: str = "lifted") -> "Options":
@@ -62,7 +66,7 @@ class Options:
             hints.update(c_hints)
         validate_hints(overrides or {})
         merged = {**DEFAULTS, **{k: hints[k] for k in DEFAULTS if k in hints}, **(overrides or {})}
-        return cls(seed=hints.get("seed", va), hints=hints, **merged)
+        return cls(seed=hints.get("seed", va), hints=hints, va=va, **merged)
 
 
 def load_hints(va: int) -> dict:
@@ -76,7 +80,7 @@ def validate_hints(hints: dict, *, worker: bool = False) -> None:
     """Validate inputs before execution; task workers cannot change test policy."""
     metadata = {"notes", "fixture_provenance", "input_probe", "input_probe_sha256", "fixture_evidence"}
     policy = set(DEFAULTS) | {"seed"}
-    input_fields = set(emu.REG_NAMES[:8]) | metadata | {"args", "arg_count", "struct_size", "globals", "fixtures", "arena_size", "import_transcript"}
+    input_fields = set(emu.REG_NAMES[:8]) | metadata | {"args", "arg_count", "struct_size", "globals", "fixtures", "arena_size", "import_transcript", "captures"}
     allowed = policy | input_fields | {"auto", "lift_jump_tables", "original_x87", "lift_original_calls", "c_hints"}
     if not isinstance(hints, dict) or set(hints) - allowed:
         raise ValueError("hints must be an object containing only supported fields")
@@ -142,6 +146,10 @@ def validate_hints(hints: dict, *, worker: bool = False) -> None:
         templates = (bytes(hints.get("arena_size", emu.ARENA_SIZE)),) * ARENA_TEMPLATES
         for fixture in fixtures:
             _fixture_case(fixture, templates, hints.get("arg_count", DEFAULTS["arg_count"]))
+    captures = hints.get("captures", [])
+    if (not isinstance(captures, list) or len(captures) > MAX_CAPTURES or len(set(captures)) != len(captures)
+            or any(not valid_capture_name(name) for name in captures)):
+        raise ValueError(f"captures must be at most {MAX_CAPTURES} distinct capture names (SHA-256 hex)")
     if "c_hints" in hints:
         c_hints = hints["c_hints"]
         if not isinstance(c_hints, dict) or set(c_hints) - input_fields:
@@ -257,6 +265,117 @@ def _fixture_case(fixture: dict, templates: list[bytes], arg_count: int) -> emu.
         raise ValueError(f"invalid input fixture: {exc}") from exc
 
 
+# --- Captured entry inputs (ADR 0009) -------------------------------------------------------
+# A capture is an input, never a result: the registers, stack words and memory
+# pages observed in the unmodified pinned process when one function was entered.
+# The store lives in this harness module so the harness identity covers the
+# bytes a test reads. Captures hold original game memory: they stay under
+# local/captures/, are never published, and are named by the SHA-256 of their
+# canonical bytes. A missing capture makes a test unavailable, never passing.
+
+CAPTURE_FORMAT = "cmre-capture/1"
+CAPTURE_MAGIC = b"CMCAP1\n"
+CAPTURE_STACK_WORDS = 64
+CAPTURE_REG_NAMES = ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "eflags")
+
+
+def capture_store() -> Path:
+    return env.LOCAL_CAPTURES
+
+
+@dataclass(frozen=True)
+class Capture:
+    name: str  # sha256 of the canonical bytes
+    va: int
+    regs: dict[str, int]
+    fpcw: int
+    stack: tuple[int, ...]
+    pages: dict[int, bytes]
+    import_seed: int
+    meta: dict
+
+
+def _capture_canonical(header: dict, pages: dict[int, bytes]) -> bytes:
+    vas = sorted(pages)
+    if any(type(va) is not int or va % emu.PAGE or len(pages[va]) != emu.PAGE for va in vas):
+        raise ValueError("capture pages must be whole 4 KiB pages")
+    head = json.dumps({**header, "format": CAPTURE_FORMAT, "page_vas": vas}, sort_keys=True,
+                      separators=(",", ":")).encode()
+    return CAPTURE_MAGIC + struct.pack("<I", len(head)) + head + b"".join(pages[va] for va in vas)
+
+
+def capture_path(va: int, name: str) -> Path:
+    return capture_store() / f"fn_{va:08x}" / f"{name}.cap"
+
+
+def save_capture(va: int, regs: dict[str, int], fpcw: int, stack: list[int], pages: dict[int, bytes],
+         import_seed: int, meta: dict) -> str:
+    header = {"target": env.TARGET_SHA256, "va": va, "regs": {n: regs[n] for n in CAPTURE_REG_NAMES},
+              "fpcw": fpcw, "stack": list(stack), "import_seed": import_seed, "meta": meta}
+    blob = _capture_canonical(header, pages)
+    name = env.digest_bytes(blob)
+    path = capture_path(va, name)
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_bytes(zlib.compress(blob, 6))
+        temporary.replace(path)
+    return name
+
+
+def valid_capture_name(name) -> bool:
+    return type(name) is str and len(name) == 64 and all(c in "0123456789abcdef" for c in name)
+
+
+def load_capture(va: int, name: str) -> Capture:
+    """Load and verify one capture. Raises when it is absent or differs from its name."""
+    if not valid_capture_name(name):
+        raise ValueError("capture names are lowercase SHA-256 hex digests")
+    path = capture_path(va, name)
+    if not path.is_file():
+        raise FileNotFoundError(f"capture {name[:12]} for fn_{va:08x} is not in the local capture store")
+    blob = zlib.decompress(path.read_bytes())
+    if env.digest_bytes(blob) != name or not blob.startswith(CAPTURE_MAGIC):
+        raise ValueError(f"capture {name[:12]} differs from its recorded identity")
+    size, = struct.unpack_from("<I", blob, len(CAPTURE_MAGIC))
+    start = len(CAPTURE_MAGIC) + 4
+    header = json.loads(blob[start:start + size])
+    vas = header["page_vas"]
+    body = blob[start + size:]
+    if (header.get("format") != CAPTURE_FORMAT or header.get("target") != env.TARGET_SHA256
+            or header.get("va") != va or len(body) != emu.PAGE * len(vas)):
+        raise ValueError(f"capture {name[:12]} does not belong to fn_{va:08x} of the pinned target")
+    pages = {page: body[i * emu.PAGE:(i + 1) * emu.PAGE] for i, page in enumerate(vas)}
+    return Capture(name, va, header["regs"], header["fpcw"], tuple(header["stack"]), pages,
+                   header["import_seed"], header["meta"])
+
+
+def capture_names(va: int) -> list[str]:
+    folder = capture_store() / f"fn_{va:08x}"
+    return sorted(p.stem for p in folder.glob("*.cap")) if folder.is_dir() else []
+
+
+MAX_CAPTURES = 96
+
+
+@functools.lru_cache(maxsize=4096)
+def _capture(va: int, name: str):
+    return load_capture(va, name)
+
+
+def _capture_case(va: int, name: str, arena_size: int, arg_count: int) -> emu.Case:
+    """Replay one captured entry input (ADR 0009): observed registers, the first
+    `arg_count` observed stack words, and the observed pages at their original
+    addresses. The function's own frame uses the test stack as in every case."""
+    try:
+        found = _capture(va, name)
+    except (OSError, ValueError, KeyError) as exc:
+        raise ValueError(f"capture unavailable: {exc}") from exc
+    stack = (list(found.stack) + [0] * arg_count)[:arg_count]
+    return emu.Case(dict(found.regs), stack, bytes(arena_size), {}, found.import_seed, found.fpcw,
+                    None, dict(found.pages))
+
+
 def make_case(rng: random.Random, opts: Options, global_inputs: list[int], templates: list[bytes]) -> emu.Case:
     if opts.inputs not in INPUT_POLICIES:
         raise ValueError(f"unknown input policy {opts.inputs!r}")
@@ -276,10 +395,15 @@ def make_case(rng: random.Random, opts: Options, global_inputs: list[int], templ
     case = emu.Case(regs, stack, _mutated_arena(rng, templates), chosen, rng.getrandbits(32))
     case.arena += bytes(size - len(case.arena))
     fixtures = h.get("fixtures", [])
-    if fixtures and rng.randrange(2) == 0:
+    captures = h.get("captures", [])
+    if (fixtures or captures) and rng.randrange(2) == 0:
         # Keep random/edge cases alongside original-side selected input fixtures.
-        case = _fixture_case(rng.choice(fixtures),
-                             [t + bytes(size - len(t)) for t in templates], opts.arg_count)
+        chosen_input = rng.choice(fixtures + captures)
+        if isinstance(chosen_input, str):
+            case = _capture_case(opts.va, chosen_input, size, opts.arg_count)
+        else:
+            case = _fixture_case(chosen_input,
+                                 [t + bytes(size - len(t)) for t in templates], opts.arg_count)
     if "import_transcript" in h:
         case.import_transcript = h["import_transcript"]
     if opts.inputs == "v2":

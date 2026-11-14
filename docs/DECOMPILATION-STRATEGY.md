@@ -90,7 +90,7 @@ At the measured ~7.5 KB/hour, the remaining C bytes would take about 520 hours.
 Next levers, in order: re-test and review held v2-passable WIP sources; select
 cohorts from the error-path majority now open to plain C; then make game state
 available as fixtures for the large unlifted functions. Concurrency and model
-tier remain measured through [THROUGHPUT.md](agent/THROUGHPUT.md) and do not
+tier remain measured through [the farm status](agent/FARM.md) and do not
 substitute for these.
 
 Concurrent sessions from any agent client follow [PARALLEL.md](agent/PARALLEL.md).

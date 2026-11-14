@@ -1,7 +1,7 @@
 """Read-only native coordination dispatch lint; not a scheduler or sandbox.
 
 Run with py -3.13 scripts/cmre_native_plan.py PLAN.json. Exit 2 rejects a plan.
-The policy contract is docs/agent/NATIVE-COORDINATION.md.
+The policy contract is docs/agent/archive/NATIVE-COORDINATION.md (retired 2026-11-13; see FARM.md).
 """
 from __future__ import annotations
 

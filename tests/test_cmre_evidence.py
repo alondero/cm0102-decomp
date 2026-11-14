@@ -8,6 +8,56 @@ import pytest
 from cmre import env
 
 
+@pytest.mark.parametrize('location', ['ledger', 'function'])
+def test_legacy_provenance_names_frozen_source_without_claiming_a_c_binding(tmp_path, monkeypatch, location):
+    from cmre import drafts, evidence, inventory, ledger, lift
+
+    source = tmp_path / 'cm_date.c'
+    source.write_text('authored legacy reconstruction')
+    adapter = tmp_path / 'cm_date.S'
+    adapter.write_text('authored entry adapter')
+    frozen = tmp_path / 'legacy.json'
+    references = {'source': str(source), 'entry_source': str(adapter)}
+    record = {'symbol': 'cm_date_assign', **(references if location == 'function' else {})}
+    frozen.write_text(json.dumps(references if location == 'ledger' else {'functions': [record]}))
+    ghidra = tmp_path / 'ghidra'
+    ghidra.mkdir()
+    (ghidra / 'fn_00401100.c').write_text('unvalidated draft')
+    monkeypatch.setattr(drafts, 'DRAFTS', ghidra)
+    monkeypatch.setattr(drafts, 'accepted_prototype', lambda va: None)
+    monkeypatch.setattr(drafts, 'prototype', lambda va: 'cm_fn_00401100(void)')
+    monkeypatch.setattr(inventory, 'load', lambda: SimpleNamespace(functions={0x401100: object()}))
+    monkeypatch.setattr(lift, 'discover', lambda va: SimpleNamespace(callees=[0x401100]))
+    monkeypatch.setattr(ledger, 'legacy_entries', lambda: [SimpleNamespace(
+        va=0x401100, source=str(frozen), record=record)])
+    text = evidence.provenance(0x401000)
+    assert 'frozen legacy recovery' in text and 'cm_date_assign' in text
+    assert 'cm_date.c' in text and env.digest(source) in text
+    assert 'cm_date.S' in text and env.digest(adapter) in text
+    assert 'binding not inferred' in text
+    assert 'unvalidated Ghidra' not in text
+
+
+@pytest.mark.parametrize('location', ['ledger', 'function'])
+def test_packet_dependencies_include_authored_legacy_source_and_header(tmp_path, monkeypatch, location):
+    from cmre import drafts, evidence, lift
+
+    registry, frozen = tmp_path / 'registry.json', tmp_path / 'legacy.json'
+    source, header = tmp_path / 'cm_date.c', tmp_path / 'cm_date.h'
+    adapter = tmp_path / 'cm_date.S'
+    source.write_text('authored reconstruction')
+    header.write_text('legacy interface')
+    adapter.write_text('legacy entry adapter')
+    references = {'source': str(source), 'header': str(header), 'entry_source': str(adapter)}
+    frozen.write_text(json.dumps(references if location == 'ledger' else {'functions': [references]}))
+    registry.write_text(json.dumps({'current': [str(frozen)]}))
+    monkeypatch.setattr(env, 'REGISTRY', registry)
+    monkeypatch.setattr(drafts, 'DRAFTS', tmp_path / 'no-drafts')
+    monkeypatch.setattr(lift, 'discover', lambda va: SimpleNamespace(callees=[]))
+    paths = evidence.dependencies(0x401000, None)
+    assert source in paths and header in paths and adapter in paths and frozen in paths
+
+
 def test_packet_reuses_rendering_but_invalidates_changed_or_new_dependencies(tmp_path, monkeypatch):
     from cmre import evidence
 
