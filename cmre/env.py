@@ -41,6 +41,9 @@ HINTS_DIR = RECOVERY / "hints"
 REGISTRY = RECOVERY / "registry.json"
 # Retained local-only content (never published, unlike disposable CM0102/Analysis).
 LOCAL_FIXTURES = ROOT / "local/fixtures"
+# Captured function-entry inputs from the running original game (ADR 0009).
+# They contain original game memory: local-only, named by content hash.
+LOCAL_CAPTURES = ROOT / "local/captures"
 
 TOOLCHAIN = Path(os.environ.get("CMRE_TOOLCHAIN", "C:/ProgramData/mingw64/mingw64/bin"))
 PYTHON_REQUIRED = (3, 13)

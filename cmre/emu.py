@@ -51,6 +51,10 @@ def _perms(section) -> int:
     return perms
 
 
+def _span(lo: int, hi: int) -> tuple[int, int]:
+    return lo & ~(PAGE - 1), (hi + PAGE - 1) & ~(PAGE - 1)
+
+
 def _align(lo: int, hi: int) -> tuple[int, int]:
     lo &= ~(PAGE - 1)
     hi = (hi + PAGE - 1) & ~(PAGE - 1)
@@ -66,6 +70,9 @@ class Case:
     import_seed: int = 0  # seeds the import stubs' return values
     fpcw: int | None = None  # optional incoming 16-bit x87 control word
     import_transcript: list | None = None
+    # Captured input pages (ADR 0009): page VA -> 4 KiB of bytes observed in the
+    # running original process at this function's entry. Mapped for this case only.
+    pages: dict[int, bytes] | None = None
 
 
 @dataclass
@@ -97,6 +104,16 @@ class Machine:
             self._map(s.va, s.raw, s.virtual_size, _perms(s), origin='original')
         self.recovered = recovered
         self._executable = tuple((s.va, s.end) for s in original.sections if s.executable)
+        # Page spans of writable original sections: the only already-mapped memory
+        # a captured input page may overwrite.
+        self._writable_image = tuple(_span(s.va, s.va + s.virtual_size)
+                                     for s in original.sections if s.writable)
+        self._case_pages: list[int] = []
+        self._iat: dict[int, bytes] = {}
+        # Recorder only (cmre/capture.py): supplies an absent page from the live
+        # original process on an unmapped data access. Never set by a differential test.
+        self.pager = None
+        self.paged: dict[int, bytes] = {}
         self._indirect: dict = {}
         if recovered:
             for s in recovered.sections:
@@ -111,6 +128,7 @@ class Machine:
         for i, (slot, name) in enumerate(sorted(original.imports.items())):
             trap = TRAP + 4 * i
             self.trap_names[trap] = name
+            self._iat[slot] = struct.pack("<I", trap)
             self._poke(slot, struct.pack("<I", trap))
             self._poke(trap, imports.stub_code(name))
         # TEB: end-of-chain SEH, stack limits, self pointer; FS via a GDT descriptor.
@@ -339,8 +357,46 @@ class Machine:
                 self.jump_runtime.observe_read(address, size, observed)
 
     def _invalid(self, uc, access, address, size, value, _):
+        if self.pager is not None and access in (unicorn.UC_MEM_READ_UNMAPPED, unicorn.UC_MEM_WRITE_UNMAPPED):
+            wanted = {}
+            for page in range(address & ~(PAGE - 1), ((address + max(size, 1) - 1) & ~(PAGE - 1)) + PAGE, PAGE):
+                if page in self.pristine:
+                    continue
+                blob = self.pager(page)
+                if blob is None:
+                    wanted = None
+                    break
+                wanted[page] = bytes(blob)
+            if wanted:
+                for page, blob in wanted.items():
+                    self._case_page(page, blob)
+                    self.paged[page] = blob
+                return True
         self.fault = (int(access), address, size)
         return False
+
+    def _case_page(self, page: int, blob: bytes) -> None:
+        """Map one captured input page for the current case; reset() removes it.
+
+        A page may lie outside every mapping or inside a writable original
+        section. Import slots keep their test stubs. Anything else is refused:
+        captured bytes never replace code, read-only data or harness memory.
+        """
+        if type(page) is not int or page % PAGE or not 0 <= page < 1 << 32 or len(blob) != PAGE:
+            raise ValueError("case pages are whole 4 KiB pages at page-aligned addresses")
+        if page in self.pristine:
+            if page in self._case_pages or not any(lo <= page < hi for lo, hi in self._writable_image):
+                raise ValueError(f"case page {page:#010x} overlaps harness, read-only or repeated memory")
+            self.uc.mem_write(page, bytes(blob))
+            for slot, stub in self._iat.items():
+                if page <= slot < page + PAGE:
+                    self.uc.mem_write(slot, stub)
+            self.dirty.add(page)
+            return
+        self.uc.mem_map(page, PAGE, unicorn.UC_PROT_READ | unicorn.UC_PROT_WRITE)
+        self.uc.mem_write(page, bytes(blob))
+        self.pristine[page] = bytes(blob)
+        self._case_pages.append(page)
 
     def _trap(self, uc, address, size, _):
         if self.x87_runtime and (self.x87_runtime.rejection
@@ -466,6 +522,12 @@ class Machine:
         self.uc.context_restore(self._pristine_cpu)
         if not self._pristine_ready:
             self._snapshot()
+        for p in self._case_pages:
+            self.uc.mem_unmap(p, PAGE)
+            del self.pristine[p]
+            self.dirty.discard(p)
+        self._case_pages = []
+        self.paged = {}
         for p in self.dirty:
             self.uc.mem_write(p, self.pristine[p])
         self.dirty = set()
@@ -483,6 +545,8 @@ class Machine:
                            if case.import_transcript is not None else None)
         self.reset()
         uc = self.uc
+        for page, blob in sorted((case.pages or {}).items()):
+            self._case_page(page, blob)
         for va, value in sorted(case.globals.items()):
             uc.mem_write(va, struct.pack("<I", value))
             self.dirty.update({va & ~(PAGE - 1), (va + 3) & ~(PAGE - 1)})

@@ -319,7 +319,10 @@ def _diagnostic_source(va: int, source: Path):
                 protected_files.append(worker_c / f'fn_{va:08x}.c')
             if resolved.exists() and any(p.is_file() and resolved.samefile(p) for p in protected_files):
                 raise ValueError('Explicit diagnostics cannot test a hard link to a task or worker source')
-            if f'fn_{va:08x}' in work.claims():
+            # The claim owner (CMRE_CLAIM_OWNER, set by the farm for its workers)
+            # tests scratch sources under its own claim; everyone else is fenced.
+            claim = work.claims().get(f'fn_{va:08x}')
+            if claim and claim.get('owner') != os.environ.get('CMRE_CLAIM_OWNER'):
                 raise ValueError('Explicit diagnostics cannot run while a shared claim is live')
             for path in (env.ANALYSIS / 'cmre/tasks').glob(f'c-{va:08x}-*/task.json'):
                 try:
@@ -372,6 +375,47 @@ def cmd_mutate(a) -> int:
         raise ValueError('--output and --resume require --plan')
     result = mutate.run(va, env.C_DIR / f'fn_{va:08x}.c', fence=_diagnostic_source)
     print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_capture(a) -> int:
+    """Captured entry inputs (ADR 0009): record from the live game, expand, apply to hints."""
+    from . import capture, capture_expand, inventory
+    inv = inventory.load()
+    if a.action == 'record':
+        from . import capture_record, ledger
+        if a.functions:
+            targets = [_va(f) for f in a.functions]
+        else:  # every inventory function that has no accepted lifted or C record yet
+            done = set(ledger.recovered())
+            targets = [va for va in inv.entries_sorted if va not in done and inv.functions[va].body_bytes]
+        recorder = capture_record.Recorder(a.pid, targets, per_function=a.per_function,
+                                           log=lambda text: print(text, file=sys.stderr))
+        print(json.dumps(recorder.run(a.seconds, a.status), indent=1))
+        return 0
+    vas = [_va(f) for f in a.functions] if a.functions else capture_expand.stored()
+    if a.action == 'status':
+        rows = [(va, capture.names_for(va)) for va in vas]
+        total = sum(inv.functions[va].body_bytes for va, names in rows if names and va in inv.functions)
+        print(json.dumps({'functions': sum(1 for _, n in rows if n), 'captures': sum(len(n) for _, n in rows),
+                          'body_bytes': total, 'store': env.rel(capture.store_dir())}, indent=1))
+        return 0
+    options = ({'iterations': a.iterations, 'target': a.target} if a.action == 'expand'
+               else {'test': not a.no_test})
+    results = capture_expand.run_many(a.action, vas, a.jobs, **options)
+    if a.output:
+        a.output.write_text(json.dumps(results, indent=1), encoding='utf-8')
+    if a.action == 'expand':
+        summary = {'functions': len(results), 'added': sum(r.get('added', 0) for r in results),
+                   'errors': sum(1 for r in results if r.get('status') == 'error')}
+    else:
+        passed = [r for r in results if r.get('status') == 'pass']
+        summary = {'functions': len(results), 'pass': len(passed),
+                   'pass_bytes': sum(inv.functions[int(r['va'], 16)].body_bytes for r in passed),
+                   'statuses': {s: sum(1 for r in results if r.get('status') == s)
+                                for s in sorted({str(r.get('status')) for r in results})},
+                   'passing': [f"fn_{int(r['va'], 16):08x}" for r in passed]}
+    print(json.dumps(summary, indent=1))
     return 0
 
 
@@ -684,6 +728,19 @@ def main(argv=None) -> int:
     s.add_argument('--output', type=Path, help='new retained control bundle directory')
     s.add_argument('--resume', action='store_true', help='reuse matching terminal stages; pending stages require investigation')
     s.set_defaults(func=cmd_mutate)
+    s = sub.add_parser('capture', help='entry inputs captured from the running original game (ADR 0009)')
+    s.add_argument('action', choices=('record', 'expand', 'apply', 'status'))
+    s.add_argument('functions', nargs='*', help='fn_XXXXXXXX IDs; default: unrecovered (record) or stored (others)')
+    s.add_argument('--pid', type=int, help='record: the running pinned cm0102.exe process')
+    s.add_argument('--seconds', type=float, default=600, help='record: session length')
+    s.add_argument('--per-function', type=int, default=24, help='record: coverage-adding captures kept per function')
+    s.add_argument('--status', type=Path, help='record: live JSON progress file')
+    s.add_argument('--iterations', type=int, default=1500, help='expand: mutation attempts per function')
+    s.add_argument('--target', type=float, default=0.9, help='expand: stop at this instruction coverage')
+    s.add_argument('--jobs', type=int, default=8, help='expand/apply: parallel processes')
+    s.add_argument('--no-test', action='store_true', help='apply: write hints without running the lifted gate')
+    s.add_argument('--output', type=Path, help='expand/apply: per-function JSON results')
+    s.set_defaults(func=cmd_capture)
     sub.add_parser("doctor", help="check environment, pins and ledgers").set_defaults(func=cmd_doctor)
     s = sub.add_parser("status", help="coverage summary")
     s.add_argument("--json", action="store_true")
@@ -778,6 +835,70 @@ def main(argv=None) -> int:
     s.add_argument("--batch", action="store_true", help="every function blocked by `batch`")
     s.set_defaults(func=cmd_unblock)
     sub.add_parser("verify", help="integrity of all ledgers (the green gate)").set_defaults(func=cmd_verify)
+    s = sub.add_parser("pipeline", help="stage accounting and deterministic conversion lanes")
+    stages = s.add_subparsers(dest="action", required=True)
+    ps = stages.add_parser("survey", help="supply bands, bytes and blocker families")
+    ps.add_argument("--json", action="store_true")
+    ps.set_defaults(func=None)
+    ps = stages.add_parser("plan", help="size a session to a byte target")
+    ps.add_argument("--target-kb", type=int, default=100)
+    ps.add_argument("--window-minutes", type=float, default=180.0)
+    ps.add_argument("--action-minutes", type=float, default=22.5,
+                    help='worker minutes per complete function, including all provider actions')
+    ps.add_argument("--jobs", type=int, default=8)
+    ps.add_argument("--pass-rate", help="measured yield per band, e.g. authored=0.3,lifted=0.5")
+    ps.add_argument("--json", action="store_true")
+    ps.set_defaults(func=None)
+    ps = stages.add_parser("drain", help="triage a band and optionally accept the passes")
+    ps.add_argument("--band", choices=("authored", "lifted"), default="authored")
+    ps.add_argument("--limit", type=int, default=10)
+    ps.add_argument("--min-bytes", type=int, default=0)
+    ps.add_argument("--max-bytes", type=int)
+    ps.add_argument("--jobs", type=int, default=8)
+    ps.add_argument("--accept", action="store_true", help="publish every triaged pass")
+    ps.set_defaults(func=None)
+    ps = stages.add_parser('replenish', help='prepare balanced private provider queues from live holds')
+    ps.add_argument('--output', type=Path, required=True)
+    ps.add_argument('--profiles', type=Path, required=True)
+    ps.add_argument('--slots', type=int, default=4)
+    ps.add_argument('--limit', type=int, default=48)
+    ps.add_argument('--buffer-kb', type=int, default=100)
+    ps.add_argument('--window-minutes', type=float, default=180)
+    ps.add_argument('--scalable', action='store_true', help='prepare reviewed automatic promotion contracts')
+    ps.set_defaults(func=None)
+    ps = stages.add_parser('inbox', help='inspect review, adoption and held queues')
+    ps.add_argument('directory', type=Path)
+    ps.set_defaults(func=None)
+    ps = stages.add_parser('report', help='bounded pipeline throughput, stage time and retained usage')
+    ps.add_argument('directory', type=Path)
+    ps.set_defaults(func=None)
+    ps = stages.add_parser('cancel-unstarted', help='plan or cancel unpaid C preparation after draining')
+    ps.add_argument('directory', type=Path)
+    ps.add_argument('--reason', required=True)
+    ps.add_argument('--apply', action='store_true')
+    ps.set_defaults(func=None)
+    ps = stages.add_parser('retry-precondition', help='inspect an exact side-effect-free controls ordering refusal')
+    ps.add_argument('directory', type=Path)
+    ps.add_argument('--job', required=True)
+    ps.add_argument('--reason', required=True)
+    ps.add_argument('--apply', action='store_true')
+    ps.set_defaults(func=None)
+    ps = stages.add_parser('adopted', help='record completed intake adoption and release backpressure')
+    ps.add_argument('directory', type=Path)
+    ps.add_argument('--job', required=True)
+    ps.add_argument('--receipt', type=Path, required=True)
+    ps.set_defaults(func=None)
+    ps = stages.add_parser('scale', help='adjust one live pipeline stage within provisioned capacity')
+    ps.add_argument('directory', type=Path)
+    from .pipeline_policy import STAGES
+    ps.add_argument('--stage', choices=STAGES, required=True)
+    ps.add_argument('--workers', type=int, required=True)
+    ps.add_argument('--owners', help='comma-separated provider roles for newly prepared supply jobs')
+    ps.add_argument('--execution-workers', type=int, help='shared broker execution capacity, 1..16')
+    for option in ('low-functions', 'high-functions', 'low-bytes', 'high-bytes'):
+        ps.add_argument('--' + option, type=int)
+    ps.set_defaults(func=None)
+    s.set_defaults(func=None, pipeline=True)
     s = sub.add_parser("revalidate", help="plan/revalidate accepted tiers with dependency-aware evidence reuse")
     s.add_argument("-n", type=int, default=10**9)
     s.add_argument("--refresh", action="store_true", help="re-accept passing records under the current harness")
@@ -846,6 +967,8 @@ def main(argv=None) -> int:
     pilot.add_commands(sub)
     from . import composition
     composition.add_commands(sub)
+    from . import composition_diagnostic
+    composition_diagnostic.add_commands(sub)
     from . import lift_migration
     lift_migration.add_commands(sub)
     from . import shards
@@ -869,6 +992,9 @@ def main(argv=None) -> int:
                 a.command == 'status' and a.write):
             with writer():
                 return a.func(a)
+        if a.command == 'pipeline':
+            from . import pipeline
+            return pipeline.command(a)
         return a.func(a)
     except (BusyError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

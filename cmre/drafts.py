@@ -10,6 +10,8 @@ Acceptance still comes only from `cmre test --c` / `cmre accept --c`.
 """
 from __future__ import annotations
 
+import json
+
 import csv
 import functools
 import re
@@ -494,6 +496,25 @@ def _register_inputs(insns) -> list[str]:
     return inputs
 
 
+def legacy_sources(data: dict, function: dict | None = None) -> dict[str, Path]:
+    """Authored-file references in shared and per-function frozen ledger layouts."""
+    function = function or {}
+    return {key: env.ROOT / name for key in ('source', 'header', 'entry_source')
+            if (name := function.get(key) or data.get(key))}
+
+
+def legacy_provenance(entry) -> str:
+    """Historical recovery provenance, without inventing a canonical C binding."""
+    path = env.ROOT / entry.source
+    data = json.loads(path.read_text(encoding='utf-8'))
+    references = legacy_sources(data, entry.record)
+    authored = '; '.join(f'{kind}={env.rel(source)} sha256='
+                         + (env.digest(source) if source.is_file() else 'unavailable')
+                         for kind, source in references.items()) or 'authored source unavailable'
+    return (f"frozen legacy recovery; {env.rel(path)} sha256={env.digest(path)}; "
+            f"symbol={entry.record.get('symbol', '?')}; {authored}; canonical cm_fn binding not inferred")
+
+
 def brief(va: int, asm: bool = True) -> str:
     """Everything needed to translate one function, in one compact block."""
     from . import ledger, lift, recover, semantic
@@ -513,19 +534,24 @@ def brief(va: int, asm: bool = True) -> str:
              f"{' '.join(f'{s:#010x}' for s in semantic.edx_readers(va)[:4]) or 'none'}"]
     if (env.C_DIR / f"fn_{va:08x}.c").exists():
         lines.append(f"existing C: {env.rel(env.C_DIR / f'fn_{va:08x}.c')}")
+    legacy = {entry.va: entry for entry in ledger.legacy_entries()}
+    if va in legacy:
+        entry = legacy[va]
+        lines.append(legacy_provenance(entry) + '; normal acceptance retains the legacy record')
     rec = ledger.recovered()
     for c in lifted.callees:
-        state = "C" if (env.C_DIR / f"fn_{c:08x}.c").exists() else "lifted" if c in rec else "original"
+        state = "legacy" if c in legacy else "C" if (env.C_DIR / f"fn_{c:08x}.c").exists() else "lifted" if c in rec else "original"
         lines.append(f"callee {state:8s} {prototype(c)}")
     if lifted.imports:
         lines.append("imports: " + ", ".join(lifted.imports))
     for gva, (gtype, length) in sorted(_globals_table(va).items()):
         lines.append(f"global 0x{gva:08x} {gtype or '?'} ({length} bytes)")
-    try:
-        path, problems = write(va)
-        lines.append(f"draft: {env.rel(path)}" + (f"  NEEDS-REVIEW: {', '.join(problems)[:200]}" if problems else ""))
-    except FileNotFoundError as exc:
-        lines.append(f"draft: unavailable ({exc})")
+    if va not in legacy:
+        try:
+            path, problems = write(va)
+            lines.append(f"draft: {env.rel(path)}" + (f"  NEEDS-REVIEW: {', '.join(problems)[:200]}" if problems else ""))
+        except FileNotFoundError as exc:
+            lines.append(f"draft: unavailable ({exc})")
     for p in lifted.problems:
         lines.append(f"PROBLEM {p}")
     if asm:

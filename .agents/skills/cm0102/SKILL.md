@@ -5,18 +5,12 @@ description: Routes CM0102 faithful decompilation, subsystem recovery, evidence 
 
 # CM0102 project work
 
-Read `AGENTS.md`, then `docs/agent/PLAYBOOK.md`. Follow its preflight, the first
-matching task route, worker allocation, and closure. An explicit task outranks the generic queue.
-Read the task workflow and, when provider use is authorized, the provider workflow.
-Resolve allocation before coordinator recovery work, including on continuations.
+Read `AGENTS.md`. To continue decompilation or use model credits, follow
+`docs/agent/FARM.md`: start the farm, check its status about hourly, and spend
+your own turns on its supply lane (harness families, capture, fixtures). The
+farm dispatches, tests, accepts and audits; never coordinate functions by hand.
 
-For example, a request for a readable date subsystem uses `SUBSYSTEM.md`; a
-native-port request uses `PORT.md` and its current milestone entry gate.
-Workers inherit completed parent preflight. Delegate only when authorized;
-the parent owns jobs, shared layouts, acceptance scheduling and the final gate.
-For parallel ad hoc worktrees, use the project `cm0102-coordinator` or
-`cm0102-worktree` skill for the session's role.
-
-For project continuations, select the campaign's next connected source result
-through the playbook. Use `cmre campaign plan` for bounded packet work; the
-campaign workflow owns priorities, evidence reuse and measured concurrency.
+For any other task, read `docs/agent/PLAYBOOK.md` and only the workflow its
+routing table selects; an explicit task outranks the queue. For example, a
+readable date subsystem uses `SUBSYSTEM.md`; a native-port request uses
+`PORT.md` and its current milestone entry gate.

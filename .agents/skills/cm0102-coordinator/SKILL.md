@@ -5,6 +5,8 @@ description: Coordinate CM 01/02 recovery across ad hoc Git worktrees, including
 
 # Coordinate CM 01/02 recovery
 
+Bulk MiniMax/DeepSeek translation runs through `docs/agent/FARM.md`, which needs no worktrees or coordinator. Use this skill only for by-hand isolated worktree workers.
+
 Use `F:/src/cm0102-decompiled` as the sole coordinator. Read its `AGENTS.md`, `docs/agent/PLAYBOOK.md`, `docs/agent/WORKTREES.md` and the relevant C or campaign workflow. The coordinator owns the local binary, evidence, claims, failure history and ledger; only `cmre accept` establishes recovery. Game files and analysis stay local.
 
 1. Inspect the current handoff and coordinator preflight and validation receipts. If a required revalidation is live, wait on that process; resolve failed or incomplete required coverage before recovery. Start `py -3.13 scripts/cmre_session.py start` once per parent session and require a finished green preflight. Workers inherit its receipt. Reuse matching evidence; do not launch whole-inventory revalidation merely for a new session or skill change. Preserve existing work and active claims.

@@ -4,10 +4,8 @@ Use when more than one agent session (Claude Code, Codex, or another shell-capab
 agent that reads `AGENTS.md`) works on recovery at the same time. Every role
 follows `AGENTS.md`; this page assigns who may do what so sessions never collide.
 
-For external MiniMax/Go campaigns, use [PROVIDER-CAMPAIGN.md](PROVIDER-CAMPAIGN.md)
-and [WORKTREES.md](WORKTREES.md): start with two external workers total, with
-coordinator-owned final review. The broader lane counts and shared-checkout hint
-permissions below do not expand that provider campaign's cap or C-only broker.
+MiniMax/DeepSeek translation runs through the [farm](FARM.md); this page covers
+interactive agent sessions running alongside it.
 
 ## Roles
 
@@ -113,7 +111,6 @@ the frozen bundle or precise hold artifact path.
   64 GB host: 16 jobs hit `MemoryError` (2026-11-01). 8 jobs ran 5,598 audit tiers in
   53 minutes without one (2026-11-03).
   The validation budget is in [PLAYBOOK](PLAYBOOK.md#validation-budget).
-- Measure before scaling: `cmre pilot` ([THROUGHPUT.md](THROUGHPUT.md)) per
-  configuration. Report accepted bytes per hour and review corrections; more
-  sessions without more reviewed acceptances is not progress.
+- Report accepted bytes per hour (`cmre_farm.py status`); more sessions without
+  more acceptances is not progress.
 - Tool-less chat models use task packets ([TASKS.md](TASKS.md)), not this page.

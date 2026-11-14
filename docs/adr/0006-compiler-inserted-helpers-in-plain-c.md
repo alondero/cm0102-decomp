@@ -72,4 +72,4 @@ construct MSVC lowers to it, when all of the following hold:
   and evidence.
 - Condition 4 is a new acceptance obligation. The weakness is not specific to
   x87: one flipped comparison survived the gate in 12 of 52 mutants of accepted
-  C (2026-11-03 sample, [NEXT-PHASE-PLAN.md](../agent/NEXT-PHASE-PLAN.md)).
+  C (2026-11-03 sample, [NEXT-PHASE-PLAN.md](../agent/archive/NEXT-PHASE-PLAN.md)).

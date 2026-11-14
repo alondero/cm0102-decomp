@@ -69,6 +69,38 @@ def evidence(tmp_path, monkeypatch):
                            report=report, witness=witness, reason='Named mismatch invalidates C evidence')
 
 
+@pytest.mark.parametrize('profile,source,bad_lines', [
+    ('semantic', 'int f(void) { __asm__("nop"); return 1; }', False),
+    ('abi', 'int f(void) { __asm__("nop"); return 1; }', False),
+    ('semantic', 'int f(void) { /* __asm__("nop"); */ return 1; }', False),
+    ('semantic', 'int f(void) { __asm__("nop"); return 1; }', True),
+])
+def test_semantic_assembly_withdrawal_requires_mechanical_proof(evidence, profile, source, bad_lines):
+    from cmre.source_policy import inline_assembly_lines
+    evidence.source.write_text(source)
+    record = copy.deepcopy(evidence.record)
+    record['c']['source_sha256'] = env.digest(evidence.source)
+    record['c']['validation'] = {opt: {'profile': profile} for opt in ('-O0', '-O2')}
+    write(ledger.record_path(VA), record)
+    report = json.loads(evidence.report.read_text())
+    report.update(source_sha256=env.digest(evidence.source), profile=profile)
+    write(evidence.report, report)
+    write(evidence.witness, {'kind': 'semantic-inline-assembly', 'function': record['va'],
+        'accepted_source_sha256': env.digest(evidence.source),
+        'accepted_ledger_sha256': env.digest(ledger.record_path(VA)),
+        'lines': [99] if bad_lines else inline_assembly_lines(source)})
+    if profile != 'semantic' or bad_lines or not inline_assembly_lines(source):
+        with pytest.raises(ValueError, match='Witness must pin'):
+            retract.preview(VA, evidence.reason, evidence.witness)
+        return
+    before = evidence.source.read_bytes()
+    plan = retract.preview(VA, evidence.reason, evidence.witness)
+    result = retract.apply(VA, evidence.reason, evidence.witness, plan['plan_sha256'])
+    assert result['state'] == 'applied'
+    assert evidence.source.read_bytes() == before
+    assert 'c' not in json.loads(ledger.record_path(VA).read_text())
+
+
 def test_preview_has_no_mutation_and_uses_inventory_body_bytes(evidence):
     before = ledger.record_path(VA).read_bytes()
     plan = retract.preview(VA, evidence.reason, evidence.witness)

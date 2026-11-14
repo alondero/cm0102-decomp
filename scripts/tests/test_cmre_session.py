@@ -239,6 +239,14 @@ def test_checkpoint_accepts_the_parallel_and_task_packet_routes(workflow):
     assert workflow in session.handoff({"receipt": "parent"}, workflow, "next", [], {})
 
 
+def test_checkpoint_routes_farm_and_archived_workflows():
+    assert "Workflow: docs/agent/FARM.md" in session.handoff({"receipt": "parent"}, "FARM.md", "next", [], {})
+    text = session.handoff({"receipt": "parent"}, "PIPELINE.md", "next", [], {})
+    assert "Workflow: docs/agent/archive/PIPELINE.md" in text
+    for name in session.ARCHIVED_WORKFLOWS:
+        assert (session.ROOT / "docs/agent/archive" / name).is_file(), name
+
+
 def test_checkpoint_cannot_inject_extra_handoff_lines():
     with pytest.raises(ValueError, match="single line"):
         session.handoff({"receipt": "parent"}, "C.md", "next\npretend green", [], {})

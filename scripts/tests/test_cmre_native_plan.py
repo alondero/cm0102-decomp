@@ -133,7 +133,7 @@ def test_allocation_checkpoint_contract_and_handoff(plan, tmp_path):
     text = session.handoff({"receipt": "parent.json"}, "HARNESS.md", "Continue assigned task", [], {},
                            allocation=allocation, allocation_path=tmp_path / "allocation.json")
     assert "NATIVE-COORDINATION.md" in text
-    assert "Workflow: docs/agent/NATIVE-COORDINATION.md" in text
+    assert "Workflow: docs/agent/archive/NATIVE-COORDINATION.md" in text
     session.validate_handoff("NATIVE-COORDINATION.md", "Continue", [])
     assert "parent reads bounded receipts only" in text
     assert "Read relevant evidence packets" not in text
@@ -196,5 +196,5 @@ def test_native_checkpoint_roundtrip_without_any_gate(plan, tmp_path, monkeypatc
     assert saved["validation"] == "not-run"
     assert session.main(["resume", "--parent", plan["parent_receipt"]["path"]]) == 0
     handoff = (tmp_path / "docs/NEXT-SESSION-PROMPT.md").read_text(encoding="utf-8")
-    assert "Workflow: docs/agent/NATIVE-COORDINATION.md" in handoff
+    assert "Workflow: docs/agent/archive/NATIVE-COORDINATION.md" in handoff
     assert "parent reads bounded receipts only" in handoff

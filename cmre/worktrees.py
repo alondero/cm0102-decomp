@@ -284,20 +284,56 @@ def _record_attempts(va: int, manifest: dict) -> None:
                     report=report, event_id=event, preserve_hold=True)
 
 
+def _report_feedback(report: dict) -> dict:
+    """Expose a bounded failure without requiring access to another report file."""
+    feedback = {'report_status': report['status'], 'first_failure': None}
+    if report['status'] == 'pass':
+        return feedback
+    failure = None
+    if report.get('problems'):
+        failure = {'kind': 'problem', 'detail': str(report['problems'][0])}
+    else:
+        for opt, built in sorted(report.get('builds', {}).items()):
+            if built.get('status') == 'pass':
+                continue
+            if built.get('status') == 'build-failed':
+                failure = {'kind': 'build-failed', 'opt': opt,
+                           'detail': built.get('stderr') or built.get('detail') or 'Compilation failed'}
+            else:
+                tested = built.get('difftest', {})
+                if tested.get('mismatches'):
+                    mismatch = tested['mismatches'][0]
+                    failure = {'kind': 'mismatch', 'opt': opt, 'case': mismatch.get('case'),
+                               'detail': json.dumps(mismatch)}
+                else:
+                    failure = {'kind': 'difftest', 'opt': opt,
+                               **{k: tested[k] for k in ('coverage', 'inconclusive', 'code_as_data_cases')
+                                  if k in tested},
+                               'detail': 'Validation gate failed; inspect the numbered report for gate details'}
+            break
+    if failure is None:
+        failure = {'kind': report['status'], 'detail': 'Validation failed; inspect the numbered report'}
+    failure['detail'] = failure['detail'].strip()[:600]
+    feedback['first_failure'] = failure
+    return feedback
+
+
 def _export_report(worker: Path, state: dict, va: int, manifest: dict, *, restore: bool = False) -> dict:
     entry = _entry(state, va)
     attempt = manifest['attempts'][-1]
+    feedback = {}
     if 'report_path' in attempt:
         report_bytes = (env.ROOT / attempt['report_path']).read_bytes()
         if env.digest_bytes(report_bytes) != attempt['report_sha256']:
             raise ValueError('Authoritative report changed')
+        feedback = _report_feedback(json.loads(report_bytes))
         entry['report'] = (LOCAL / f'fn_{va:08x}' / f"report-{attempt['number']}.json").as_posix()
         local = _file(worker, entry['report'])
         if local.exists() and not restore and env.digest(local) != attempt['report_sha256']:
             raise ValueError('Worker report changed; coordinator sync is required to restore it')
         coordination.atomic_bytes(local, report_bytes)
     _save(worker, state)
-    return _result(entry, manifest)
+    return {**_result(entry, manifest), **feedback}
 
 
 def submit(worker: Path, va: int, *, binding: str | None = None) -> dict:
@@ -478,4 +514,6 @@ def command(a) -> int:
     if a.action == 'bootstrap':
         result = {k: result[k] for k in ('schema', 'worker', 'coordinator')}
     print(json.dumps(result, indent=2))
+    if 'report_status' in result and result['report_status'] != 'pass':
+        return 1
     return 1 if result.get('status') in ('claimed', 'exhausted', 'publication-failed') and a.action != 'claim' else 0

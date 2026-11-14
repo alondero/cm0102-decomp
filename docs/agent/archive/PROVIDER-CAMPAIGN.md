@@ -1,39 +1,127 @@
-# Run a 150-minute provider campaign
+# Provider-assisted recovery
 
-Use this workflow for an explicitly requested timed campaign using MiniMax and
-OpenCode Go. Optimize reviewed accepted C bytes and connected behavior per unit of
-coordinator effort. [CAMPAIGN.md](CAMPAIGN.md) owns dependency closure;
+Use this workflow whenever MiniMax/DeepSeek use is authorized for a recovery batch
+or continuation. Optimize reviewed accepted C bytes and connected behavior per unit
+of coordinator effort. The timed schedule below applies only when requested.
+For explicitly requested direct OpenCode subagents, follow
+[native dispatch](OPENCODE-DIRECT.md) while retaining this intake and closing reserve.
+For the provider-owned architecture, start with
+[PROVIDER-CONTROLLER.md](PROVIDER-CONTROLLER.md): DeepSeek owns investigation,
+MiniMax owns C authoring, the other provider reviews, and Python supervises the
+existing gates. Its manifest supplies the explicitly authorized duration.
+The manual coordination procedure below remains available for scoped exceptions.
+[CAMPAIGN.md](CAMPAIGN.md) owns dependency closure;
 [WORKTREES.md](WORKTREES.md) owns isolated C workers;
 [THROUGHPUT.md](THROUGHPUT.md) owns measurement. The fidelity rules and validation
 budget in [PLAYBOOK.md](PLAYBOOK.md) remain authoritative.
 
 ## Roles and authority
 
+For explicitly authorized coordination-only native work,
+[NATIVE-COORDINATION.md](NATIVE-COORDINATION.md) replaces the roles, parent technical
+execution and initial worker limit below. It retains this workflow's evidence,
+failure budgets and validation requirements. No timed campaign is implied.
+
 | Role | Default assignment | Owns | Returns |
 | --- | --- | --- | --- |
-| Coordinator / family owner | Codex | Campaign selection, original-instruction contracts, difficult ABI/x87/alias/fault questions, shared inputs, independent final review, serial acceptance, gates and retro | Accepted evidence or a named unresolved obligation |
+| Coordinator / family owner | DeepSeek through the durable controller | Original evidence, input investigation, probe selection and provider repair loops; Python owns gates and serial acceptance | Reviewed bundle or retained escalation |
 | Translator | MiniMax initially | Exact eligible functions with prepared evidence; edits only the assigned C files | Broker report path and concise instruction rationale, or an evidence-bound hold |
-| Preliminary reviewer / second worker | DeepSeek Go initially | Independent source/evidence review, second opinions, or disjoint translation when supply permits | Exact source/report identities, discrepancies and evidence; never acceptance |
+| Independent reviewer / second worker | Other actual provider model | Exact source, complete emitted code and evidence review; disjoint translation when supply permits | Frozen bundle verdict or evidence-bound revision; Python accepts separately |
 | Input proposal author | Either external provider, as a bounded trial | Private original-derived input/layout proposals for one blocker family | Reproducible evidence and proposed fixtures, with unknowns explicit |
 
-Start with at most **two external provider workers total**, including reviewers
-and proposal authors. Role assignments are hypotheses: both providers passed small
+For unqualified ordinary scopes, start with at most **two external provider workers total**,
+including reviewers and proposal authors. For user-authorized pipeline capacity,
+use the measured isolated pool and replenishment procedure in [PIPELINE.md](PIPELINE.md). Role assignments are hypotheses: both providers passed small
 translation pilots; neither has established broad input-authoring or review
-quality. The coordinator independently checks their evidence before adoption.
+quality. Input adoption requires independent review of its exact evidence.
 Use a different author for review; a worker cannot approve its own candidate.
 Increase concurrency only after a measured cohort shows prepared supply and review
 capacity, within the user's authorization. Use native helper agents only when
 the task or selected skill authorizes them; record their costs when observed.
 They do not stand in for the requested provider.
 
-The worktree broker covers accepted lifts without accepted C, at most 600 body
-bytes. Larger, held and unlifted functions use the coordinator's selected C,
-triage or control workflow. Input authors produce private proposals; they do not
+The worktree broker defaults to accepted lifts without accepted C, at most 600 body
+bytes. Controller C tasks can use an explicit larger packet limit with the same
+gate and lifetime attempt budget. Held and unlifted functions retain their input,
+triage or control obligations. Input authors produce private proposals; they do not
 edit canonical hints, change the harness, claim C tasks or run `worktree test` for
-ineligible functions. The coordinator adopts reviewed inputs at a boundary and
-validates affected evidence. Every writer has explicit ownership and paths.
+ineligible functions. The finite workflow adopts inputs at a boundary. The
+continuous [pipeline supervisor](PIPELINE.md) checks exact reviewed resolutions,
+preserves inputs and runs native acceptance before replenishing C automatically.
+Every writer has explicit ownership and paths.
+For selected computation controls, read [CONTROL-PLANS.md](CONTROL-PLANS.md).
+Its `controls-complete` outcome retains bundle proposal readiness; report ordinary
+C acceptance separately under [C.md](C.md).
 
-## Start and freeze the run
+## Batch intake
+
+1. Read the current user instructions and inherited worker-allocation record.
+   Preserve authorization within its scope. A record describes that authorization;
+   it cannot grant permission. Resume the parent preflight and complete
+   [recovery intake](HARNESS.md#recovery-intake). Completion: the authorized scope,
+   available budget and any required dispatch gate are explicit.
+2. Prepare bounded work using the roles above: eligible C translations, private
+   input proposals or independent preliminary reviews. Use at most two external
+   workers initially. Give every assignment an exact task, evidence, writable
+   paths and falsifiable result. If useful work cannot start, record the blocker
+   and retry condition. Completion: prepared assignments or an evidence-bound hold.
+3. Follow [PROVIDER-WORKERS.md](PROVIDER-WORKERS.md) for fresh scoped smoke, dispatch,
+   terminal collection and accounting. Start finite pilot measurement before
+   recovery work under [THROUGHPUT.md](THROUGHPUT.md). While workers run, the parent
+   validates another ready result or resolves the next evidence gap.
+   Completion before coordinator implementation: dispatch receipts, or a named
+   hold explaining zero dispatch. Pending assignments are preparation, not dispatch.
+4. Retain allocation separately from the task workflow in a local JSON record.
+   Establish or update it with:
+
+   ```powershell
+   py -3.13 scripts/cmre_session.py checkpoint --parent RECEIPT --workflow C.md --next "Continue the selected source slice" --allocation ALLOCATION.json
+   ```
+
+   A minimal preparation record is:
+
+   ```json
+   {
+     "schema": "cmre-worker-allocation/1",
+     "mode": "providers",
+     "authorization": "Reference the user's instruction authorizing this scope",
+     "assignments": [
+       {"provider": "minimax", "task": "fn_XXXXXXXX: bounded input proposal", "state": "pending"}
+     ]
+   }
+   ```
+
+   Replace the example task with the actual assignment. States are `pending`,
+   `running`, `completed` and `held`. Running/completed entries require `receipt`
+   naming an existing file, using an absolute or repository-relative path. This
+   checks navigation availability; the provider workflow still verifies the
+   receipt's actual state, model and scope. Held entries require `reason` and
+   `retry_when`. An empty provider assignment list requires those two fields at
+   the top level. `mode: "solo"` uses an empty list, identifies the current solo
+   scope in `authorization`, and requires `reason` and `retry_when`. Keep credentials
+   outside this record. The record is bounded to 64 KiB and 20 retained assignments;
+   that storage bound does not authorize additional concurrent workers.
+
+   Each checkpoint snapshots the record as `worker-allocation.json` and retains
+   it in its receipt. Subsequent checkpoints inherit this parent's latest finished
+   snapshot when `--allocation` is omitted. Resume checks snapshot consistency and
+   prints the mode/path. Use an explicit new record to change scope, authorization
+   or assignments; a missing legacy record becomes `unresolved`, never assumed solo.
+   For a new parent session, supply the handoff's allocation via `--allocation` on
+   its first checkpoint; automatic inheritance stays within one parent.
+   Recheck live receipts and refresh pending work at each batch: a completed old
+   assignment does not supply a new batch. Completion: the handoff preserves both
+   task workflow and allocation without copying provider setup into every prompt.
+
+For an ordinary batch, follow the existing task workflow and validation budget,
+then drain workers, reconcile usage/review and close the parent gate. The sections
+on coordinator effort and measurement below apply to ordinary batches too. Run a
+retro when requested. A continuation alone does not start a 150-minute campaign.
+
+## Timed campaigns (only when requested)
+
+The remaining time allocation and end-of-run retro apply to an explicitly
+requested 150-minute campaign. Complete batch intake above as part of this run.
 
 1. Resume the inherited green parent receipt, or start once when none applies.
    Inspect live claims, required gates and current source hashes; preserve other
@@ -56,7 +144,8 @@ validates affected evidence. Every writer has explicit ownership and paths.
    another finite pilot and retain both, rather than rewriting its baseline.
 5. Verify client/version, account and exact model through the selected endpoint.
    Follow [PROVIDER-WORKERS.md](PROVIDER-WORKERS.md) for actual headless read/write
-   permission smoke checks and local credentials. Freeze harness, headers,
+   machine-checked scoped smoke, terminal collection and pre-finish adoption
+   accounting, plus local credentials. Freeze harness, headers,
    comparison policy and declared inputs before recovery. A needed harness change
    becomes a separate release under HARNESS.md; it does not waive revalidation.
 
@@ -140,10 +229,12 @@ saved, including its useful capacity when MiniMax is constrained.
 
 ## End with the user-requested retro
 
-The **coordinator** applies the installed `retro` skill after recovery stops; the
-user explicitly requested this end-of-run step. Discover its `SKILL.md` rather
-than assuming a worker has a skill tool. Known local locations are
-`~/.claude/skills/retro/SKILL.md` and `~/.agents/skills/retro/SKILL.md`. Read it and
+When the user requests a retro, the **coordinator** applies the installed `retro`
+skill after recovery stops. Invoke a user-named skill through the parent harness's
+skill tool first, even if its advertised catalog omits it; native OpenCode resolved
+`retro` this way. For a harness without that tool, known local locations are
+`~/.claude/skills/retro/SKILL.md` and `~/.agents/skills/retro/SKILL.md`, subject to
+normal filesystem permissions. Read it and
 its writing guide, then use the run's primary receipts/logs. Its manual-invocation
 metadata is not permission for external workers to self-invoke it or edit policy.
 If unavailable, retain the finding and report retro incomplete; do not invent it.

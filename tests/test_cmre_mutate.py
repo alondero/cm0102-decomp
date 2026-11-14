@@ -172,3 +172,29 @@ def test_mutate_reuses_guard_worker_source_check(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match='worker-bound sources'):
         with cli._diagnostic_source(0x401000, source):
             pass
+
+
+def test_claim_owner_may_run_explicit_diagnostics(tmp_path, monkeypatch):
+    # The farm claims a function, then its worker tests a scratch source under that claim.
+    from cmre import cli
+    env, work, recover = _cli_workspace(tmp_path, monkeypatch)
+    monkeypatch.setattr(work, 'claims', lambda: {'fn_00401000': {'owner': 'farm-x'}})
+    scratch = tmp_path / 'scratch' / 'fn_00401000.c'
+    scratch.parent.mkdir()
+    scratch.write_text('int f(void) { return 0; }', encoding='utf-8')
+    monkeypatch.setenv('CMRE_CLAIM_OWNER', 'farm-x')
+    with cli._diagnostic_source(0x401000, scratch) as resolved:
+        assert resolved == scratch.resolve()
+
+
+def test_other_claim_owner_still_refused(tmp_path, monkeypatch):
+    import pytest
+    from cmre import cli
+    env, work, recover = _cli_workspace(tmp_path, monkeypatch)
+    monkeypatch.setattr(work, 'claims', lambda: {'fn_00401000': {'owner': 'farm-x'}})
+    scratch = tmp_path / 'scratch.c'
+    scratch.write_text('int f(void) { return 0; }', encoding='utf-8')
+    monkeypatch.setenv('CMRE_CLAIM_OWNER', 'someone-else')
+    with pytest.raises(ValueError, match='shared claim'):
+        with cli._diagnostic_source(0x401000, scratch):
+            pass

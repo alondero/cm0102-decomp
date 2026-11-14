@@ -168,17 +168,27 @@ def _load(task_id: str) -> dict:
     return manifest
 
 
+def _inputs_at_limit(va: int, maximum: int) -> dict:
+    if type(maximum) is not int or not 1 <= maximum <= 1_048_576:
+        raise ValueError('Explicit task body limit must be 1..1048576 bytes')
+    inputs = _inputs(va)
+    if maximum != MAX_BODY_BYTES:
+        inputs = {**inputs, 'policy': {**inputs.get('policy', {}), 'max_body_bytes': maximum}}
+    return inputs
+
+
 def validate_current(manifest: dict) -> None:
-    if _hash(_inputs(int(manifest["va"], 16))) != manifest["input_fingerprint"]:
+    maximum = manifest.get('policy', {}).get('max_body_bytes', MAX_BODY_BYTES)
+    if _hash(_inputs_at_limit(int(manifest["va"], 16), maximum)) != manifest["input_fingerprint"]:
         raise ValueError("Stale task inputs; prepare a new packet")
 
 
-def prepare(va: int) -> dict:
+def prepare(va: int, *, max_body_bytes: int = MAX_BODY_BYTES) -> dict:
     """Freeze complete instruction evidence for one accepted lifted function."""
     if type(va) is not int or not 0 <= va <= 0xFFFFFFFF:
         raise ValueError("Invalid function VA")
     with coordination.writer():
-        inputs = _inputs(va)
+        inputs = _inputs_at_limit(va, max_body_bytes)
         fingerprint = _hash(inputs)
         task_id = f"c-{va:08x}-{fingerprint[:16]}"
         directory = task_dir(task_id)
@@ -187,8 +197,8 @@ def prepare(va: int) -> dict:
             if (directory / "task.json").exists():
                 return status(task_id)
             function = inventory.load().functions[va]
-            if function.body_bytes > MAX_BODY_BYTES:
-                raise ValueError(f"Initial C task lane is bounded to {MAX_BODY_BYTES} body bytes")
+            if function.body_bytes > max_body_bytes:
+                raise ValueError(f"C task lane is bounded to {max_body_bytes} body bytes")
             lifted = lift.discover(va)
             if lifted.problems:
                 raise ValueError(f"Unresolved lift boundaries: {lifted.problems}")
@@ -226,7 +236,7 @@ def prepare(va: int) -> dict:
                             "note": "Scheduling signal only, not proof of ABI or semantic simplicity. "
                                     "If ABI cannot be established from instructions, submit evidence-needed."},
                 "policy": {"max_attempts": MAX_ATTEMPTS,
-                           "max_body_bytes": MAX_BODY_BYTES,
+                           "max_body_bytes": max_body_bytes,
                            "validation": f"py -3.13 -m cmre task submit {task_id} --owner OWNER --token TOKEN",
                            "gate": "unchanged C differential gate, both O0/O2; coordinator accepts separately"},
                 "lease": None, "attempts": [], "journal": [],

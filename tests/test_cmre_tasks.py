@@ -59,6 +59,41 @@ def test_packet_is_deduplicated_complete_and_does_not_disclose_lease(workspace):
     assert not (env.C_DIR / "fn_00401000.c").exists()
 
 
+def test_explicit_larger_lane_preserves_default_packets_and_unchanged_gate(workspace, monkeypatch):
+    normal = tasks.prepare(VA)
+    assert normal['input_fingerprint'] == tasks._hash(tasks._inputs(VA))
+    tasks.inventory.load().functions[VA].body_bytes = 900
+    # Existing default packet can be reused, but a new default packet refuses
+    # an oversized function; explicit size policy has a distinct identity.
+    larger = tasks.prepare(VA, max_body_bytes=1024)
+    assert larger['task_id'] != normal['task_id']
+    assert larger['policy']['max_body_bytes'] == 1024
+    assert larger['policy']['max_attempts'] == normal['policy']['max_attempts'] == 5
+    tasks.validate_current(larger)
+    workspace['harness'] = 'changed'
+    with pytest.raises(ValueError, match='bounded to 600'):
+        tasks.prepare(VA)
+    with pytest.raises(ValueError, match='Stale'):
+        tasks.validate_current(larger)
+
+
+@pytest.mark.parametrize('maximum', [True, 0, -1, 1_048_577, 600.0])
+def test_explicit_task_lane_rejects_invalid_policy(workspace, maximum):
+    with pytest.raises(ValueError, match='body limit'):
+        tasks.prepare(VA, max_body_bytes=maximum)
+
+
+def test_larger_packet_does_not_reset_function_attempt_budget(workspace, monkeypatch):
+    first = tasks.prepare(VA)
+    claimed = tasks.claim(first['task_id'], 'worker')
+    for _ in range(5):
+        tasks.submit(first['task_id'], 'worker', claimed['lease']['token'], outcome='failed')
+    monkeypatch.setattr(tasks.time, 'time', lambda: claimed['lease']['expires_at'] + 1)
+    larger = tasks.prepare(VA, max_body_bytes=1024)
+    with pytest.raises(ValueError, match='five-attempt'):
+        tasks.claim(larger['task_id'], 'worker')
+
+
 def test_claim_rejects_live_lease_and_wrong_token(workspace):
     manifest, _ = leased()
     with pytest.raises(ValueError, match="live lease"):

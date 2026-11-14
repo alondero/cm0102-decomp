@@ -17,16 +17,16 @@ Original files may remain inputs to local extraction and differential tests.
 
 ## How to work (read this, then the playbook)
 
-For authorized **coordination-only native** work (including the current next-session
-directive), first read [NATIVE-COORDINATION](docs/agent/NATIVE-COORDINATION.md).
-Its expert steward executes preflight and gates below; the parent only coordinates
-and consumes bounded receipts. All substantive work is delegated.
+To continue decompilation or use model credits, run the
+[recovery farm](docs/agent/FARM.md): a script keeps many MiniMax/DeepSeek workers
+translating, gate-testing and accepting; expert sessions work its supply lane.
+In OpenCode, the `cm-coordinator` agent runs it (FARM.md "OpenCode coordinator").
 
 1. Run `py -3.13 scripts/cmre_session.py start` once per parent session: doctor,
    status, baseline pytest, with an exit-code receipt. Resumes reuse that receipt;
    workers inherit it. Use `py -3.13` for all Python commands.
-2. Route the task and worker allocation through [docs/agent/PLAYBOOK.md](docs/agent/PLAYBOOK.md).
-   Read the task workflow and any authorized provider workflow. Explicit tasks take priority over queued work.
+2. Route other tasks through [docs/agent/PLAYBOOK.md](docs/agent/PLAYBOOK.md).
+   Explicit tasks take priority over queued work.
 3. Run `py -3.13 scripts/cmre_session.py check` at batch and handoff boundaries,
    not after each accept ([validation budget](docs/agent/PLAYBOOK.md#validation-budget)).
    Green means **both pytest and cmre verify exit 0**. Report baseline failures as
@@ -34,12 +34,12 @@ and consumes bounded receipts. All substantive work is delegated.
 
 Use live `cmre status` for counts. For continuation, assess the local
 [docs/NEXT-SESSION-PROMPT.md](docs/NEXT-SESSION-PROMPT.md) against the baseline when
-present. This handoff stays local; use the campaign workflow when it is absent.
+present. This handoff stays local; run the farm when it is absent.
 For session reviews, consult relevant sections of `docs/HISTORY.md` and local
 transcripts; routine recovery uses `cmre show`, `explain`, and `next`.
 
-For project continuations, prioritize accepted C and dependency closure for one
-observable game behavior through [docs/agent/CAMPAIGN.md](docs/agent/CAMPAIGN.md).
+For project continuations, maximize accepted C bytes through the farm; composition
+and runtime checkpoints follow [docs/agent/CAMPAIGN.md](docs/agent/CAMPAIGN.md).
 Report accepted C/legacy bytes, lift-inclusive recovery, composed calls and live
 integration separately. Reuse unchanged evidence; add checks for a named gap.
 
@@ -79,9 +79,10 @@ integration separately. Reuse unchanged evidence; add checks for a named gap.
   a source extension does not turn a raw dump into authored reconstruction.
 - Supplied executables/media, original or extracted game content, credentials
   and raw analysis stay local, outside published history and packages.
-- Commit reviewed batches using explicit paths when requested. Push only when
-  requested, after the publication workflow scans the exact commit and reachable
-  history for the intended remote. Reuse authorization for that batch.
+- Adam's standing authorization (2026-11-14): commit and push repo-worthy,
+  reviewed batches as work progresses, using explicit paths. Before every push,
+  the publication workflow must scan the exact commit and reachable history for
+  the intended remote. Keep excluded content and unresolved source defects local.
   `cmre task publish` remains local acceptance, separate from Git publication.
 - Preserve accepted source bytes and evidence while resolving scanner findings.
   For source reviews, scans, evidence retention and pushes, follow

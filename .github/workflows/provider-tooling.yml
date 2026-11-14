@@ -1,0 +1,25 @@
+﻿name: Provider tooling (no game assets)
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fake-process-regressions:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install test dependencies
+        run: py -3.13 -m pip install pytest==9.0.3 capstone==5.0.9 unicorn==2.1.4 pefile==2024.8.26 numpy==2.4.4
+      - name: Exercise provider coordination without game assets or provider access
+        run: |
+          $providerTests = @(Get-ChildItem tests -File | Where-Object { $_.Name -like 'test_provider_*.py' -or $_.Name -like 'test_pipeline*.py' } | ForEach-Object { $_.FullName })
+          py -3.13 -m pytest $providerTests scripts/tests/test_cmre_provider_worker.py scripts/tests/test_cmre_session.py tests/test_cmre_worktrees.py tests/test_cmre_tasks.py tests/test_cmre_retract.py tests/test_cmre_composition_diagnostic.py tests/test_cmre_pipeline_stages.py scripts/tests/test_cmre_provider_slots.py scripts/tests/test_cmre_hint_check.py scripts/tests/test_cmre_native_plan.py scripts/tests/test_cmre_farm.py -q

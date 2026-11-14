@@ -5,9 +5,10 @@ Use the native C loop, work-state registry and family index. The retired
 `CM0102/Analysis/workflow-upgrade-20261020/retired/`; they are not a second source
 of scheduling truth. `cmre task` remains optional for tool-less workers only.
 
-For a timed multi-provider run, use [PROVIDER-CAMPAIGN.md](PROVIDER-CAMPAIGN.md):
-it defines the 150-minute budget, roles, supply checks, closing reserve and
-coordinator-led retro. The measurement rules here apply inside that workflow.
+For authorized provider work, use [PROVIDER-CAMPAIGN.md](PROVIDER-CAMPAIGN.md):
+it defines ordinary batch allocation and, when requested, the timed schedule,
+closing reserve and coordinator-led retro. The measurement rules here apply
+inside that workflow.
 
 ## Select comparable work
 
