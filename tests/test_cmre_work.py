@@ -1,4 +1,6 @@
 from types import SimpleNamespace
+import json
+import time
 
 import pytest
 
@@ -191,6 +193,54 @@ def test_shared_claim_respects_hard_hold(workspace):
     work.update(va, 'harness-blocker', 'Fault', 'Investigate fault')
     with pytest.raises(ValueError, match='hold|retry'):
         work.claim([va], 'worker')
+    assert not work.claims()
+
+
+@pytest.mark.parametrize("state", ["needs-review", "harness-blocker", "evidence-needed"])
+def test_explicit_held_claim_preserves_hold_and_source(workspace, state):
+    va = 0x401000
+    source = env.C_DIR / "fn_00401000.c"
+    source.write_text("/* retained unaccepted source */")
+    work.update(va, state, "inspect source", "review original listing")
+    before = work.read()
+    result = work.claim([va], "farm-held", include_held=True)
+    assert result["fn_00401000"]["owner"] == "farm-held"
+    assert work.read() == before
+    assert source.read_text() == "/* retained unaccepted source */"
+
+
+def test_explicit_held_claim_keeps_other_owner_exclusion(workspace):
+    va = 0x401000
+    work.update(va, "needs-review", "inspect source", "review original listing")
+    work.claim([va], "first", include_held=True)
+    with pytest.raises(ValueError, match="claimed by first"):
+        work.claim([va], "second", include_held=True)
+    assert work.claims()["fn_00401000"]["owner"] == "first"
+
+
+def test_explicit_held_claim_does_not_reset_attempt_budget(workspace, monkeypatch):
+    from cmre import tasks
+    va = 0x401000
+    work.update(va, "needs-review", "inspect source", "review original listing")
+    before = work.read()
+    monkeypatch.setattr(tasks, "attempts_used", lambda *args: tasks.MAX_ATTEMPTS)
+    with pytest.raises(ValueError, match="five|budget|exhaust"):
+        work.claim([va], "farm-held", include_held=True)
+    assert work.read() == before
+    assert not work.claims()
+
+
+def test_explicit_held_claim_respects_live_task_lease(workspace):
+    va = 0x401000
+    work.update(va, "harness-blocker", "inspect source", "review original listing")
+    manifest = env.ANALYSIS / "cmre/tasks/c-00401000-held/task.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({
+        "status": "claimed", "attempts": [],
+        "lease": {"owner": "packet-worker", "expires_at": time.time() + 3600},
+    }))
+    with pytest.raises(ValueError, match="live task lease"):
+        work.claim([va], "farm-held", include_held=True)
     assert not work.claims()
 
 

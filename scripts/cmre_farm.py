@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -585,6 +586,30 @@ class Farm:
             job['source'] = str(self.run_dir / 'src' / f'{fn}.c')
         return job
 
+    def _resume_seed(self, fn):
+        """An interrupted candidate is a hash-bound draft, never gate evidence."""
+        manifest = self.run_dir / 'resume-candidates.json'
+        if not manifest.exists():
+            return None
+        try:
+            data = json.loads(manifest.read_text(encoding='utf-8'))
+            if data.get('schema') != 'cmre-farm-resume-candidates/1':
+                raise ValueError('unsupported resume-candidate schema')
+            row = data.get('sources', {}).get(fn)
+            if not row:
+                return None
+            source = (self.run_dir / row['path']).resolve()
+            if not source.is_relative_to(self.run_dir.resolve()):
+                raise ValueError('resume candidate escapes run directory')
+            content = source.read_bytes()
+            if hashlib.sha256(content).hexdigest() != row['sha256']:
+                raise ValueError('resume candidate hash mismatch')
+            self._event('resume-candidate', fn=fn, sha256=row['sha256'])
+            return content
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self._event('resume-rejected', fn=fn, reason=str(exc)[:300])
+            return None
+
     def _launch(self, job):
         c_path = self.root / 'recovery/c' / f"{job['fn']}.c"
         hint_path = self.root / 'recovery/hints' / f"{job['fn']}.json"
@@ -604,12 +629,17 @@ class Farm:
             if seed is None and job['kind'] == 'translate' and not job.get('prior') and job['_snap']['c'] is not None:
                 seed = job['_snap']['c']
                 job['seeded'] = True
+            if seed is None and job['kind'] == 'translate' and not job.get('prior'):
+                seed = self._resume_seed(job['fn'])
+                if seed is not None:
+                    job['seeded'] = True
             _restore(source, seed)
             job['_seed_bytes'] = seed
             prompt = fix_prompt(self.root, job) if job['kind'] == 'fix' else translate_prompt(self.root, job)
         handle = self.launcher.start(job, prompt, worker_config(self.root, job))
         self.running.append((job, handle, self.clock()))
         self._event('dispatch', fn=job['fn'], kind=job['kind'], model=job['model'], n=job['n'])
+        self.save()  # large first dispatch must not look dead to the event monitor
 
     def _bundle(self, job):
         """Write the job's bundle file; None (classic prompt) when the brief is unavailable."""
@@ -944,6 +974,7 @@ class Farm:
         self.save()
 
     def run(self, poll=10.0):
+        self.save()
         self._event('farm-start', pid=os.getpid(), workers=self.config.workers,
                     audit_workers=self.config.audit_workers, ladder=self.config.ladder)
         try:
@@ -1150,8 +1181,9 @@ def status_line(s):
 class CmreAdapter:
     """Selection and claims through the Python API; gate and acceptance through the CLI."""
 
-    def __init__(self, root=ROOT):
+    def __init__(self, root=ROOT, *, include_held=False):
         self.root = Path(root)
+        self.include_held = include_held
 
     def _cli(self, *args, timeout=1800):
         result = subprocess.run(['py', '-3.13', '-m', 'cmre', *args], cwd=self.root, capture_output=True,
@@ -1167,7 +1199,7 @@ class CmreAdapter:
     def claim(self, fn, owner, hours):
         from cmre import coordination, work
         try:
-            work.claim([int(fn[3:], 16)], owner, hours)
+            work.claim([int(fn[3:], 16)], owner, hours, include_held=self.include_held)
         except coordination.BusyError as exc:   # another farm is claiming or testing it right now
             raise ValueError(str(exc)) from exc
 
@@ -1569,7 +1601,8 @@ def main(argv=None):
     (run_dir / 'STOP').unlink(missing_ok=True)
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=max(1, a.verify_threads)) as verifier:
-        f = Farm(run_dir, ROOT, CmreAdapter(), make_launcher(a.opencode, ROOT, run_dir), config, verifier=verifier)
+        f = Farm(run_dir, ROOT, CmreAdapter(include_held=a.include_held),
+                 make_launcher(a.opencode, ROOT, run_dir), config, verifier=verifier)
         f.run(poll=a.poll)
     print(status_line(f.summary()))
     return 0

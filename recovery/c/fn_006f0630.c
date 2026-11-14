@@ -1,4 +1,16 @@
-/* WIP: regs (EDX) mismatch, case 134 */
+/* fn_006f0630 -- preferred-image VA 0x006f0630, image base 0x00400000.
+ *
+ * Convention: ECX is read before written, so ECX is the receiver (`this`).
+ * The callers read EDX after the call (0x006c5023), so the result is the
+ * 64-bit pair EDX:EAX; the routine returns that pair.
+ *
+ * EDX is an *input* on the path that leaves the body at 0x006f0960 (the
+ * `[self+0x19e] == 0` early exit): the original never writes EDX there, so
+ * the value the caller sees in EDX is the EDX it passed in.  Plain C cannot
+ * read the incoming EDX through a thiscall receiver, so EDX is taken as the
+ * second (fastcall) register argument and returned unchanged on that path.
+ * Every other path writes EDX explicitly and its value is reproduced.
+ */
 #include "cmre.h"
 
 /* Field access by byte offset from an object address. Every access is volatile
@@ -13,7 +25,7 @@
    argument; the callee pops it. Only AX is compared (cmp ax, 1). */
 extern u16 CM_THISCALL cm_fn_006c38c0(u32 recv, u32 arg);
 
-unsigned long long CM_THISCALL cm_fn_006f0630(u32 self)
+unsigned long long CM_FASTCALL cm_fn_006f0630(u32 self, u32 edx_in)
 {
     u32 p;
     u32 q;
@@ -35,10 +47,10 @@ unsigned long long CM_THISCALL cm_fn_006f0630(u32 self)
 
     p = OBJ_U32(self, 0x19e);
     if (p == 0) {
-        /* Exit at 0x6f063e -> 0x6f0962. EAX is 0 here, but the original returns the
-           caller's entry EDX, which this routine never writes. Plain C cannot name
-           that value; `0` below is a placeholder, not evidence (WIP). */
-        return 0;
+        /* 0x006f0636 loads EAX with the null pointer and 0x006f063e jumps
+           straight to the epilogue: EAX is 0 and EDX still holds the
+           caller's EDX, which this routine never writes. */
+        return ((unsigned long long)edx_in << 32);
     }
     q = OBJ_U32(p, 0xf582);
     if (q != 0) {
@@ -113,6 +125,8 @@ unsigned long long CM_THISCALL cm_fn_006f0630(u32 self)
             p = OBJ_U32(self, 0x19e);
             idx = (u32)(s32)(s8)al;
             if (OBJ_U8(p + idx, 0x1a5) == 0) {
+                /* neg al / sbb eax,eax / and eax,0xb4 keeps 0xb4 for a
+                   non-zero AL and 0 otherwise. */
                 OBJ_U16(self, 0x19a) = (al != 0) ? 0xb4 : 0;
                 OBJ_U8(p, 0x8ea9) = 0xff;
             }
