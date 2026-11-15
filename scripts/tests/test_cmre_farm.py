@@ -1301,6 +1301,63 @@ def test_a_limited_provider_falls_through_to_another_providers_rung(root, monkey
     assert [r['model'] for r in f.state['attempts']['fn_00401000']] == ['mm/b']
 
 
+@pytest.mark.parametrize('source, accepted', [(GOOD, True), (GOOD.replace('a + 1', 'a + 2'), False)])
+def test_default_terra_lane_works_when_other_providers_are_limited(root, monkeypatch, source, accepted):
+    monkeypatch.setattr(farm.time, 'time', lambda: 1000.0)
+    f, cmre, launcher = make(root, [item('fn_00401000')], writes(source), workers=1,
+                             ladder=list(farm.DEFAULT_LADDER), audit_workers=1,
+                             audit_model=farm.DEFAULT_AUDIT_MODEL,
+                             confirm_model=farm.DEFAULT_CONFIRM_MODEL)
+    f.state['limited_providers'] = {
+        provider: {'until': 4600, 'message': 'quota exhausted'}
+        for provider in ('opencode-go', 'minimax-coding-plan')}
+    drain(f)
+    assert launcher.started and all(j['model'] == 'openai/gpt-6.1-terra'
+                                    for j, _, _ in launcher.started)
+    assert cmre.accepted == (['fn_00401000'] if accepted else [])
+    assert len(cmre.tests) == (2 if accepted else 1)
+    if accepted:
+        assert f.state['audits']['fn_00401000']['verdict'] == 'ok'
+    else:
+        assert 'fn_00401000' in f.state['parked']
+
+
+@pytest.mark.parametrize('confirm', [False, True])
+@pytest.mark.parametrize('failure', ['limited', 'auth'])
+def test_audit_and_confirmation_fall_back_to_terra(root, monkeypatch, confirm, failure):
+    monkeypatch.setattr(farm.time, 'time', lambda: 1000.0)
+    preferred = 'opencode-go/deepseek-v4.1-flash'
+    terra = 'openai/gpt-6.1-terra'
+
+    def plan(job):
+        if job['model'] == preferred:
+            return ScriptedHandle(code=1, infra='401 API key expired')
+        Path(job['audit_path']).parent.mkdir(parents=True, exist_ok=True)
+        Path(job['audit_path']).write_text(json.dumps({'verdict': 'ok', 'findings': []}))
+        return ScriptedHandle(code=0)
+
+    f, cmre, launcher = scripted_farm(root, plan, lambda: 0.0, workers=0,
+                                      ladder=[preferred, terra], audit_workers=1,
+                                      audit_model=preferred, confirm_model=preferred)
+    fn = 'fn_00401000'
+    (root / 'recovery/c' / f'{fn}.c').write_text(GOOD)
+    f.state['accepted'][fn] = {'bytes': 200, 'model': preferred, 'kind': 'translate', 'at': 0}
+    if confirm:
+        f.state['audits'][fn] = {'rounds': 1, 'verdict': 'unconfirmed',
+                                 'findings': [B], 'model': preferred}
+    f.audit_queue.append(fn)
+    if failure == 'limited':
+        f.state['limited_providers']['opencode-go'] = {'until': 4600, 'message': 'usage limit'}
+    drain(f)
+    models = [j['model'] for j, _, _ in launcher.started]
+    assert models == ([terra] if failure == 'limited' else [preferred, terra])
+    assert bool(launcher.started[-1][0].get('confirm')) == confirm
+    assert f.state['audits'][fn]['verdict'] == 'ok'
+    assert f.config.audit_model == preferred and f.config.confirm_model == preferred
+    assert cmre.accepted == [] and cmre.tests == []
+    assert all(row['model'] == terra for row in f.state['attempts'][fn])
+
+
 def test_a_limited_audit_waits_for_the_reset_instead_of_erroring(root, monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(farm.time, 'time', lambda: now[0])
@@ -1317,7 +1374,7 @@ def test_a_limited_audit_waits_for_the_reset_instead_of_erroring(root, monkeypat
 
     cmre = FakeCmre([item('fn_00401000')])
     cmre.root = root
-    cfg = farm.FarmConfig(workers=1, ladder=['mm/cheap'], audit_workers=1, audit_model='go/judge',
+    cfg = farm.FarmConfig(workers=1, ladder=['go/cheap'], audit_workers=1, audit_model='go/judge',
                           attempt_minutes=30, hours=1, min_bytes=0, max_bytes=None, include_held=False,
                           owner='farm-t')
     f = farm.Farm(root / 'run', root, cmre, Launcher(root, None), cfg, clock=lambda: 0.0)

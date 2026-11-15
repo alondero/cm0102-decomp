@@ -33,13 +33,15 @@ sys.path.insert(0, str(ROOT))
 # MiniMax M3 3/13 (dropped), DeepSeek v4.1 Flash #low 4/12 then default effort 2/4; DeepSeek
 # solved functions MiniMax failed. All arms ~1 KB/h per worker, bounded by reasoning tokens.
 # DeepSeek runs use v4.1 Flash (Adam's choice); fix jobs use the top rung.
+# Adam added Terra as an ordinary farm lane on 2026-11-15 after provider quotas ran low.
+TERRA_MODEL = 'openai/gpt-6.1-terra'
 DEFAULT_LADDER = ('minimax-coding-plan/MiniMax-M3.1-Flash', 'opencode-go/deepseek-v4.1-flash#low',
-                  'opencode-go/deepseek-v4.1-flash')
-DEFAULT_AUDIT_MODEL = 'opencode-go/deepseek-v4.1-flash'
+                  'opencode-go/deepseek-v4.1-flash', TERRA_MODEL)
+DEFAULT_AUDIT_MODEL = TERRA_MODEL
 # A defect needs a second auditor before any fix: the MiniMax M3 auditor flagged 8 of 8 functions
 # with false positives, DeepSeek #low passed real defects (cross-audits, 2026-11-13). The second
-# opinion is a separate Flash run that must prove each finding from the listing.
-DEFAULT_CONFIRM_MODEL = 'opencode-go/deepseek-v4.1-flash'
+# opinion is a separate worker run that must prove each finding from the listing.
+DEFAULT_CONFIRM_MODEL = TERRA_MODEL
 # The coordinator must outlive an OpenCode Go usage limit, so it runs on the MiniMax plan.
 COORDINATOR_MODEL = 'minimax-coding-plan/MiniMax-M3.1-Flash'
 # Runtime-library x87 helpers: 7 of 10 production audit defects (control word, ST0, caller
@@ -550,6 +552,11 @@ class Farm:
     def _available(self, model):
         return model not in self.state['unavailable_models'] and self._limited_until(model) is None
 
+    def _audit_model(self, preferred):
+        """Keep the preferred auditor when usable, otherwise use an available ladder rung."""
+        return next((model for model in (preferred, *reversed(self.config.ladder))
+                     if self._available(model)), None)
+
     def _rung_model(self, rung):
         """First available ladder model at or above rung, or (None, rung) when none remain."""
         while rung < len(self.config.ladder):
@@ -684,16 +691,17 @@ class Farm:
             fn = self.audit_queue[0]
             prior = self.state['audits'].get(fn, {})
             confirm = prior.get('verdict') == 'unconfirmed' and self.config.confirm_model
-            if not self._available(self.config.confirm_model if confirm else self.config.audit_model):
-                break   # paused by a usage limit (or retired); the queue waits
+            model = self._audit_model(self.config.confirm_model if confirm else self.config.audit_model)
+            if model is None:
+                break   # every audit lane is paused or retired; retain the queue
             self.audit_queue.pop(0)
             accepted = self.state['accepted'][fn]
             if confirm:
-                job = self._new_job('audit', fn, self.config.confirm_model, bytes=accepted['bytes'],
+                job = self._new_job('audit', fn, model, bytes=accepted['bytes'],
                                     hold=accepted.get('hold'), confirm=True,
                                     findings=prior.get('findings', []), first_model=prior.get('model'))
             else:
-                job = self._new_job('audit', fn, self.config.audit_model, bytes=accepted['bytes'],
+                job = self._new_job('audit', fn, model, bytes=accepted['bytes'],
                                     hold=accepted.get('hold'))
             self._launch(job)
             audits.append(job)
@@ -758,9 +766,6 @@ class Farm:
         self.state['unavailable_models'][job['model']] = error[:300]
         self._event('model-unavailable', model=job['model'], error=error[:300], fn=job['fn'], n=job['n'])
         if job['kind'] == 'audit':
-            if self.config.audit_model == job['model']:
-                self.config.audit_model = next((m for m in reversed(self.config.ladder)
-                                                if m not in self.state['unavailable_models']), None)
             if self.config.audit_model:
                 self.audit_queue.insert(0, job['fn'])
             return
@@ -1482,7 +1487,7 @@ def main(argv=None):
     r = sub.add_parser('run', help='dispatch, gate and accept until the deadline or STOP')
     r.add_argument('run_dir')
     r.add_argument('--workers', type=int, default=12)
-    r.add_argument('--ladder', default=','.join(DEFAULT_LADDER), help='comma-separated provider/model, cheapest first')
+    r.add_argument('--ladder', default=','.join(DEFAULT_LADDER), help='comma-separated provider/model escalation order')
     r.add_argument('--audit-workers', type=int, default=4)
     r.add_argument('--audit-model', default=DEFAULT_AUDIT_MODEL)
     r.add_argument('--attempt-minutes', type=float, default=30)
