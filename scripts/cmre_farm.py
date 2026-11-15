@@ -130,12 +130,45 @@ _BANNED = (
     (re.compile(r'\bCM_ORIGINAL_CALL\b'), 'CM_ORIGINAL_CALL belongs to legacy abi records only'),
     (re.compile(r'\bnaked\b'), 'naked function'),
 )
+_RETURN_TYPE_WEAKENING = re.compile(
+    r'\s*(?:GCC|clang)\s+diagnostic\s+(?:ignored|warning)\s+"-Wreturn-type"\s*')
+_PRAGMA_DIRECTIVE = re.compile(r'^[ \t]*(?P<op>#[ \t]*pragma)\b(?P<body>[^\n]*)', re.M)
+_PRAGMA_OPERATOR = re.compile(r'\b_Pragma\s*\(\s*L?"(?P<body>(?:\\.|[^"\\])*)"\s*\)')
+
+
+def _mask_noncode(match):
+    return re.sub(r'[^\r\n]', ' ', match.group())
+
+
+def _weakens_return_type(text, code):
+    """Recognize literal diagnostic pragmas, not arbitrary preprocessor expansion or UB.
+
+    Keep pragma operands but mask comments. The code-only view proves the
+    directive/operator itself is not inside an ordinary string or character.
+    Both views retain offsets and line boundaries after C line splicing.
+    """
+    operands = _NONCODE.sub(
+        lambda m: _mask_noncode(m) if m.group().startswith('/') else m.group(), text)
+    for match in _PRAGMA_DIRECTIVE.finditer(operands):
+        if code[match.start('op')] == '#' and _RETURN_TYPE_WEAKENING.fullmatch(match['body']):
+            return True
+    for match in _PRAGMA_OPERATOR.finditer(operands):
+        if code[match.start():match.start() + 7] != '_Pragma':
+            continue
+        # C _Pragma destringizing removes only escaped double quotes/backslashes.
+        body = re.sub(r'\\(["\\])', r'\1', match['body'])
+        if _RETURN_TYPE_WEAKENING.fullmatch(body):
+            return True
+    return False
 
 
 def mechanical_problems(fn, text):
-    """Cheap rejections that never need the gate. Comments and strings are ignored."""
-    code = _NONCODE.sub(lambda m: ' ' * len(m.group()), text.replace('\\\r\n', '').replace('\\\n', ''))
+    """Cheap rejections; ignore comments/ordinary strings, inspect literal pragma operands."""
+    spliced = text.replace('\\\r\n', '').replace('\\\n', '')
+    code = _NONCODE.sub(_mask_noncode, spliced)
     problems = [message for pattern, message in _BANNED if pattern.search(code)]
+    if _weakens_return_type(spliced, code):
+        problems.append('return-type diagnostic weakening permits undefined register capture')
     if re.search(r'/\*\s*WIP', text):
         problems.append('WIP marker present: the source is not finished')
     if not re.search(r'\bcm_%s\s*\(' % re.escape(fn), code):

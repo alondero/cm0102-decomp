@@ -380,6 +380,56 @@ def test_comment_mentions_do_not_trip_checks():
     assert farm.mechanical_problems('fn_00401000', text) == []
 
 
+@pytest.mark.parametrize('directive', [
+    '#pragma GCC diagnostic ignored "-Wreturn-type"',
+    '# pragma GCC diagnostic warning "-Wreturn-type"',
+    '#pragma clang diagnostic ignored "-Wreturn-type"',
+    '#pragma GCC diagnostic /* reason */ ignored "-Wreturn-type"',
+    '#pragma GCC diagnostic ignored \\\n "-Wreturn-type"',
+    '_Pragma("GCC diagnostic ignored \\"-Wreturn-type\\"")',
+    '_Pragma ( /* reason */ "GCC diagnostic warning \\"-Wreturn-type\\"" )',
+    '_Pragma(L"clang diagnostic ignored \\"-Wreturn-type\\"")',
+])
+def test_return_type_diagnostic_weakening_rejected(directive):
+    source = (directive + '\n'
+              'static u32 __attribute__((noinline)) capture_eax(void) {}\n'
+              'u32 cm_fn_00401000(void) { return capture_eax(); }\n')
+    assert farm.mechanical_problems('fn_00401000', source) == [
+        'return-type diagnostic weakening permits undefined register capture']
+
+
+def test_return_type_diagnostic_rejection_never_runs_gate(root):
+    source = ('#pragma GCC diagnostic ignored "-Wreturn-type"\n'
+              'static u32 __attribute__((noinline)) capture_eax(void) {}\n'
+              'u32 cm_fn_00401000(void) { return capture_eax(); }\n')
+    f, cmre, _ = make(root, [item('fn_00401000')], writes(source), ladder=['m/cheap'])
+    drain(f)
+    assert cmre.tests == []
+    assert cmre.accepted == []
+    assert 'return-type diagnostic weakening' in json.dumps(f.state['parked'])
+
+
+@pytest.mark.parametrize('decoy', [
+    '/*\n#pragma GCC diagnostic ignored "-Wreturn-type"\n*/',
+    '// _Pragma("GCC diagnostic ignored \\"-Wreturn-type\\"")',
+    r'const char *s = "#pragma GCC diagnostic ignored \"-Wreturn-type\"";',
+    r'const char *s = "_Pragma(\"GCC diagnostic ignored \\\"-Wreturn-type\\\"\")";',
+    '#pragma GCC diagnostic error "-Wreturn-type"',
+    '#pragma GCC diagnostic ignored "-Wunused-parameter"',
+    '#pragma GCC diagnostic ignored "-Wreturn-type-extra"',
+    '_Pragma("GCC diagnostic error \\"-Wreturn-type\\"")',
+])
+def test_return_type_checker_ignores_decoys_and_nonweakening_pragmas(decoy):
+    assert farm.mechanical_problems('fn_00401000', decoy + '\n' + GOOD) == []
+
+
+@pytest.mark.parametrize('abi', ['regparm(3), stdcall', 'thiscall', 'fastcall'])
+def test_explicit_entry_abi_is_not_undefined_register_capture(abi):
+    source = (f'u32 __attribute__(({abi})) cm_fn_00401000(u32 eax, u32 edx, u32 ecx, u32 stack) '
+              '{ return eax + edx + ecx + stack; }\n')
+    assert farm.mechanical_problems('fn_00401000', source) == []
+
+
 def test_busy_accept_is_retried_not_failed(root):
     f, cmre, _ = make(root, [item('fn_00401000')], writes(GOOD), accept_codes=[2, 0])
     drain(f)
