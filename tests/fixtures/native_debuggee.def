@@ -1,0 +1,15 @@
+LIBRARY KERNEL32.dll
+EXPORTS
+GetStdHandle@4
+ReadFile@20
+WriteFile@20
+ExitProcess@4
+ExitThread@4
+CreateThread@24
+WaitForSingleObject@8
+CloseHandle@4
+CreateEventA@16
+SetEvent@4
+VirtualAlloc@16
+VirtualFree@12
+SetErrorMode@4
