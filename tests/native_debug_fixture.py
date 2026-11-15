@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests/fixtures/native_debuggee.c"
 DEFINITION = SOURCE.with_suffix(".def")
 SCENARIOS = {"ordinary": "o", "nested": "n", "shared": "s", "threads": "t",
-             "fault": "f", "unreadable": "u", "thread-exit": "x"}
+             "fault": "f", "unreadable": "u", "thread-exit": "x", "exit-race": "r"}
 
 
 class Unavailable(RuntimeError):

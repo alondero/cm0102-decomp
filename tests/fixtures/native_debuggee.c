@@ -26,6 +26,7 @@ extern U32 fixture_call(U32 mode, U32 depth, U32 *out, U32 token);
 extern char fixture_entry, fixture_return, fixture_done, fixture_probe;
 extern void done_marker(void), probe(void);
 static HANDLE gate_a, gate_b;
+static U32 worker_exit_code;
 #ifdef FIXTURE_EXTERNAL_BREAKPOINTS
 #define OBSERVATION_MARKER "nop\n"
 #else
@@ -102,7 +103,7 @@ static U32 __attribute__((stdcall)) worker(void *arg)
 {
     U32 out;
     fixture_call('t', 1, &out, (U32)arg);
-    return 0;
+    return worker_exit_code;
 }
 
 static U32 __attribute__((stdcall)) exiting_worker(void *unused)
@@ -115,7 +116,7 @@ static U32 __attribute__((stdcall)) exiting_worker(void *unused)
 
 void start(void)
 {
-    U32 mode, out = 0, i, tid;
+    U32 mode, out = 0, i, tid, wave;
     HANDLE a, b;
     U32 *page;
     SetErrorMode(0x0001 | 0x0002); /* no interactive fault UI */
@@ -125,17 +126,23 @@ void start(void)
     text(",\"probe\":"); number((U32)&fixture_probe);
     text("}\n");
     mode = command(); /* fixture is inert until the debugger says go */
-    if (mode == 't') {
-        gate_a = CreateEventA(0, 1, 0, 0);
-        gate_b = CreateEventA(0, 1, 0, 0);
-        if (!gate_a || !gate_b) ExitProcess(79);
-        a = CreateThread(0, 0, worker, (void *)201, 0, &tid);
-        b = CreateThread(0, 0, worker, (void *)202, 0, &tid);
-        if (!a || !b) ExitProcess(73);
-        if (WaitForSingleObject(a, 5000) != 0 || WaitForSingleObject(b, 5000) != 0)
-            ExitProcess(74);
-        CloseHandle(a); CloseHandle(b);
-        CloseHandle(gate_a); CloseHandle(gate_b);
+    if (mode == 't' || mode == 'r') {
+        /* Deliberate debugger edge: 259 is also a possible ACTUAL exit value.
+         * The fixture joins handles, never treats that value as liveness proof.
+         */
+        worker_exit_code = mode == 'r' ? 259 : 0;
+        for (wave = 0; wave < (mode == 'r' ? 12u : 1u); ++wave) {
+            gate_a = CreateEventA(0, 1, 0, 0);
+            gate_b = CreateEventA(0, 1, 0, 0);
+            if (!gate_a || !gate_b) ExitProcess(79);
+            a = CreateThread(0, 0, worker, (void *)201, 0, &tid);
+            b = CreateThread(0, 0, worker, (void *)202, 0, &tid);
+            if (!a || !b) ExitProcess(73);
+            if (WaitForSingleObject(a, 5000) != 0 || WaitForSingleObject(b, 5000) != 0)
+                ExitProcess(74);
+            CloseHandle(a); CloseHandle(b);
+            CloseHandle(gate_a); CloseHandle(gate_b);
+        }
     } else if (mode == 'x') {
         a = CreateThread(0, 0, exiting_worker, 0, 0, &tid);
         if (!a || WaitForSingleObject(a, 5000) != 0) ExitProcess(75);

@@ -1,0 +1,12 @@
+LIBRARY KERNEL32.dll
+EXPORTS
+GetStdHandle@4
+ReadFile@20
+WriteFile@20
+CreateFileA@28
+GetProcessHeap@0
+HeapAlloc@12
+HeapFree@12
+CloseHandle@4
+SetErrorMode@4
+ExitProcess@4

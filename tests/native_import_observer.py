@@ -1,7 +1,8 @@
 """Test-only live adapter for the trusted local external-breakpoint fixture.
 
 Not a production debugger. Only a newly created child can be attached. The
-fixture's verified NOP/RET contract supplies stack cleanup and output sizes.
+default fixture's verified NOP/RET contract supplies stack cleanup/output sizes;
+the private real-OS fixture profile supplies its own evidenced caller contract.
 Sibling build receipts detect accidental artifact drift, not malicious
 replacement: source, executable, receipt and producer are trusted local inputs.
 """
@@ -23,23 +24,47 @@ from native_debug_fixture import SOURCE, DEFINITION, SCENARIOS, _line_with_timeo
 SINGLE_STEP = (0x80000004, 0x4000001e)
 BREAKPOINT = (api.STATUS_BREAKPOINT, api.STATUS_WX86_BREAKPOINT)
 TF = 0x100
+DBG_REPLY_LATER = 0x40010001
+
+
+class PeerSuspensionUnavailable(OSError):
+    def __init__(self, fact):
+        self.fact = fact
+        super().__init__(fact["error"], f"suspend peer {fact['tid']}; "
+                         f"exit={fact['exit_code']}, wait={fact['wait_result']}")
+
+
+def _exit_transition_candidate(fact):
+    """Only permits bounded EXIT-event collection, NEVER declares a peer dead."""
+    return (fact["error"] == 5 and fact["ntstatus"] == 0xc000004b
+            and type(fact["generation"]) is int and fact["generation"] > 0
+            and fact["actual_tid"] == fact["tid"]
+            and fact["actual_pid"] == fact["expected_pid"]
+            and fact["object_query_status"] == 0 and fact["granted_access"] & 2 != 0
+            and fact["queried_exit"] and fact["exit_code"] == 259
+            and fact["wait_result"] == 258)
 
 
 def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
-                  fail_at: str | None = None, report: dict | None = None, seconds=12) -> dict:
+                  fail_at: str | None = None, report: dict | None = None, seconds=12,
+                  _profile=None) -> dict:
     """Use real caller return-site breakpoints, including recursive/shared sites.
 
     Early detach disables ONLY the authored end-of-scenario INT3, explicitly
     recorded as fixture control, so the child can finish without a debugger.
     It is not counted as a debugger-inserted breakpoint or a restored byte.
     """
-    if scenario not in SCENARIOS or detach_at not in (None, "entry-hit", "step-prepared", "step-stop"):
+    # Private trusted test-fixture seam, not a user-selectable attach/ABI API.
+    source = SOURCE if _profile is None else _profile.source
+    definition = DEFINITION if _profile is None else _profile.definition
+    scenarios = SCENARIOS if _profile is None else _profile.scenarios
+    if scenario not in scenarios or detach_at not in (None, "entry-hit", "step-prepared", "step-stop"):
         raise ValueError("unsupported fixture scenario/detach point")
     if fail_at not in (None, "step-prepared", "step-stop"):
         raise ValueError("unsupported failure injection")
     build = json.loads((exe.parent / "build.json").read_text(encoding="utf-8"))
-    if (build.get("source_sha256") != env.digest(SOURCE)
-            or build.get("definition_sha256") != env.digest(DEFINITION)
+    if (build.get("source_sha256") != env.digest(source)
+            or build.get("definition_sha256") != env.digest(definition)
             or build.get("exe_sha256") != env.digest(exe)
             or build.get("external_breakpoints") is not True):
         raise ValueError("requires matching authored external-breakpoint fixture receipt")
@@ -52,12 +77,20 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
     k.WaitForSingleObject.argtypes = (ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD)
     k.WaitForSingleObject.restype = ctypes.wintypes.DWORD
     k.GetCurrentProcess.restype = ctypes.wintypes.HANDLE
+    k.GetThreadId.argtypes = k.GetProcessIdOfThread.argtypes = (ctypes.wintypes.HANDLE,)
+    k.GetThreadId.restype = k.GetProcessIdOfThread.restype = ctypes.wintypes.DWORD
+    nt = ctypes.WinDLL("ntdll")
+    last_nt_status = nt.RtlGetLastNtStatus
+    last_nt_status.restype = ctypes.c_long
+    nt.NtQueryObject.argtypes = (ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD,
+                                ctypes.c_void_p, ctypes.wintypes.DWORD, ctypes.c_void_p)
+    nt.NtQueryObject.restype = ctypes.c_long
     k.DuplicateHandle.argtypes = (
         ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE,
         ctypes.POINTER(ctypes.wintypes.HANDLE), ctypes.wintypes.DWORD,
         ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)
     child = subprocess.Popen([str(exe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE)
+                             stderr=subprocess.PIPE, cwd=None if _profile is None else _profile.workdir)
     result = {} if report is None else report
     result.update(dict(scenario=scenario, steps=[], debug_events=[], fixture_controls=[],
                        cleanup={}, run_id=uuid.uuid4().hex))
@@ -67,14 +100,18 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
     threads, originals, armed, facts = {}, {}, set(), {}
     generations = {}
     suspended = {}
+    exit_waiting, reply_expected = {}, {}
+    exit_wait_deadline, unsafe_stop_reason = None, None
     stepping, stopped_hit = None, None
     manifest = {}
+    entry_addresses = set()
     obs = ImportObserver(enabled=True, source=dict(
         kind="authored-native-debugger", session=result["run_id"], pid=child.pid,
-        executable_sha256=env.digest(exe), source_sha256=env.digest(SOURCE),
-        fixture_definition_sha256=env.digest(DEFINITION),
+        executable_sha256=env.digest(exe), source_sha256=env.digest(source),
+        fixture_definition_sha256=env.digest(definition),
         thread_identity="Generation stamped on receipt from one serialized Windows debug-event stream",
-        warning="Authored surrogate call observations; not game captures or API semantics"))
+        warning=("Authored surrogate call observations; not game captures or API semantics"
+                 if _profile is None else _profile.warning)))
 
     def checked(ok, operation):
         if not ok:
@@ -133,14 +170,14 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
         ctx.ContextFlags = 0x00010001
         checked(k.Wow64SetThreadContext(threads[tid], ctypes.byref(ctx)), "set WOW64 control")
 
-    def snapshot(ctx, *, ip=None, reads=()):
+    def snapshot(ctx, *, ip=None, reads=(), gaps=()):
         regs = {name: getattr(ctx, name.capitalize()) for name in (
             "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip")}
         regs["eflags"] = ctx.EFlags
         regs["debugger_raw_eip"] = ctx.Eip
         if ip is not None:
             regs["eip"] = ip
-        return Snapshot(regs, tuple(reads))
+        return Snapshot(regs, tuple(reads), tuple(gaps))
 
     def continue_pending(status=api.DBG_CONTINUE):
         nonlocal pending
@@ -186,16 +223,77 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
         count = k.SuspendThread(handle)
         if count == 0xffffffff:
             error = ctypes.get_last_error()
+            # Capture native status BEFORE other native calls. A candidate
+            # transition still requires the SAME generation's actual exit event.
+            ntstatus = last_nt_status() & 0xffffffff
+            basic = (ctypes.wintypes.DWORD * 14)()
+            object_status = nt.NtQueryObject(handle, 0, ctypes.byref(basic), ctypes.sizeof(basic), None)
+            actual_tid = k.GetThreadId(handle)
+            actual_pid = k.GetProcessIdOfThread(handle)
             exit_code = ctypes.wintypes.DWORD()
             queried = k.GetExitCodeThread(handle, ctypes.byref(exit_code))
             wait = k.WaitForSingleObject(handle, 10)
-            if wait == 0 or (queried and exit_code.value != 259):
+            fact = dict(
+                tid=tid, generation=generations.get(tid), handle=handle, error=error,
+                ntstatus=ntstatus, actual_tid=actual_tid, actual_pid=actual_pid,
+                expected_pid=child.pid, object_query_status=object_status & 0xffffffff,
+                granted_access=basic[1], queried_exit=bool(queried), exit_code=exit_code.value,
+                wait_result=wait, pending_event=pending, stepping=stepping,
+                last_peer_event=next((e for e in reversed(result["debug_events"]) if e["tid"] == tid), None))
+            result.setdefault("suspend_failures", []).append(fact)
+            if wait == 0:
                 result.setdefault("terminated_peers_not_suspended", []).append(
-                    dict(tid=tid, generation=generations.get(tid), exit_code=exit_code.value,
-                         suspend_error=error, wait_result=wait))
+                    dict(fact, terminal_basis="owned thread handle observed signaled"))
                 return  # proven terminated; its exit event may still be queued
-            raise OSError(error, f"suspend peer {tid}; exit={exit_code.value}, wait={wait}")
+            raise PeerSuspensionUnavailable(fact)
         suspended[tid] = dict(previous=count, handle=handle, generation=generations.get(tid))
+
+    def reply_later(tid, generation, address):
+        """Keep every code byte armed and this breaking event unconsumed."""
+        nonlocal unsafe_stop_reason
+        try:
+            suspend_one(tid, threads[tid])
+            if tid not in suspended:
+                raise RuntimeError("cannot hold the breaking thread for reply-later")
+            reply_expected[(tid, generation)] = address
+            witnesses = [memory(site, 1, "reply-later-armed-readback") for site in sorted(armed)]
+            if any(not read.complete or read.data != b"\xcc" for read in witnesses):
+                raise RuntimeError("armed breakpoint drift before reply-later")
+            result.setdefault("reply_later", []).append(dict(
+                tid=tid, generation=generation, address=address,
+                armed_addresses=sorted(armed), armed_readback=[read.report() for read in witnesses],
+                raw_context_hex=bytes(context(tid)).hex()))
+            continue_pending(DBG_REPLY_LATER)
+        except BaseException:
+            unsafe_stop_reason = "reply-later hold/continue failed"
+            raise
+
+    def acquire_peers_before_observation(tid, generation, address):
+        """No endpoint, original byte or TF is changed before this succeeds."""
+        nonlocal exit_wait_deadline, unsafe_stop_reason
+        if exit_waiting:
+            reply_later(tid, generation, address)
+            return False
+        for other, handle in list(threads.items()):
+            if other == tid:
+                continue
+            try:
+                suspend_one(other, handle)
+            except PeerSuspensionUnavailable as exc:
+                fact = exc.fact
+                if (not _exit_transition_candidate(fact) or threads.get(other) != handle
+                        or generations.get(other) != fact["generation"]):
+                    unsafe_stop_reason = "unknown peer suspend failure; no safe step/detach"
+                    raise
+                proof = dict(tid=other, generation=fact["generation"], handle=handle,
+                             suspend_failure=fact, held_owner=dict(tid=tid, generation=generation,
+                                                                  address=address))
+                exit_waiting[(other, fact["generation"])] = proof
+                result.setdefault("peer_exit_deferrals", []).append(proof)
+                exit_wait_deadline = time.monotonic() + 1
+                reply_later(tid, generation, address)
+                return False
+        return True
 
     def prepare_step(tid, generation, address, ctx):
         nonlocal stepping, stopped_hit
@@ -203,9 +301,8 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
             raise RuntimeError("fixture unexpectedly supplied TF; refusing to steal trap ownership")
         stepping = dict(tid=tid, generation=generation, address=address,
                         original_flags=ctx.EFlags, executed=False)
-        for other, handle in threads.items():
-            if other != tid:
-                suspend_one(other, handle)
+        # Peer leases were acquired BEFORE recording the endpoint. This prevents
+        # a replayed stop from duplicating logical entries/returns.
         restore(address)
         ctx.Eip, ctx.EFlags = address, ctx.EFlags | TF
         set_control(tid, ctx)
@@ -217,7 +314,7 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
         ctx = context(tid)
         ctx.EFlags = (ctx.EFlags & ~TF) | (stepping["original_flags"] & TF)
         set_control(tid, ctx)
-        wanted = address == manifest["entry"] or any(
+        wanted = address in entry_addresses or any(
             site["address"] == address and site["owners"] for site in obs.report()["breakpoints"])
         if wanted:
             install(address)
@@ -285,7 +382,7 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
 
     try:
         manifest = json.loads(_line_with_timeout(child.stdout, 5))
-        if manifest.get("version") != 1:
+        if manifest.get("version") != (1 if _profile is None else _profile.manifest_version):
             raise ValueError("unknown fixture manifest")
         result["manifest"] = manifest
         process = k.OpenProcess(0x1f0fff, False, child.pid)
@@ -296,6 +393,9 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
         event = api._DebugEvent()
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
+            if exit_waiting and time.monotonic() >= exit_wait_deadline:
+                unsafe_stop_reason = "terminating peer exit event not confirmed within 1s"
+                raise TimeoutError(unsafe_stop_reason)
             if not k.WaitForDebugEvent(ctypes.byref(event), 50):
                 if ctypes.get_last_error() != 121:
                     raise OSError(ctypes.get_last_error(), "wait debug event")
@@ -303,7 +403,25 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
             tid, code = event.dwThreadId, event.dwDebugEventCode
             if event.dwProcessId != child.pid:
                 raise RuntimeError("foreign process debug event")
+            # Receipt owns a real native event even when it is too late to use.
+            # Register it BEFORE rejecting: failed cleanup must continue it only
+            # after killing our child, so termination/drain cannot lose the stop.
             pending = (child.pid, tid)
+            if exit_waiting:
+                received_at = time.monotonic()
+                if received_at >= exit_wait_deadline:
+                    unsafe_stop_reason = "terminating peer exit event not confirmed within 1s"
+                    result["received_after_peer_exit_deadline"] = dict(
+                        pid=child.pid, tid=tid, generation=generations.get(tid), code=code,
+                        received_at=received_at, deadline=exit_wait_deadline,
+                        raw_event_hex=bytes(event).hex())
+                    raise TimeoutError(unsafe_stop_reason)
+            if _profile is not None and len(result["debug_events"]) >= _profile.event_budget:
+                # The event is owned but NOT normalized (IP/TF). Force owned-child
+                # termination rather than pretending it is safe to detach.
+                unsafe_stop_reason = "native fixture debug-event budget exhausted"
+                result["event_budget_stop"] = dict(tid=tid, code=code, raw_event_hex=bytes(event).hex())
+                raise RuntimeError(unsafe_stop_reason)
             # Stamp identity at transport ingress, before any deferred dispatch.
             # Never look up today's generation when delivering an old event.
             event_generation = generations.get(tid)
@@ -321,10 +439,27 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
                 threads[tid] = duplicate(event.u.CreateThread.hThread)
                 event_generation = generations[tid] = obs.thread_start(tid)
                 result["debug_events"][-1]["generation"] = event_generation
+                if exit_waiting:
+                    try:
+                        suspend_one(tid, threads[tid])
+                        if tid not in suspended:
+                            raise RuntimeError("new peer not suspendable during exit proof")
+                    except BaseException:
+                        unsafe_stop_reason = "new thread cannot be held during exit proof"
+                        raise
             elif code == api.LOAD_DLL_DEBUG_EVENT:
                 if event.u.LoadDll.hFile:
                     k.CloseHandle(event.u.LoadDll.hFile)
             elif code == api.EXIT_THREAD_DEBUG_EVENT:
+                proof = exit_waiting.get((tid, event_generation))
+                if proof is not None:
+                    if proof["handle"] != threads.get(tid):
+                        unsafe_stop_reason = "exit proof handle/generation changed"
+                        raise RuntimeError(unsafe_stop_reason)
+                    proof["confirmed_by_exit_event"] = dict(
+                        tid=tid, generation=event_generation, handle=threads[tid],
+                        exit_code=struct.unpack_from("<I", bytes(event.u.raw))[0])
+                    del exit_waiting[(tid, event_generation)]
                 obs.thread_exit(tid, generation=event_generation,
                                 exit_code=struct.unpack_from("<I", bytes(event.u.raw))[0])
                 lease = suspended.pop(tid, None)
@@ -336,8 +471,13 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
                 if handle:
                     k.CloseHandle(handle)
                 drain_requests()
+                if proof is not None and not exit_waiting:
+                    # Commit the exit event BEFORE releasing our exact counts.
+                    # Windows then replays each held breaking event.
+                    continue_pending()
+                    resume_others()
                 if ready and tid == attach_tid and not command_released:
-                    child.stdin.write(SCENARIOS[scenario].encode("ascii"))
+                    child.stdin.write(scenarios[scenario].encode("ascii"))
                     child.stdin.flush()
                     command_released = True
             elif code == api.EXIT_PROCESS_DEBUG_EVENT:
@@ -354,6 +494,9 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
                 raw_ctx = context(tid)
                 result["debug_events"][-1].update(
                     wow64_context_hex=bytes(raw_ctx).hex(), context_flags=raw_ctx.ContextFlags)
+                if exit_waiting and not (exception in BREAKPOINT and address in originals):
+                    unsafe_stop_reason = "unowned exception during peer exit proof"
+                    raise RuntimeError(unsafe_stop_reason)
                 if (stepping is not None and tid == stepping["tid"]
                         and event_generation != stepping["generation"]):
                     raise RuntimeError("single-step event has a different thread generation")
@@ -381,8 +524,25 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
                         rewound_ip=context(tid).Eip))
                 elif exception in BREAKPOINT and address in originals:
                     ctx = context(tid)
+                    expected = reply_expected.pop((tid, event_generation), None)
+                    if expected is not None:
+                        if expected != address or exit_waiting:
+                            unsafe_stop_reason = "reply-later replay identity/address mismatch"
+                            raise RuntimeError(unsafe_stop_reason)
+                        result.setdefault("reply_replays", []).append(dict(
+                            tid=tid, generation=event_generation, address=address))
+                    if not acquire_peers_before_observation(tid, event_generation, address):
+                        continue  # existing breakpoint event belongs to Windows until replayed
                     stopped_hit = (tid, address)
-                    if address == manifest["entry"]:
+                    if address in entry_addresses and _profile is not None:
+                        invocation = _profile.entry(
+                            obs, tid, event_generation, address, ctx, snapshot, memory, exact, facts)
+                        if invocation is not None:
+                            drain_requests()
+                        if detach_at == "entry-hit":
+                            early = True
+                            break
+                    elif _profile is None and address == manifest["entry"]:
                         raw = exact(ctx.Esp, 20)
                         caller, mode, depth, out, token = struct.unpack("<5I", raw)
                         return_code = exact(manifest["return"], 2)
@@ -410,14 +570,17 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
                                       if r["tid"] == tid and r["state"] == "pending"
                                       and r["thread_generation"] == event_generation
                                       and r["return_site"] == address and r["return_sp"] == ctx.Esp]
-                        reads = ()
+                        reads, gaps = (), ()
                         if len(candidates) == 1:
                             fact = facts[candidates[0]["invocation"]]
-                            reads = (memory(fact["out"], 4, "fixture-output-after"),)
+                            if _profile is None:
+                                reads = (memory(fact["out"], 4, "fixture-output-after"),)
+                            else:
+                                reads, gaps = _profile.outputs(fact, ctx, memory)
                         # A shared continuation can also be an ordinary branch
                         # target (fixture depth==0 bypasses the recursive CALL).
                         # Keep the rejected endpoint raw; never fabricate a pair.
-                        obs.return_hit(tid, address, snapshot(ctx, ip=address, reads=reads),
+                        obs.return_hit(tid, address, snapshot(ctx, ip=address, reads=reads, gaps=gaps),
                                        generation=event_generation)
                         drain_requests()
                     prepare_step(tid, event_generation, address, ctx)
@@ -427,13 +590,21 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
                             raise RuntimeError("injected failure at step-prepared")
                         break
                 elif exception in BREAKPOINT and address == manifest["done"]:
+                    if reply_expected or exit_waiting:
+                        unsafe_stop_reason = "fixture ended with unresolved reply-later events"
+                        raise RuntimeError(unsafe_stop_reason)
                     break  # fixture-owned trap: leave post-INT3 IP unchanged
                 elif exception in BREAKPOINT and not ready:
-                    if (exact(manifest["entry"], 1) != b"\x90"
-                            or exact(manifest["return"], 2) != b"\x90\xc3"
-                            or exact(manifest["probe"], 1) != b"\x90"):
-                        raise RuntimeError("external fixture bytes do not match source contract")
-                    install(manifest["entry"])
+                    if _profile is None:
+                        if (exact(manifest["entry"], 1) != b"\x90"
+                                or exact(manifest["return"], 2) != b"\x90\xc3"
+                                or exact(manifest["probe"], 1) != b"\x90"):
+                            raise RuntimeError("external fixture bytes do not match source contract")
+                        entry_addresses.add(manifest["entry"])
+                    else:
+                        entry_addresses.update(_profile.bind(manifest, process, k, memory, exact, result))
+                    for entry_address in entry_addresses:
+                        install(entry_address)
                     install(manifest["probe"])
                     ready = True
                     attach_tid = tid
@@ -441,7 +612,7 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
                     # fixture. A terminating debugger thread can reject suspend
                     # while still reporting STILL_ACTIVE; never assume it safe.
                     if tid == main_tid:
-                        child.stdin.write(SCENARIOS[scenario].encode("ascii"))
+                        child.stdin.write(scenarios[scenario].encode("ascii"))
                         child.stdin.flush()
                         command_released = True
                 else:
@@ -463,6 +634,11 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
     finally:
         try:
             if attached and not exited:
+                if unsafe_stop_reason or exit_waiting or reply_expected:
+                    result["cleanup"]["unavailable"] = (
+                        unsafe_stop_reason or "unresolved reply-later event; terminate owned child")
+                    obs.detach(result["cleanup"]["unavailable"])
+                    raise RuntimeError(result["cleanup"]["unavailable"])
                 # All normal/injected stop paths hold an outstanding debug event.
                 # Async break-in introduces a new thread with its own pending
                 # loader trap. This test adapter does not pretend it can safely
@@ -541,6 +717,9 @@ def observe_calls(exe: Path, scenario: str, *, detach_at: str | None = None,
                                     obs.process_exit(exit_code=struct.unpack_from("<I", bytes(event.u.raw))[0])
                                 break
                 child.communicate(timeout=5)
+                result["cleanup"]["terminated_owned_child"] = dict(
+                    pid=child.pid, returncode=child.returncode,
+                    reason=result["cleanup"].get("unavailable", "bounded failure cleanup"))
             for handle in threads.values():
                 k.CloseHandle(handle)
             if event_process:

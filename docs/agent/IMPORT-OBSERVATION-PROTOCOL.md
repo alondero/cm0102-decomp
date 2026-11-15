@@ -126,9 +126,11 @@ unchanged.
 
 The native adapter builds the external-breakpoint variant of the separately
 authored fixture. It validates the source/definition/executable hashes before
-starting a child and accepts no PID. Fixture sources/helpers were copied
-unchanged from `.worktrees/debug-fixture-sol-20261115`,
-branch `tooling/debug-fixture-sol-20261115`; their provenance is below.
+starting a child and accepts no PID. Fixture sources/helpers were initially
+copied unchanged from `.worktrees/debug-fixture-sol-20261115`,
+branch `tooling/debug-fixture-sol-20261115`, then extended for peer-exit tests.
+The historical initial-copy hashes are below; current build receipts bind the
+actual sources used by each run.
 `tests/test_native_import_observe.py` covers:
 
 - Real caller continuation pairing, observed EAX/EDX/output bytes, recursive and
@@ -206,7 +208,10 @@ Capture schema/loading/replay changes remain a separate proposed harness
 release requiring full regression and inventory gates at a stopped-farm boundary.
 These tests establish no additional accepted C bytes or game live integration.
 
-### Unchanged fixture-copy provenance (SHA-256)
+### Historical initial-copy provenance (SHA-256)
+
+These hashes describe the initial copy, not the subsequently extended files.
+Current source and executable hashes are retained in each local build receipt.
 
 | File under `tests/` | Hash |
 | --- | --- |

@@ -44,7 +44,9 @@ files. No generated binary or raw observation belongs in Git.
 2. Scenario bytes: `o` ordinary; `n` recursion; `s` three calls from the same
    caller site; `t` two threads with overlapping recursive calls; `f` unhandled
    access violation; `u` output allocation freed before return; `x` thread exit
-   from inside the observed call.
+   from inside the observed call. `r` repeats the two-thread scenario in twelve
+   waves for the native peer-exit regression; those workers intentionally return
+   the exit value 259 (the fixture joins actual handles, not exit-code polling).
 3. Entry and return markers are fixture-owned `INT3`s by default. The debugger
    must handle them and **not rewind EIP**. At both markers the cdecl stack is
    `[caller_return_va, mode, depth, out_pointer, token]`, five little-endian u32s.
@@ -87,6 +89,11 @@ Do not treat the external-build contract test as evidence that the production
 observer has been integrated: no such integration is done here. In particular,
 later work must test hit/step/rearm restoration and detach with calls in flight
 against that separately owned protocol.
+
+The external caller-continuation backend and real peer-exit regression are now
+covered by `tests/test_native_import_observe.py` and
+`tests/test_native_peer_exit.py`; see [native_peer_exit.md](native_peer_exit.md).
+This does not extend the claims of the simpler marker driver above.
 
 Startup wait is bounded to 5 seconds, debug event loop to 10 seconds (50 ms waits),
 native rendezvous/join waits to 5 seconds, each build tool to 30 seconds, and
