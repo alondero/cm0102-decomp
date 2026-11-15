@@ -30,6 +30,12 @@ install-agents` writes `cm-coordinator` and `cm-defect` into the local
 `.opencode/agents/`. Then open OpenCode in the repo, pick `cm-coordinator`, and
 ask it to continue the decompilation.
 
+The generated coordinator auto-allows direct `cmre` reads only: `status`,
+`pipeline survey`, `work show`, `family`, `show`, and `job status` (with their
+read arguments). Acceptance, retraction, work retry/block, source mutation and
+other direct `cmre` commands have no automatic grant. Use the farm's checked
+request protocol, not direct ledger/source mutation; the farm owns acceptance.
+
 Coordinator procedure:
 
 1. `py -3.13 scripts/cmre_session.py start`, then `py -3.13 scripts/cmre_farm.py probe`.
@@ -44,12 +50,24 @@ Coordinator procedure:
    shell command and end your turn; OpenCode resumes you when it returns. Act on
    the reason it prints, in one short line per event:
    - `open-defect fn_X`: send one `cm-defect` subagent the prompt `RUN fn_X`
-     (at most 3 at once). Its last line decides: `ADOPT <path> <note>` →
-     `py -3.13 scripts/cmre_farm.py adopt RUN fn_X --source <path> --note "<note>"`;
-     `DISMISS <reason>` → `py -3.13 scripts/cmre_farm.py dismiss RUN fn_X --reason "<reason>"`;
+     (at most 3 at once). Its last line decides: `ADOPT <path> <review_receipt> <note>` →
+     `py -3.13 scripts/cmre_farm.py adopt RUN fn_X --source <path> --review-receipt <review_receipt> --note "<note>"`;
+     `DISMISS <review_receipt> <reason>` →
+     `py -3.13 scripts/cmre_farm.py dismiss RUN fn_X --review-receipt <review_receipt> --reason "<reason>"`;
      `UNRESOLVED <why>` → leave it open and list it in the handoff.
+   - `acceptance-quarantined fn_X`: preserve the run and canonical inputs.
+     Ask for manual/current `cmre` ledger review at a stopped-farm boundary;
+     do not queue another adoption or infer nonacceptance from unavailable evidence.
    - `request-failed fn_X`: the hand fix failed the gate. One more `cm-defect`
-     with the failure detail, then leave it open.
+     with the failure detail, then leave it open. A missing/stale review receipt
+     requires a fresh claimed review, not resubmission against a new baseline.
+   - `hint-evidence-needed fn_X`: the worker retained a private input proposal.
+     Give its receipt to the parent input lane for validation/application at an
+     authorized stopped-farm boundary. The farm has not applied or accepted it.
+   - `fix-evidence-needed fn_X`: the origin review or automatic-fix dispatch
+     inputs are missing/drifted. Preserve the concern and raw evidence; the farm
+     requeues fresh review instead of accepting a stale fix. This is an evidence
+     failure, not an ordinary failed model attempt or permission to restore newer work.
    - `model-unavailable`: the farm already moved to the next rung; probe once and
      tell Adam if a key needs renewal.
    - `model-limited`: a provider usage limit (OpenCode Go: 5 hours, shared by every
@@ -70,17 +88,59 @@ Coordinator procedure:
 
 `cm-defect` (GPT-6.1 Terra, 40 steps) resolves one open defect. It gets `RUN fn_X`.
 
-1. Read `RUN/audit/fn_X.json`, `RUN/audit/fn_X.confirm.json` when present,
-   `RUN/bundle/fn_X.md` (or run `py -3.13 -m cmre brief fn_X`), and `recovery/c/fn_X.c`.
+1. Explicitly claim the inputs you will review:
+   `py -3.13 scripts/cmre_farm.py review RUN fn_X --claim NAME`, with a new unique
+   name (letters/digits/underscore/hyphen, at most 80 characters). A successful claim returns
+   `review_receipt` and immutable `source` / `hints` paths under
+   `RUN/reviews/NAME/`; an existing claim is never overwritten. Read these
+   claimed source/hints bytes. A claim freezes inputs; it does not certify a review.
+   - `status: "bound"`: read the returned `review.audit_path`, `review.bundle`
+     when non-null (otherwise run `py -3.13 -m cmre brief fn_X`), and
+     `review.source_snapshot` / `review.hints_snapshot` (missing hints means none).
+     Read `first_review` too when present: it locates the first audit preceding
+     the confirmation. These paths are bound to the current accepted source/hints,
+     verified snapshot bytes, and unchanged verdict/bundle hashes.
+   - `status: "fresh-review-required"`: use `source`, `hints`, and a fresh brief
+     for a complete listing review. `unbound_legacy_evidence` preserves the old
+     run route (`audit/fn_X[.confirm].json`, `bundle/fn_X.md`) as historical leads,
+     not findings about current code. A missing identity never becomes a bound verdict.
+     If canonical C is missing, claim fails before creating a directory/receipt:
+     obtain actual source first. Old missing-C receipts are invalid at admission,
+     even when their old `c: null` identity matches the missing canonical file.
+   - `status: "acceptance-quarantined"`: finish `UNRESOLVED` pending manual/current
+     `cmre` ledger review; leave canonical inputs and retained evidence untouched.
+     The CLI exits 2 with bounded JSON and creates no receipt.
+   - `status: "conflict"`: the requested claim name already exists; exit 2 with
+     bounded JSON. Preserve that claim. Choose a new name only for an actual new
+     review, never to rebase an older fix or overwrite reviewed inputs.
+   A fresh-review-required response with a new `review_receipt` exits 0 and
+   permits the complete fresh review above. An input error/missing run/drift
+   response has no receipt and exits 2 with bounded `reason`/`instruction` JSON:
+   correct or obtain the inputs before reviewing. Expected statuses do not
+   require interpreting a traceback.
+   Independently verify every `open_findings` item in the claim. Retain
+   `review_receipt`, `identity` and `open_findings` for the final check.
+   Never guess job-number paths.
 2. Confirm each finding from the listing VA and instruction, or reject it. The
    "Audit checklist" below lists real defect classes; auditors also report
-   false positives.
-3. None confirmed: finish with `DISMISS <reason citing VAs>`.
-4. Otherwise copy `recovery/c/fn_X.c` to `RUN/hand/fn_X.c` (the only file you may
+   false positives. The target source/hints/bundle MUST be the supplied
+   immutable snapshots. Callee C may be read ONLY for navigation, NEVER as
+   signature/ABI/fidelity authority or proof. Every ABI finding must cite
+   original instructions at preferred-image VAs for the pinned CM0102 3.9.68
+   binary, SHA-256 `0c78e7da6d0bcb4603fa179449bbe6d1c627a22c445d14d489bd9bff86`.
+   A bound target review does not establish callee composition or live runtime
+   equivalence; reading callee C does not silently add a global dependency hash.
+3. None confirmed: after the identity check in step 5, finish with
+   `DISMISS <review_receipt> <reason citing VAs>`.
+4. Otherwise copy the claimed `source` to `RUN/hand/fn_X.c` (the only file you may
    write), fix only the confirmed findings under the "Worker rules", and test with
    `py -3.13 scripts/cmre_farm.py test RUN fn_X RUN/hand/fn_X.c` (add `--case N`
    to explain a case). Five failed tests end the attempt.
-5. Finish with one line: `ADOPT RUN/hand/fn_X.c <what changed>` after a pass,
+5. Repeat `review RUN fn_X`. If `identity` or `open_findings` changed, evidence became unbound,
+   or acceptance is quarantined, finish `UNRESOLVED` and request fresh review.
+   A legacy/fresh-review branch may finish only after the complete current-code
+   review and an unchanged identity, never on the old verdict alone.
+   Finish with one line: `ADOPT RUN/hand/fn_X.c <review_receipt> <what changed>` after a pass,
    else `UNRESOLVED <first remaining mismatch or why>`.
 
 ## Run by hand (Claude Code, Codex)
@@ -100,14 +160,19 @@ Coordinator procedure:
    Options: `--include-held` also takes held functions (each prompt carries
    the hold reason; the audit checks it). `--min-bytes/--max-bytes` bound the
    queue. `--ladder` is the model escalation order
-   (default MiniMax M3.1 Flash → DeepSeek v4.1 Flash `#low` → DeepSeek v4.1
-   Flash → GPT-6.1 Terra, DeepSeek via OpenCode Go and Terra via OpenAI;
+   (default MiniMax M3.1 Flash → DeepSeek v4.1 Flash `#low` via Go → `#low` via
+   Command Code → default effort via Go → default effort via Command Code →
+   GPT-6.1 Terra via OpenAI;
    MiniMax M3 passed 3 of 13 on 2026-11-13 and is off the ladder). DeepSeek runs
    use v4.1 Flash. `--audit-model` defaults to `openai/gpt-6.1-terra`; when the
    preferred auditor is limited or retired, the last available ladder rung audits.
    `--stall-minutes` (default 15) kills a worker whose transcript stops growing.
    OpenCode 2.x writes nothing while a step thinks, so a shorter limit kills real
    work. DeepSeek models take an effort variant (`opencode-go/deepseek-v4.1-flash#low`).
+   Command Code uses exactly `commandcode/deepseek/deepseek-v4.1-flash`
+   (not `deepseek-v4.1-flash-fast`), at the same capability/effort tiers as Go.
+   Its provider quota/availability is independent of Go. Workers use the same
+   permissions, gate tests and serial acceptance; no separate installed agent is needed.
    `--opencode v2` (default) runs the npm OpenCode 2.x build with one temporary
    agent file per job in `.opencode/agents/` carrying its permissions; it has a
    256k output ceiling and the current credentials. `--opencode v1` runs the
@@ -118,8 +183,11 @@ Coordinator procedure:
    `0x00940000-0x00953000`, the x87
    runtime helpers behind 7 of 10 production defects) is never dispatched.
    `--verify-threads` (default 8) runs gate re-tests beside the dispatcher.
-   Every job reads one generated `RUN/bundle/fn_X.md`: the brief with the
-   listing, the draft, the rules and `cmre.h`.
+   Translation jobs read `RUN/bundle/fn_X.md`: the brief with the listing,
+   draft, rules and `cmre.h`. Fix/audit/confirmation bundles are immutable per
+   dispatch (`fn_X-N.md`); audit/confirmation verdicts are unique
+   per job, including `fn_X-N.md` and `fn_X-N[.confirm].json`; the supported
+   defect lookup is `review RUN fn_X`, not a stable-name alias.
 
    To conserve MiniMax/OpenCode Go quota, select Terra for all farm workers:
    `py -3.13 scripts/cmre_farm.py start RUN --workers 16 --audit-workers 4 --include-held --hours 10 --ladder openai/gpt-6.1-terra --audit-model openai/gpt-6.1-terra --confirm-model openai/gpt-6.1-terra`.
@@ -148,8 +216,109 @@ Coordinator procedure:
 
 The run directory holds `state.json` (resumable: rerun `run` with the same
 directory), `events.jsonl`, `src/` candidates, `bundle/` job inputs, `audit/`
-verdicts, `hand/` defect fixes, `requests/` and `logs/` (prompts and worker
-transcripts). It is local evidence; never publish it.
+verdicts, `audit/snapshots/` dispatch inputs, `transactions/` durable candidate
+journals, `reviews/` explicit immutable review claims, `hints/` private input
+proposals/receipts, `fix/snapshots/` automatic-fix dispatch evidence, `hand/` manual
+defect fixes, `requests/` (including immutable
+`requests/candidates/` proposals and `requests/rejected/` evidence), and `logs/`
+(prompts and worker transcripts). Retain/archive these together with their
+receipts and identities under the policy below. They are local evidence; never publish them.
+
+### Transaction ownership and retention
+
+The controller owns `RUN/transactions/`: each journal retains exact prior and
+candidate C/hints bytes, SHA-256 input identities, request/resume identity,
+acceptance evidence when available, and lifecycle phase **before** replacement.
+Worker/model pass claims are not acceptance evidence. Completed collection is
+recorded only after terminal status; interrupted collection remains resumable.
+
+Restart restores only bytes whose ownership is proven. After an interrupted
+acceptance, matching authoritative acceptance evidence may complete bookkeeping;
+only explicit authoritative **nonacceptance** permits rollback. Unavailable,
+absent or mismatching ledger proof instead records `quarantined`, preserves all
+current canonical inputs, and blocks further requests/acceptance for that
+function. The real adapter currently has no complete ledger identity proof, so
+this case requires manual/current `cmre` ledger review. No automatic unquarantine
+or guessed success is supported. Quarantine is separate from a failed gate.
+Quarantine is function-local: offline application drains every runnable
+request/verifier/acceptance while retaining that function's blocked requests.
+Unrelated adopts/dismissals still complete. An action whose own target is
+quarantined returns bounded `acceptance-quarantined` JSON and exit 2, including
+when acceptance becomes unknown during that action. It does not abort the
+whole offline queue or roll back potentially accepted bytes.
+
+Canonical hints are read-only to farm workers in both OpenCode configurations.
+Each translation/fix job may edit only its scratch C and private
+`RUN/hints/fn_X-N.json`, initialized from the dispatch hint bytes. The controller
+checks proposal shape/shared-policy restrictions and retains changed proposals,
+their bytes/hashes, and dispatch source/hints identity in a `.proposal.json`
+receipt. A valid proposal produces `hint-evidence-needed`, not automatic canonical
+application or acceptance. Worker tests still use canonical hints and do not
+validate the private proposal. The parent validates/applies it at an authorized
+boundary, then requests fresh verification under the reviewed inputs. There is
+no claimed real-worker mutation-provenance adapter. Unrelated canonical changes
+are preserved and parked; provider/auth paths never restore canonical hints.
+Private drafts replaced on redispatch are retained with their dispatch metadata.
+
+Adopt/dismiss requests must carry `--review-receipt` from the actual prior
+`review --claim NAME`, not a new claim created after a hand fix is reviewed.
+The queue records that immutable receipt's hash and expected source/hints identity.
+Admission verifies both snapshots, current inputs and the reviewed open-concern
+set before taking the receipt bytes as the baseline. Acceptance rechecks the
+concern set too. A queued request cannot rebase onto a newer acceptance or clear
+newer unreviewed concerns.
+Missing, changed, or stale proof is retained under `requests/rejected/` and
+requires fresh review; legacy no-receipt requests fail closed.
+At queue time, adopt copies the proposed output into a unique
+`requests/candidates/` file and records its SHA-256. Admission and verification
+check that identity. Later edits to the original `--source` path do not replace
+the queued proposal. A missing/changed queue copy requires explicit resubmission;
+its hash is not a substitute for the separate prior review-input receipt.
+
+The controller owns immutable `RUN/audit/snapshots/N/` source/hints bytes and
+identity/first-verdict metadata. Metadata bytes and bundle identity are pinned
+at dispatch. Before applying any actionable verdict, the controller verifies
+all required retained target source/hints, metadata, bundle and verdict evidence;
+confirmation also verifies the first review's evidence. Missing/hash-drift
+evidence preserves open concerns and requeues fresh review, even if the returned
+verdict says `ok`. Older unbound metadata is not silently upgraded.
+Auditors own only their unique verdict output. Their target inputs are the
+supplied snapshots; optional callee C is navigation only under the original-only
+ABI evidence rule above. Stale verdicts remain historical evidence and cannot
+cause rollback, dismissal or a fix. A stale old result cannot invalidate a newer
+bound review with intact evidence.
+Automatic fix jobs also freeze their accepted starting source/hints, metadata
+and bundle under `fix/snapshots/N/` and unique bundle paths. Their authorization
+is the exact originating defect review (including confirmation evidence when
+present), not just a source hash or a mutable latest verdict. Origin artifacts
+are checked before dispatch; both origin and fix-dispatch artifacts are checked
+before canonical installation and immediately before serial acceptance.
+Evidence failure preserves current concerns and requeues fresh review. Only an
+unaccepted installed source still matching its transaction may be rolled back;
+newer unrelated canonical C/hints are never restored from a stale fix snapshot.
+Provider retries get new dispatch identities and retain the prior inputs.
+This does not grant extra automatic fix rounds beyond the existing run budget.
+`review` without `--claim` and `status` are read-only; neither reconciles transactions.
+`review --claim NAME` explicitly creates immutable inputs/receipt, not a latest alias.
+
+On a supervised restart with audit workers, retained terminal verdict,
+snapshot and dispatch-bound bundle evidence is checked for the functions in
+**that run**. Missing/hash-drift evidence is requeued for fresh audit. Legacy
+unbound findings stay OPEN as unresolved concerns until actually reviewed;
+stale findings cannot authorize a fix or silently dismiss a backlog item.
+Fresh auditors receive the unresolved concerns explicitly; a result for an older
+concern set cannot clear newly added findings.
+An offline adopt/dismiss has no audit workers and leaves unrelated legacy
+audits/findings untouched. This is per-run reaudit work, not a whole-game
+inventory revalidation request.
+
+Journals, review claims, private hint proposals, snapshots, immutable audit bundles/verdicts, events and associated
+receipts are required local acceptance evidence. They can contain original
+listings, proprietary inputs and raw analysis: keep them under ignored local
+analysis storage and out of published history/packages. **No journal/snapshot
+pruning without a verified archive** retaining exact bytes, identities, phase,
+raw verdicts, receipts and cross-referenced paths. Preserve unresolved
+quarantines in place until reviewed; an ignored directory is not disposable.
 
 ## Open defects
 
@@ -181,9 +350,12 @@ before writing. Then:
 
 - Search with `rg` (it skips the ignored multi-GB `CM0102/` tree) or the
   built-in grep/glob tools; other shell commands are denied.
-- Write only your scratch source. `c_hints` fixtures go in
-  `recovery/hints/fn_X.json` under `"c_hints"`; run
-  `py -3.13 scripts/cmre_hint_check.py recovery/hints/fn_X.json` first.
+- Write only your scratch source and the private hint-proposal path given in
+  your prompt (`RUN/hints/fn_X-N.json`). Canonical `recovery/hints/` is read-only.
+  Put proposed fixtures under `"c_hints"`; run
+  `py -3.13 scripts/cmre_hint_check.py <private-proposal-path>` first.
+  Changed proposals finish `FARM-RESULT: evidence-needed <why>` for parent input
+  validation/application; a worker test is not evidence for that proposal.
 - Start from the draft path `cmre brief` prints, or from the source already
   in your scratch file. Check every statement against the listing.
 - Never shape code generation to pass: no `register`, no optimize attributes,

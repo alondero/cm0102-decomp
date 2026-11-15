@@ -35,8 +35,11 @@ sys.path.insert(0, str(ROOT))
 # DeepSeek runs use v4.1 Flash (Adam's choice); fix jobs use the top rung.
 # Adam added Terra as an ordinary farm lane on 2026-11-15 after provider quotas ran low.
 TERRA_MODEL = 'openai/gpt-6.1-terra'
+COMMANDCODE_FLASH_MODEL = 'commandcode/deepseek/deepseek-v4.1-flash'
+# Same capability/effort tiers as Go, with independent provider availability. Not Flash Fast.
 DEFAULT_LADDER = ('minimax-coding-plan/MiniMax-M3.1-Flash', 'opencode-go/deepseek-v4.1-flash#low',
-                  'opencode-go/deepseek-v4.1-flash', TERRA_MODEL)
+                  COMMANDCODE_FLASH_MODEL + '#low', 'opencode-go/deepseek-v4.1-flash',
+                  COMMANDCODE_FLASH_MODEL, TERRA_MODEL)
 DEFAULT_AUDIT_MODEL = TERRA_MODEL
 # A defect needs a second auditor before any fix: the MiniMax M3 auditor flagged 8 of 8 functions
 # with false positives, DeepSeek #low passed real defects (cross-audits, 2026-11-13). The second
@@ -49,7 +52,7 @@ COORDINATOR_MODEL = 'minimax-coding-plan/MiniMax-M3.1-Flash'
 DEFAULT_SKIP_RANGES = ((0x00940000, 0x00953000),)
 # Events that wake a waiting coordinator (`wait`).
 NOTABLE_EVENTS = ('farm-exit', 'open-defect', 'model-unavailable', 'model-limited', 'supply-empty',
-                  'request-failed')
+                  'request-failed', 'acceptance-quarantined', 'hint-evidence-needed', 'fix-evidence-needed')
 # OpenCode Go has a 5-hour usage limit per account (HTTP 429, hit 2026-11-13 evening); it pauses
 # every model of that provider until it resets. Without a reset time, retry after this long.
 DEFAULT_LIMIT_SECONDS = 900
@@ -66,6 +69,13 @@ WORKER_COMMANDS = ('brief', 'test', 'explain', 'show', 'disasm', 'family', 'work
 # grep over them hung a worker for 23 minutes (2026-11-13 smoke). No grep/ls/find.
 DEFAULT_EFFORT = 'low'
 READ_ONLY_SHELL = ('rg *', 'cat *', 'head *', 'tail *', 'sed -n *', 'wc *', 'Get-Content *')
+AUDIT_AUTHORITY = (
+    'The target source, hints and audit bundle MUST be the supplied immutable snapshots, never moving canonical files.',
+    'Callee C is navigation only: never authority or proof for signatures, ABI or fidelity. Every ABI finding must '
+    'cite original instructions at preferred-image VAs and the pinned CM0102 3.9.68 binary SHA-256 '
+    '0c78e7da6d0bcb4603fa179449bbe6d1c627a22c445d14d489bd9bff86.',
+    'A bound target review is not callee composition or runtime proof; callee reads introduce no automatic global dependency.',
+)
 
 
 @dataclass
@@ -197,7 +207,9 @@ def worker_config(root, job, effort=DEFAULT_EFFORT):
     for name in {_rel(root, own), Path(own).as_posix(), str(Path(own))}:
         edit[name] = 'allow'
     if job['kind'] != 'audit':
-        edit[f'recovery/hints/{fn}.json'] = 'allow'
+        proposal = job.get('hint_source', str(Path(job['source']).with_suffix('.hints.json')))
+        for name in {_rel(root, proposal), Path(proposal).as_posix(), str(Path(proposal))}:
+            edit[name] = 'allow'
     bash = {'*': 'deny'}
     for command in WORKER_COMMANDS:
         bash[f'{PY} -m cmre {command} *'] = 'allow'
@@ -227,7 +239,8 @@ def v2_agent(root, job):
     rules = [('*', '*', 'deny'), ('read', '*', 'allow'), ('grep', '*', 'allow'), ('glob', '*', 'allow'),
              ('edit', _rel(root, own), 'allow')]
     if job['kind'] != 'audit':
-        rules.append(('edit', f'recovery/hints/{fn}.json', 'allow'))
+        proposal = job.get('hint_source', str(Path(job['source']).with_suffix('.hints.json')))
+        rules.append(('edit', _rel(root, proposal), 'allow'))
     shell = [f'{PY} -m cmre {command} *' for command in WORKER_COMMANDS]
     shell += [f'{PY} scripts/cmre_hint_check.py *', *READ_ONLY_SHELL]
     rules += [('shell', command, 'allow') for command in shell]
@@ -281,14 +294,27 @@ def bundle_text(root, job, brief):
              'rules, header, draft or source separately.']
     parts += _fenced('cmre brief (evidence, callers, callees, globals, listing)', brief)
     if kind == 'audit':
+        parts += ['', *AUDIT_AUTHORITY]
         parts += ['', checklist]
-        parts += _fenced(f'Accepted source recovery/c/{fn}.c', _file(root, f'recovery/c/{fn}.c'), 'c')
+        source = job.get('_snap', {}).get('c')
+        text = source.decode('utf-8', errors='replace') if source is not None else _file(root, f'recovery/c/{fn}.c')
+        parts += _fenced(f'Accepted source recovery/c/{fn}.c', text, 'c')
+        hints = job.get('_snap', {}).get('hint')
+        if hints is not None:
+            parts += _fenced('Reviewed hints snapshot', hints.decode('utf-8', errors='replace'), 'json')
+        if job.get('_open_findings'):
+            parts += _fenced('Open concerns to review explicitly (unbound, not assumed true)',
+                             json.dumps(job['_open_findings'], indent=1), 'json')
     else:
         parts += ['', '## Rules (docs/agent/C.md, Loop step 2)',
                   _section(_file(root, 'docs/agent/C.md'), r'2\. Write ', r'3\. '),
                   '', _section(farm_md, r'## Worker rules', r'## ')]
         if kind == 'fix':
             parts += ['', checklist]
+            parts += _fenced('Accepted starting source snapshot',
+                             (job.get('_snap', {}).get('c') or b'').decode('utf-8', errors='replace'), 'c')
+            parts += _fenced('Starting hints snapshot',
+                             (job.get('_snap', {}).get('hint') or b'').decode('utf-8', errors='replace'), 'json')
         draft = re.search(r'^draft: (\S+)', brief, re.M)
         if draft:
             parts += _fenced(f'Draft {draft.group(1)}', _file(root, draft.group(1)), 'c')
@@ -304,14 +330,24 @@ def _bundle_steps(job, first):
     return [f"1. {PY} -m cmre brief {job['fn']}   (evidence, callers, callees, globals, draft path, listing)"]
 
 
+def _hint_steps(root, job):
+    proposal = job.get('hint_source', str(Path(job['source']).with_suffix('.hints.json')))
+    return [f'Private c_hints proposals go ONLY in {_rel(root, proposal)} (initialized from dispatch hints).',
+            'Canonical recovery/hints is read-only. Tests use current canonical hints, not your proposal.',
+            'If your proposal changes, finish FARM-RESULT: evidence-needed <why>; the controller retains it '
+            'for parent validation/application at an authorized stopped boundary. A proposal is not gate evidence.']
+
+
 def translate_prompt(root, job):
     fn, src = job['fn'], _rel(root, job['source'])
     lines = [
         f'CM0102 farm worker. Translate {fn} ({job["bytes"]} bytes, {job.get("module") or "unknown module"}) '
         'to plain C that passes the semantic gate. Do the work now; do not reply with a plan.',
         '',
-        f'Write your C ONLY to {src}. You may also edit recovery/hints/{fn}.json for c_hints fixtures. '
-        'Every other edit and command is denied.',
+        f'Write your C ONLY to {src}. '
+        'Other than the private hints proposal below, every other edit is denied.',
+        *_hint_steps(root, job),
+        *AUDIT_AUTHORITY[1:],
     ]
     if not job.get('bundle'):
         lines += ['Read docs/agent/FARM.md section "Worker rules" once before writing.']
@@ -327,7 +363,8 @@ def translate_prompt(root, job):
         f'4. On a mismatch: {PY} -m cmre explain {fn} --c --source {src} --case N   then fix the first difference.',
         '   Stop after 5 failed tests. Build failures count.',
         '',
-        'Finish with exactly one line: FARM-RESULT: pass | FARM-RESULT: fail <first remaining mismatch>',
+        'Finish with exactly one line: FARM-RESULT: pass | FARM-RESULT: fail <first remaining mismatch> | '
+        'FARM-RESULT: evidence-needed <private hint proposal needs parent>',
     ]
     if job.get('prior'):
         p = job['prior']
@@ -345,7 +382,14 @@ def fix_prompt(root, job):
         f'CM0102 farm fixer. {fn} passed the gate and was accepted, but an audit found fidelity defects '
         'the gate cannot see. Do the work now.',
         '',
-        f'The accepted source is already in {src}. Edit ONLY that file (and recovery/hints/{fn}.json).',
+        f'The accepted source is already in {src}. Edit ONLY that file and private hints proposal '
+        f'{_rel(root, job.get("hint_source", str(Path(job["source"]).with_suffix(".hints.json"))))}.',
+        *_hint_steps(root, job),
+        *AUDIT_AUTHORITY[1:],
+        f'Review the immutable starting inputs {job.get("review_source", src)} and '
+        f'{job.get("review_hints", "no hints snapshot")}. The scratch source is your editable candidate.',
+        'The originating finding artifacts are fixed inputs, not a mutable latest review: '
+        + json.dumps(job.get('_origin_review')),
         *([] if job.get('bundle') else ['Read docs/agent/FARM.md sections "Worker rules" and "Audit checklist".']),
         *_bundle_steps(job, 'the draft, the C.md rules, the worker rules, the audit checklist'),
         '   Verify each finding against the listing. A finding without listing evidence may be a false '
@@ -353,7 +397,8 @@ def fix_prompt(root, job):
         f'2. Fix confirmed defects, then {PY} -m cmre test {fn} --c --source {src} until it passes (5 failures max).',
         '',
         'Audit findings:', findings, '',
-        'Finish with exactly one line: FARM-RESULT: pass <what changed> | FARM-RESULT: fail <why>',
+        'Finish with exactly one line: FARM-RESULT: pass <what changed> | FARM-RESULT: fail <why> | '
+        'FARM-RESULT: evidence-needed <private hint proposal needs parent>',
     ]) + '\n'
 
 
@@ -367,11 +412,17 @@ def audit_prompt(root, job):
         '',
         'Use at most 20 tool calls, then write the verdict file. A finding you cannot prove from the '
         'listing within that budget is not a finding.',
+        f'Review only the immutable source snapshot {job.get("review_source", f"recovery/c/{fn}.c")} '
+        f'and hints snapshot {job.get("review_hints", f"recovery/hints/{fn}.json")} (absent means no hints). '
+        'Do not substitute the live canonical files.',
+        *AUDIT_AUTHORITY,
+        'Independently review every open concern below; "ok" must cover them, not silently discard them: '
+        + json.dumps(job.get('_open_findings', [])),
         *(_bundle_steps(job, 'the audit checklist, the accepted source') if job.get('bundle') else [
             'Read docs/agent/FARM.md section "Audit checklist", then:',
-            f'1. {PY} -m cmre brief {fn}   (it includes the listing) and read recovery/c/{fn}.c']),
-        '2. Walk every checklist item against the listing. Callee sources in recovery/c/ are fair to read '
-        'for their signatures. ' + ('Apart from the bundle, do' if job.get('bundle') else 'Do')
+            f'1. {PY} -m cmre brief {fn}   (it includes the listing) and read {job.get("review_source", f"recovery/c/{fn}.c")}']),
+        '2. Walk every checklist item against the original listing. Callee C may locate evidence only, '
+        'never establish a signature or ABI. ' + ('Apart from the bundle, do' if job.get('bundle') else 'Do')
         + ' not read farm run files, the ledger, transcripts or directories.',
         f'3. Write {out} as JSON: {{"verdict": "ok"|"defect", "findings": '
         '[{"line": N, "detail": "...", "evidence": "listing VA and instruction"}]}',
@@ -394,8 +445,14 @@ def confirm_prompt(root, job):
         'against the listing instructions; do not trust its wording.',
         '',
         'Use at most 20 tool calls, then write the verdict file.',
+        f'Review only the immutable source snapshot {job.get("review_source", f"recovery/c/{fn}.c")} '
+        f'and hints snapshot {job.get("review_hints", f"recovery/hints/{fn}.json")} (absent means no hints). '
+        'Do not substitute the live canonical files.',
+        *AUDIT_AUTHORITY,
+        'Also independently review these open/unbound concerns; "ok" must cover them: '
+        + json.dumps(job.get('_open_findings', [])),
         *(_bundle_steps(job, 'the audit checklist, the accepted source') if job.get('bundle') else [
-            f'1. {PY} -m cmre brief {fn}   (it includes the listing) and read recovery/c/{fn}.c']),
+            f'1. {PY} -m cmre brief {fn}   (it includes the listing) and read {job.get("review_source", f"recovery/c/{fn}.c")}']),
         '2. For each finding, confirm it with the listing VA and instruction, or reject it.',
         f'3. Write {out} as JSON: {{"verdict": "defect"|"ok", "findings": [only the confirmed findings, '
         'each with "line", "detail" and "evidence"]}. "ok" when none is confirmed.',
@@ -412,13 +469,43 @@ def _read(path):
     return path.read_bytes() if path.exists() else None
 
 
+def _durable_json(path, data):
+    """Replace one journal record only after its complete contents reach the OS."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp')
+    with tmp.open('w', encoding='utf-8') as stream:
+        json.dump(data, stream, indent=1)
+        stream.flush()
+        os.fsync(stream.fileno())
+    tmp.replace(path)
+
+
+def _identity(snapshot):
+    return {k: hashlib.sha256(v).hexdigest() if v is not None else None
+            for k, v in snapshot.items()}
+
+
+def _encode_snapshot(snapshot):
+    return {k: v.hex() if v is not None else None for k, v in snapshot.items()}
+
+
+def _decode_snapshot(snapshot):
+    return {k: bytes.fromhex(v) if v is not None else None for k, v in snapshot.items()}
+
+
 def _restore(path, data):
     path = Path(path)
     if data is None:
         path.unlink(missing_ok=True)
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
+        tmp = path.with_name(path.name + '.farm-tmp')
+        with tmp.open('wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        tmp.replace(path)
 
 
 def _validate_worker_hints(before, after):
@@ -468,7 +555,7 @@ class InlineExecutor:
 
 
 class Farm:
-    def __init__(self, run_dir, root, cmre, launcher, config, clock=time.monotonic, verifier=None):
+    def __init__(self, run_dir, root, cmre, launcher, config, clock=time.monotonic, verifier=None, *, reconcile=True):
         self.run_dir, self.root, self.cmre, self.launcher, self.config = Path(run_dir), Path(root), cmre, launcher, config
         self.clock = clock
         # Gate re-tests (median 48 s per job) run here so they never block dispatch.
@@ -499,6 +586,240 @@ class Farm:
         self.frontier = None
         self.seen = set(self.state['accepted']) | set(self.state['parked']) | set(self.state['skipped'])
         self.counter = sum(len(v) for v in self.state['attempts'].values())
+        events, _ = _read_events(self.run_dir / 'events.jsonl', 0)
+        self.counter = max([self.counter, *(e.get('n', 0) for e in events)])
+        for kind in ('audit', 'fix'):
+            retained = [int(path.name) for path in (self.run_dir / kind / 'snapshots').glob('*')
+                        if path.is_dir() and path.name.isdigit()]
+            self.counter = max([self.counter, *retained])
+        if reconcile:
+            self._reconcile_transactions()
+        changed_audits = False
+        for fn in self.state['accepted'] if reconcile and config.audit_workers else ():
+            audit = self.state['audits'].get(fn, {})
+            invalid = audit.get('identity') != _identity(self._inputs(fn))
+            if audit.get('verdict') in ('ok', 'defect'):
+                invalid = invalid or review_paths(self.run_dir, self.root, fn)['status'] != 'bound'
+            if invalid:
+                self._reset_audit(fn)
+                changed_audits = True
+                if config.audit_workers and fn not in self.audit_queue:
+                    self.audit_queue.append(fn)
+        if changed_audits:
+            self.save()
+
+    def _inputs(self, fn):
+        return {'c': _read(self.root / 'recovery/c' / f'{fn}.c'),
+                'hint': _read(self.root / 'recovery/hints' / f'{fn}.json')}
+
+    def _writer_busy(self, fn):
+        if fn in self.state.get('quarantined', {}):
+            return True
+        jobs = ([j for j, _, _ in self.running if j['kind'] != 'audit']
+                + [j for j, _ in self.verifying] + self.accept_queue + self.pending)
+        return any(j['fn'] == fn for j in jobs)
+
+    def _reset_audit(self, fn):
+        prior = self.state['audits'].get(fn)
+        if prior:
+            self.state.setdefault('audit_history', {}).setdefault(fn, []).append(prior.copy())
+        self.state['audits'][fn] = {'rounds': 0, 'fresh_review_required': True}
+        # Unknown or stale evidence cannot dismiss an unresolved legacy concern.
+        if fn in self.state['defects']:
+            self.state['audits'][fn]['unbound_findings'] = self.state['defects'][fn]
+
+    def _fix_evidence_error(self, job, *, before_dispatch=False):
+        if job['kind'] != 'fix':
+            return None
+        try:
+            identity, origin = job['_finding_identity'], job['_origin_review']
+            if identity.get('c') is None:
+                raise ValueError('origin has no reviewed C source')
+            paths, _, _ = _bound_audit_reviews(self.run_dir, self.root, job['fn'], identity, origin)
+            raw = Path(paths['audit_path']).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != origin['verdict_sha256']:
+                raise ValueError('origin verdict changed while checking findings')
+            verdict = json.loads(raw)
+            if verdict.get('verdict') != 'defect' or (verdict.get('findings') or []) != job['findings']:
+                raise ValueError('origin verdict does not authorize these findings')
+            if self.state['defects'].get(job['fn'], []) != job['findings']:
+                raise ValueError('open concerns changed since the originating review')
+            if before_dispatch and _identity(self._inputs(job['fn'])) != identity:
+                raise ValueError('canonical inputs changed since the originating review')
+            if not before_dispatch or '_fix_dispatch' in job:
+                if _identity(job['_snap']) != identity:
+                    raise ValueError('fix dispatch is not based on the reviewed inputs')
+                _, metadata = _review_input_artifacts(
+                    self.run_dir, self.root, job['fn'], identity, job['_fix_dispatch'])
+                if metadata.get('origin_review') != origin or metadata.get('open_findings') != job['findings']:
+                    raise ValueError('fix dispatch origin/concerns binding changed')
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return f'fix evidence unavailable or changed: {exc}'
+        return None
+
+    def _invalidate_fix(self, job, detail):
+        """Retire only an unaccepted owned installation; never resurrect stale concerns."""
+        if '_transaction' in job:
+            safe = self._rollback(job)
+            self._terminal(job, 'failed' if safe else 'conflict')
+        self._event('result', fn=job['fn'], kind='fix', model=job['model'], n=job['n'],
+                    outcome='stale-fix', detail=detail[:300])  # evidence failure is not a model attempt
+        fn, identity = job['fn'], _identity(self._inputs(job['fn']))
+        audit = self.state['audits'].get(fn, {})
+        if (audit.get('verdict') in ('ok', 'defect') and audit.get('identity') == identity
+                and audit.get('review') != job.get('_origin_review')
+                and self.state['defects'].get(fn, []) == (
+                    audit.get('findings', []) if audit['verdict'] == 'defect' else [])):
+            try:
+                _bound_audit_reviews(self.run_dir, self.root, fn, identity, audit['review'])
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            else:
+                return  # newer intact evidence stays authoritative, not this stale fix
+        self._reset_audit(fn)
+        if fn not in self.audit_queue:
+            self.audit_queue.append(fn)
+        self._event('fix-evidence-needed', fn=fn, n=job['n'], detail=detail[:300])
+
+    def _retry_worker(self, job):
+        if job['kind'] == 'fix':
+            # A provider retry is a new immutable dispatch, with the same origin.
+            extra = {k: job[k] for k in ('bytes', 'module', 'hold', 'findings',
+                                        '_finding_identity', '_origin_review') if k in job}
+            again = self._new_job('fix', job['fn'], job['model'], job['rung'], **extra)
+        else:
+            again = {k: v for k, v in job.items() if k not in ('_snap', '_seed_bytes')}
+        again['_seed'] = job.get('_seed_bytes')
+        self.pending.insert(0, again)
+
+    def _transaction(self, job, phase=None, **updates):
+        path = Path(job['_transaction'])
+        data = json.loads(path.read_text(encoding='utf-8'))
+        if _identity(_decode_snapshot(data['candidate'])) != data['identity']:
+            raise RuntimeError(f'candidate journal identity mismatch: {path}')
+        if phase is not None or updates:
+            data.update(updates)
+        if phase is not None:
+            data['phase'] = phase
+        if phase is not None or updates:
+            _durable_json(path, data)
+        return data
+
+    def _begin_transaction(self, job):
+        # The journal contains bytes, not merely names of mutable draft files.
+        hint = self._inputs(job['fn'])['hint']
+        # A fresh read is an input, not proof that this job wrote it.
+        owned_hint = self._owns_hint(job, hint)
+        candidate = {'c': _read(job['source']), 'hint': hint if owned_hint else job['_snap']['hint']}
+        job['_unowned_hint'] = not owned_hint
+        path = self.run_dir / 'transactions' / f"{job['n']:08d}.json"
+        job['_transaction'] = str(path)
+        metadata = {k: v for k, v in job.items()
+                    if k not in ('_snap', '_seed', '_seed_bytes')}
+        _durable_json(path, {'schema': 'cmre-farm-candidate/1', 'phase': 'prepared',
+                            'job': metadata, 'prior': _encode_snapshot(job['_snap']),
+                            'candidate': _encode_snapshot(candidate), 'identity': _identity(candidate)})
+
+    def _rollback(self, job):
+        data = self._transaction(job)
+        current = self._inputs(job['fn'])
+        prior, candidate = _decode_snapshot(data['prior']), _decode_snapshot(data['candidate'])
+        conflicts = []
+        for key, directory, suffix in (('c', 'c', '.c'), ('hint', 'hints', '.json')):
+            # Canonical hints are read-only: legacy journals did not prove
+            # ownership of worker/external changes, so never restore those bytes.
+            allowed = ((prior[key], candidate[key]) if key == 'c' and data['phase'] != 'prepared'
+                       else (prior[key],))
+            if current[key] in allowed:
+                if key == 'c' and current[key] != prior[key]:
+                    _restore(self.root / 'recovery' / directory / (job['fn'] + suffix), prior[key])
+            else:
+                conflicts.append(key)
+        if conflicts:
+            self._event('transaction-conflict', fn=job['fn'], n=job['n'], fields=conflicts)
+        return not conflicts
+
+    @staticmethod
+    def _owns_hint(job, hint):
+        return hint == job['_snap']['hint']
+
+    def _running_inputs_match(self, job):
+        """Provider failures cannot claim whatever happened to appear after dispatch."""
+        current = self._inputs(job['fn'])
+        if current['c'] != job['_snap']['c'] or not self._owns_hint(job, current['hint']):
+            self._event('running-input-conflict', fn=job['fn'], n=job['n'])
+            self._park(job['fn'], 'running job lost canonical input ownership')
+            return False
+        return True
+
+    def _quarantine(self, job, reason):
+        self._transaction(job, 'quarantined', quarantine_reason=reason)
+        self.state.setdefault('quarantined', {})[job['fn']] = {
+            'n': job['n'], 'journal': job['_transaction'], 'reason': reason}
+        self.seen.add(job['fn'])
+        self._event('acceptance-quarantined', fn=job['fn'], n=job['n'], reason=reason)
+
+    def _terminal(self, job, phase):
+        if '_transaction' not in job:
+            return
+        self._transaction(job, phase)
+        if job.get('_resume_collect') and phase in ('complete', 'failed'):
+            self.state.setdefault('resume_collected', {})[job['fn']] = job['_resume_collect']
+        if job.get('_request') and phase in ('complete', 'failed', 'conflict'):
+            Path(job['_request']).unlink(missing_ok=True)
+
+    def _reconcile_transactions(self):
+        for path in sorted((self.run_dir / 'transactions').glob('*.json')):
+            data = json.loads(path.read_text(encoding='utf-8'))
+            if data.get('schema') != 'cmre-farm-candidate/1':
+                raise RuntimeError(f'unsupported candidate journal: {path}')
+            job = data['job']
+            if _identity(_decode_snapshot(data['candidate'])) != data['identity']:
+                raise RuntimeError(f'candidate journal identity mismatch: {path}')
+            self.counter = max(self.counter, job['n'])
+            if data['phase'] in ('complete', 'failed', 'conflict', 'reverify'):
+                # A crash may fall between recording terminal status and removing its request.
+                if data['phase'] != 'reverify':
+                    self._terminal(job, data['phase'])
+                continue
+            job['_snap'] = _decode_snapshot(data['prior'])
+            if data['phase'] == 'quarantined':
+                self._quarantine(job, data['quarantine_reason'])
+                continue
+            if job['kind'] == 'fix' and data['phase'] not in ('accepting', 'accepted'):
+                detail = self._fix_evidence_error(job)
+                if detail:
+                    self._invalidate_fix(job, detail)
+                    continue
+            matched = False
+            nonacceptance_proven = False
+            if data['phase'] in ('accepting', 'accepted'):
+                if data['phase'] == 'accepted':
+                    matched = True  # persisted successful adapter return
+                else:
+                    try:
+                        evidence = self.cmre.acceptance_identity(job['fn'])
+                    except (AttributeError, NotImplementedError) as exc:
+                        self._event('acceptance-evidence-unavailable', fn=job['fn'], detail=str(exc))
+                    else:
+                        matched = evidence == data['identity']
+                        nonacceptance_proven = evidence == {'status': 'not-accepted'}
+            if data['phase'] in ('accepting', 'accepted') and (
+                    not nonacceptance_proven and (
+                        not matched or _identity(self._inputs(job['fn'])) != data['identity'])):
+                self._quarantine(job, 'acceptance unresolved; preserve inputs for manual/current cmre ledger review')
+                continue
+            if matched and _identity(self._inputs(job['fn'])) == data['identity']:
+                if data['phase'] != 'accepted':
+                    self._transaction(job, 'accepted', acceptance_evidence=evidence)
+                self._accepted(job)
+            else:
+                safe = self._rollback(job)
+                self._terminal(job, 'reverify' if safe else 'conflict')
+                if not safe:
+                    self._park(job['fn'], 'interrupted candidate conflicts with current canonical inputs')
+                self._event('candidate-reverification-required', fn=job['fn'], n=job['n'])
+        self.save()
 
     @staticmethod
     def _needs_audit(audit):
@@ -548,7 +869,8 @@ class Farm:
                 'audits_unconfirmed': audits.count('unconfirmed'),
                 'audits_disputed': sum(a.get('verdict') == 'ok' and bool(a.get('disputed') or a.get('dismissed'))
                                        for a in self.state['audits'].values()),
-                'open_defects': sorted(self.state['defects']),
+                 'open_defects': sorted(self.state['defects']),
+                 'quarantined': dict(self.state.get('quarantined', {})),
                 'unavailable_models': dict(self.state['unavailable_models']),
                 'limited': {p: v['until'] for p, v in self.state.get('limited_providers', {}).items()
                             if v['until'] > time.time()},
@@ -604,6 +926,19 @@ class Farm:
         i = 0
         while i < len(self.pending):
             job = self.pending[i]
+            if job['fn'] in self.state.get('quarantined', {}):
+                i += 1
+                continue
+            detail = self._fix_evidence_error(job, before_dispatch=True)
+            if detail:
+                self.pending.pop(i)
+                self._invalidate_fix(job, detail)
+                continue
+            active = ([j for j, _, _ in self.running if j['kind'] != 'audit']
+                      + [j for j, _ in self.verifying] + self.accept_queue)
+            if any(j['fn'] == job['fn'] for j in active):
+                i += 1
+                continue
             model, rung = self._rung_model(job['rung'])
             if model is not None:
                 job.update(model=model, rung=rung)
@@ -620,13 +955,14 @@ class Farm:
         self.counter += 1
         job = {'kind': kind, 'fn': fn, 'model': model, 'rung': rung, 'n': self.counter, **extra}
         if kind == 'audit':
-            name = f'{fn}.confirm.json' if extra.get('confirm') else f'{fn}.json'
+            name = f'{fn}-{self.counter}.confirm.json' if extra.get('confirm') else f'{fn}-{self.counter}.json'
             job['audit_path'] = str(self.run_dir / 'audit' / name)
         else:
             job['source'] = str(self.run_dir / 'src' / f'{fn}.c')
+            job['hint_source'] = str(self.run_dir / 'hints' / f'{fn}-{self.counter}.json')
         return job
 
-    def _resume_seed(self, fn):
+    def _resume_seed(self, fn, *, collect=False):
         """An interrupted candidate is a hash-bound draft, never gate evidence."""
         manifest = self.run_dir / 'resume-candidates.json'
         if not manifest.exists():
@@ -638,6 +974,15 @@ class Farm:
             row = data.get('sources', {}).get(fn)
             if not row:
                 return None
+            if collect and not row.get('collect'):
+                return None
+            if collect and self.state.get('resume_collected', {}).get(fn) == row.get('sha256'):
+                return None
+            if collect:
+                hints = _read(self.root / 'recovery/hints' / f'{fn}.json')
+                digest = hashlib.sha256(hints).hexdigest() if hints is not None else None
+                if 'hints_sha256' not in row or row['hints_sha256'] != digest:
+                    raise ValueError('resume candidate hints identity changed or missing')
             source = (self.run_dir / row['path']).resolve()
             if not source.is_relative_to(self.run_dir.resolve()):
                 raise ValueError('resume candidate escapes run directory')
@@ -651,18 +996,57 @@ class Farm:
             return None
 
     def _launch(self, job):
+        detail = self._fix_evidence_error(job, before_dispatch=True)
+        if detail:
+            self._invalidate_fix(job, detail)
+            return False
         c_path = self.root / 'recovery/c' / f"{job['fn']}.c"
         hint_path = self.root / 'recovery/hints' / f"{job['fn']}.json"
         job['_snap'] = {'c': _read(c_path), 'hint': _read(hint_path)}
+        if job['kind'] in ('audit', 'fix'):
+            snapshot = self.run_dir / job['kind'] / 'snapshots' / str(job['n'])
+            snapshot.mkdir(parents=True, exist_ok=False)
+            for key, name in (('c', 'source.c'), ('hint', 'hints.json')):
+                _restore(snapshot / name, job['_snap'][key])
+            job['review_source'] = _rel(self.root, snapshot / 'source.c')
+            job['review_hints'] = _rel(self.root, snapshot / 'hints.json')
+            job['_audit_state'] = json.loads(json.dumps(self.state['audits'].get(job['fn'], {})))
+            job['_open_findings'] = json.loads(json.dumps(self.state['defects'].get(job['fn'], [])))
+            snapshot_metadata = {
+                'identity': _identity(job['_snap']), 'fn': job['fn'], 'n': job['n'],
+                'kind': job['kind'], 'origin_review': job.get('_origin_review'),
+                'model': job['model'], 'confirm': bool(job.get('confirm')),
+                'audit_state': job['_audit_state'], 'open_findings': job['_open_findings']}
         job.pop('bundle', None)
         bundle = self._bundle(job)
         if bundle is not None:
             job['bundle'] = _rel(self.root, bundle)
+        if job['kind'] in ('audit', 'fix'):
+            job['_bundle_sha256'] = _identity({'bundle': _read(bundle) if bundle is not None else None})['bundle']
+            snapshot_metadata.update(bundle=job.get('bundle'), bundle_sha256=job['_bundle_sha256'])
+            _durable_json(snapshot / 'identity.json', snapshot_metadata)
+            job['_snapshot_metadata_sha256'] = hashlib.sha256((snapshot / 'identity.json').read_bytes()).hexdigest()
+            if job['kind'] == 'fix':
+                job['_fix_dispatch'] = {
+                    'snapshot': str(snapshot), 'snapshot_metadata_sha256': job['_snapshot_metadata_sha256'],
+                    'bundle': job.get('bundle'), 'bundle_sha256': job['_bundle_sha256']}
         if job['kind'] == 'audit':
             Path(job['audit_path']).parent.mkdir(parents=True, exist_ok=True)
             Path(job['audit_path']).unlink(missing_ok=True)
             prompt = confirm_prompt(self.root, job) if job.get('confirm') else audit_prompt(self.root, job)
         else:
+            proposal = Path(job['hint_source'])
+            proposal.parent.mkdir(parents=True, exist_ok=True)
+            old_proposal = _read(proposal)
+            if old_proposal is not None and old_proposal != job['_snap']['hint']:
+                dispatch = _read(proposal.with_suffix('.dispatch.json'))
+                _durable_json(proposal.with_name(f'{proposal.stem}.retained-{time.time_ns()}.json'), {
+                    'proposal': old_proposal.hex(),
+                    'dispatch': json.loads(dispatch) if dispatch is not None else None})
+            _restore(proposal, job['_snap']['hint'])
+            job['_hint_dispatched'] = True
+            _durable_json(proposal.with_suffix('.dispatch.json'), {
+                'fn': job['fn'], 'n': job['n'], 'identity': _identity(job['_snap'])})
             source = Path(job['source'])
             source.parent.mkdir(parents=True, exist_ok=True)
             seed = job.pop('_seed', None)
@@ -676,10 +1060,15 @@ class Farm:
             _restore(source, seed)
             job['_seed_bytes'] = seed
             prompt = fix_prompt(self.root, job) if job['kind'] == 'fix' else translate_prompt(self.root, job)
+        detail = self._fix_evidence_error(job, before_dispatch=True)
+        if detail:
+            self._invalidate_fix(job, detail)
+            return False
         handle = self.launcher.start(job, prompt, worker_config(self.root, job))
         self.running.append((job, handle, self.clock()))
         self._event('dispatch', fn=job['fn'], kind=job['kind'], model=job['model'], n=job['n'])
         self.save()  # large first dispatch must not look dead to the event monitor
+        return True
 
     def _bundle(self, job):
         """Write the job's bundle file; None (classic prompt) when the brief is unavailable."""
@@ -693,7 +1082,8 @@ class Farm:
             return None
         if not text:
             return None
-        path = self.run_dir / 'bundle' / f"{job['fn']}.md"
+        name = f"{job['fn']}-{job['n']}.md" if job['kind'] in ('audit', 'fix') else f"{job['fn']}.md"
+        path = self.run_dir / 'bundle' / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(bundle_text(self.root, job, text), encoding='utf-8')
         return path
@@ -717,17 +1107,46 @@ class Farm:
                 model, rung = self._rung_model(0)
                 job = self._new_job('translate', item.fn, model, rung, bytes=item.bytes,
                                     module=item.module, hold=hold)
-            self._launch(job)
-            translators.append(job)
+                seed = self._resume_seed(item.fn, collect=True)
+                if seed is not None:
+                    # The operator must quiesce old sessions and retain hash-bound
+                    # inputs before opting into collection. Neither a worker's
+                    # claimed pass nor an interrupted test is gate evidence.
+                    job['_snap'] = {
+                        'c': _read(self.root / 'recovery/c' / f'{item.fn}.c'),
+                        'hint': _read(self.root / 'recovery/hints' / f'{item.fn}.json')}
+                    Path(job['source']).parent.mkdir(parents=True, exist_ok=True)
+                    Path(job['source']).write_bytes(seed)
+                    job['_resume_collect'] = hashlib.sha256(seed).hexdigest()
+                    self._event('resume-collect', fn=item.fn, n=job['n'])
+                    self.save()
+                    self._verify(job, False)
+                    translators.append(job)
+                    continue
+            if self._launch(job):
+                translators.append(job)
         audits = [j for j, _, _ in self.running if j['kind'] == 'audit']
         while len(audits) < self.config.audit_workers and self.audit_queue and self.config.audit_model:
-            fn = self.audit_queue[0]
+            index = next((i for i, fn in enumerate(self.audit_queue)
+                          if not self._writer_busy(fn) and all(j['fn'] != fn for j in audits)), None)
+            if index is None:
+                break
+            fn = self.audit_queue[index]
             prior = self.state['audits'].get(fn, {})
+            if prior.get('verdict') and prior.get('identity') != _identity(self._inputs(fn)):
+                self._reset_audit(fn)
+                prior = self.state['audits'][fn]
+            if prior.get('verdict') == 'unconfirmed':
+                try:
+                    _bound_audit_reviews(self.run_dir, self.root, fn, _identity(self._inputs(fn)), prior['review'])
+                except (OSError, ValueError, KeyError, TypeError):
+                    self._reset_audit(fn)
+                    prior = self.state['audits'][fn]
             confirm = prior.get('verdict') == 'unconfirmed' and self.config.confirm_model
             model = self._audit_model(self.config.confirm_model if confirm else self.config.audit_model)
             if model is None:
                 break   # every audit lane is paused or retired; retain the queue
-            self.audit_queue.pop(0)
+            self.audit_queue.pop(index)
             accepted = self.state['accepted'][fn]
             if confirm:
                 job = self._new_job('audit', fn, model, bytes=accepted['bytes'],
@@ -747,14 +1166,23 @@ class Farm:
                     outcome=outcome, detail=detail[:300])
 
     def _fail(self, job, detail):
-        snap = job['_snap']
-        _restore(self.root / 'recovery/c' / f"{job['fn']}.c", snap['c'])
-        _restore(self.root / 'recovery/hints' / f"{job['fn']}.json", snap['hint'])
+        safe = self._rollback(job) if '_transaction' in job else True
+        self._terminal(job, 'failed' if safe else 'conflict')
         self._record(job, 'fail', detail)
         fn = job['fn']
+        if job.get('_hint_evidence_needed'):
+            self.state.setdefault('hint_proposals', {})[fn] = job['_hint_evidence_needed']
+            self._event('hint-evidence-needed', fn=fn, n=job['n'], **job['_hint_evidence_needed'])
+            self._park(fn, detail)
+            return
+        if not safe:
+            # Do not turn identity loss into a fresh retry based on somebody
+            # else's canonical work. An operator must explicitly resolve it.
+            self._park(fn, 'canonical identity conflict: ' + detail)
+            return
         if job['kind'] == 'fix':
-            self.state['defects'][fn] = self.state['audits'].get(fn, {}).get('findings', [])
-            self._event('open-defect', fn=fn, detail=detail[:300])
+            self._event('open-defect' if fn in self.state['defects'] else 'fix-failed',
+                        fn=fn, detail=detail[:300])
             return
         if job['kind'] == 'adopt':   # a coordinator hand fix: the accepted source stays
             self._event('request-failed', fn=fn, kind='adopt', detail=detail[:300])
@@ -772,41 +1200,49 @@ class Farm:
             self._park(fn, detail)
 
     def _park(self, fn, detail):
+        self.seen.add(fn)
         self.state['parked'][fn] = {'detail': detail[:600],
                                     'models': [r['model'] for r in self.state['attempts'].get(fn, [])]}
         self.cmre.release(self.config.owner, [fn])
 
     def _limited(self, job, message, seconds):
         """Provider usage limit: pause the provider, requeue the job, spend no attempt."""
-        _restore(self.root / 'recovery/c' / f"{job['fn']}.c", job['_snap']['c'])
-        _restore(self.root / 'recovery/hints' / f"{job['fn']}.json", job['_snap']['hint'])
+        detail = self._fix_evidence_error(job, before_dispatch=True)
+        if detail:
+            self._invalidate_fix(job, detail)
+        safe = not detail and (job['kind'] == 'audit' or self._running_inputs_match(job))
         provider = job['model'].split('/', 1)[0]
         until = time.time() + max(60, seconds)
         self.state['limited_providers'][provider] = {'until': until, 'message': message[:300]}
         self._event('model-limited', provider=provider, model=job['model'], until=until,
                     message=message[:300], fn=job['fn'], n=job['n'])
+        if not safe:
+            return
         if job['kind'] == 'audit':
             self.audit_queue.insert(0, job['fn'])
             return
-        again = {k: v for k, v in job.items() if k not in ('_snap', '_seed_bytes')}
-        again['_seed'] = job.get('_seed_bytes')
-        self.pending.insert(0, again)
+        self._retry_worker(job)
 
     def _infra(self, job, error):
         """Provider/auth failure: not the model's attempt. Retire the model, requeue the job."""
-        _restore(self.root / 'recovery/c' / f"{job['fn']}.c", job['_snap']['c'])
-        _restore(self.root / 'recovery/hints' / f"{job['fn']}.json", job['_snap']['hint'])
+        detail = self._fix_evidence_error(job, before_dispatch=True)
+        if detail:
+            self._invalidate_fix(job, detail)
+        safe = not detail and (job['kind'] == 'audit' or self._running_inputs_match(job))
         self.state['unavailable_models'][job['model']] = error[:300]
         self._event('model-unavailable', model=job['model'], error=error[:300], fn=job['fn'], n=job['n'])
+        if not safe:
+            return
         if job['kind'] == 'audit':
             if self.config.audit_model:
                 self.audit_queue.insert(0, job['fn'])
             return
-        again = {k: v for k, v in job.items() if k not in ('_snap', '_seed_bytes')}
-        again['_seed'] = job.get('_seed_bytes')
-        self.pending.insert(0, again)
+        self._retry_worker(job)
 
     def _verify(self, job, timed_out):
+        if job['fn'] in self.state.get('quarantined', {}):
+            raise RuntimeError('acceptance quarantined: manual/current cmre ledger review required')
+        self._begin_transaction(job)
         self.verifying.append((job, self.verifier.submit(self._check, job, timed_out)))
 
     def _check(self, job, timed_out):
@@ -815,15 +1251,39 @@ class Farm:
         Runs on a verifier thread: it reads the job and calls the gate; only the canonical copy
         into recovery/c/ is written here, and the main loop restores it on failure."""
         fn, source = job['fn'], Path(job['source'])
+        detail = self._fix_evidence_error(job)
+        if detail:
+            job['_fix_evidence_invalid'] = detail
+            return detail
+        if job.get('_unowned_hint'):
+            return 'canonical hints changed since dispatch; read-only input conflict'
         if job.get('_stalled'):
             return f'stalled: no worker output for {self.config.stall_minutes} min'
         if timed_out:
             return f'timeout after {self.config.attempt_minutes} min'
+        if job.get('_hint_dispatched'):
+            proposal = _read(job['hint_source'])
+            if proposal != job['_snap']['hint']:
+                try:
+                    _validate_worker_hints(job['_snap']['hint'], proposal)
+                except (ValueError, TypeError, UnicodeError) as exc:
+                    return f'worker hints rejected: {exc}'
+                receipt = Path(job['hint_source']).with_suffix('.proposal.json')
+                _durable_json(receipt, {'fn': fn, 'n': job['n'],
+                                        'dispatch_identity': _identity(job['_snap']),
+                                        'proposal': proposal.hex() if proposal is not None else None,
+                                        'sha256': _identity({'hint': proposal})['hint']})
+                job['_hint_evidence_needed'] = {
+                    'receipt': str(receipt), 'dispatch_identity': _identity(job['_snap']),
+                    'sha256': _identity({'hint': proposal})['hint']}
+                return 'private hint proposal requires parent validation/application at an authorized boundary'
         text_bytes = _read(source)
         if text_bytes is None:
             if job.get('_finish') == 'length':
                 return 'worker hit the output cap before writing source'
             return 'worker wrote no source'
+        if job.get('expected_source_sha256') and hashlib.sha256(text_bytes).hexdigest() != job['expected_source_sha256']:
+            return 'queued candidate bytes changed; explicit resubmission required'
         if text_bytes == job.get('_seed_bytes'):
             return 'worker left the starting source unchanged'
         text = text_bytes.decode('utf-8', errors='replace')
@@ -840,7 +1300,18 @@ class Farm:
         if report.get('status') != 'pass':
             return report_detail(report)
         target = self.root / 'recovery/c' / f'{fn}.c'
-        target.write_bytes(text_bytes)
+        data = self._transaction(job)
+        if _read(target) != job['_snap']['c']:
+            return 'canonical source changed since dispatch'
+        if _identity({'c': text_bytes, 'hint': self._inputs(fn)['hint']}) != data['identity']:
+            return 'candidate inputs changed during verification'
+        detail = self._fix_evidence_error(job)
+        if detail:
+            job['_fix_evidence_invalid'] = detail
+            return detail
+        self._transaction(job, 'installing')
+        _restore(target, text_bytes)
+        self._transaction(job, 'installed')
         report = self.cmre.test(fn, None)
         if report.get('status') != 'pass':
             return 'canonical: ' + report_detail(report)
@@ -858,21 +1329,82 @@ class Farm:
                 detail = f'verification crashed: {exc}'
             if detail is None:
                 self.accept_queue.append(job)
+            elif job.get('_fix_evidence_invalid'):
+                self._invalidate_fix(job, detail)
             else:
                 self._fail(job, detail)
         self.verifying = waiting
 
     def _audit_result(self, job, timed_out):
         fn = job['fn']
+        raw = None
         try:
-            data = json.loads(Path(job['audit_path']).read_text(encoding='utf-8'))
+            raw = _read(job['audit_path'])
+            if raw is None:
+                raise ValueError('no audit file')
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError('audit verdict must be an object')
             verdict = data.get('verdict')
             findings = data.get('findings') or []
         except (OSError, ValueError):
             verdict, findings = 'error', ['timeout' if timed_out else 'no audit file']
         if verdict not in ('ok', 'defect'):
             verdict = 'error'
+        identity = _identity(job['_snap'])
+        stale = identity != _identity(self._inputs(fn))
+        findings_changed = job.get('_open_findings', []) != self.state['defects'].get(fn, [])
+        stale = stale or findings_changed
+        review = {
+            'audit_path': job['audit_path'], 'bundle': job.get('bundle'),
+            'bundle_sha256': job.get('_bundle_sha256'),
+            'snapshot': str(self.run_dir / 'audit/snapshots' / str(job['n'])),
+            'snapshot_metadata_sha256': job.get('_snapshot_metadata_sha256'),
+            'verdict_sha256': _identity({'verdict': raw})['verdict']}
+        invalid_artifacts = False
+        try:
+            _review_input_artifacts(self.run_dir, self.root, fn, identity, review)
+            if verdict in ('ok', 'defect'):
+                _bound_review(self.run_dir, self.root, fn, identity, review)
+            if job.get('confirm'):
+                _bound_audit_reviews(self.run_dir, self.root, fn, identity, job['_audit_state']['review'])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            invalid_artifacts = True
+            self._event('audit-evidence-invalid', fn=fn, n=job['n'], detail=str(exc)[:300])
+        stale = stale or invalid_artifacts
+        if job.get('confirm'):
+            stale = stale or job.get('_audit_state') != self.state['audits'].get(fn, {})
+        self.state.setdefault('audit_history', {}).setdefault(fn, []).append(
+            {'n': job['n'], 'identity': identity, 'path': job['audit_path'],
+             'outcome': 'stale' if stale else verdict})
+        if stale:
+            self._record(job, 'stale', json.dumps(findings))
+            current_audit = self.state['audits'].get(fn, {})
+            current_identity = _identity(self._inputs(fn))
+            if (current_audit.get('verdict') in ('ok', 'defect')
+                    and current_audit.get('identity') == current_identity
+                    and current_audit.get('review', {}).get('audit_path') != job['audit_path']
+                    and self.state['defects'].get(fn, []) == (
+                        current_audit.get('findings', []) if current_audit['verdict'] == 'defect' else [])):
+                try:
+                    _bound_audit_reviews(self.run_dir, self.root, fn, current_identity, current_audit['review'])
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass  # current evidence also needs fresh review below
+                else:
+                    return  # this old stale result cannot invalidate a newer bound verdict
+            if invalid_artifacts or findings_changed or current_audit.get('identity') != current_identity:
+                self._reset_audit(fn)
+                if fn not in self.audit_queue:
+                    self.audit_queue.append(fn)
+            elif self._needs_audit(self.state['audits'].get(fn, {})) and fn not in self.audit_queue:
+                self.audit_queue.append(fn)
+            return
         audit = self.state['audits'].setdefault(fn, {'rounds': 0})
+        audit['identity'] = identity
+        if verdict in ('ok', 'defect'):
+            audit.pop('fresh_review_required', None)
+            audit.pop('unbound_findings', None)
+            audit['review'] = review
         if job.get('confirm'):
             return self._confirm_result(job, audit, verdict, findings)
         audit.update(verdict=verdict, findings=findings, model=job['model'])
@@ -911,8 +1443,11 @@ class Farm:
         if rounds < MAX_FIX_ROUNDS and not self.stopping():
             self.state['fix_rounds'][fn] = rounds + 1
             fix = self._new_job('fix', fn, self.config.ladder[-1], len(self.config.ladder) - 1,
-                                bytes=self.state['accepted'][fn]['bytes'], findings=findings)
+                                bytes=self.state['accepted'][fn]['bytes'],
+                                findings=json.loads(json.dumps(findings)),
+                                _origin_review=json.loads(json.dumps(self.state['audits'].get(fn, {}).get('review'))))
             fix['_seed'] = _read(self.root / 'recovery/c' / f'{fn}.c')
+            fix['_finding_identity'] = _identity(self._inputs(fn))
             self.pending.insert(0, fix)
         else:
             self._event('open-defect', fn=fn, findings=len(findings))
@@ -952,6 +1487,10 @@ class Farm:
         waiting = []
         for job in self.accept_queue:
             fn = job['fn']
+            detail = self._fix_evidence_error(job)
+            if detail:
+                self._invalidate_fix(job, detail)
+                continue
             hold = self.cmre.hold(fn)
             for _ in range(5):
                 if not hold or hold.get('state') not in HARD_HOLDS:
@@ -959,25 +1498,80 @@ class Farm:
                 self.cmre.retry(fn, f"farm {self.config.owner}: gate pass under current harness; "
                                     f"async audit owns the held concern ({hold.get('reason', '')[:120]})")
                 hold = self.cmre.hold(fn)
+            # Holds/retries can take time: compare the exact tested bytes at the last
+            # controller boundary before entering the serial acceptance adapter.
+            data = self._transaction(job)
+            detail = self._fix_evidence_error(job)
+            if detail:
+                self._invalidate_fix(job, detail)
+                continue
+            if ('reviewed_findings' in job
+                    and job['reviewed_findings'] != self.state['defects'].get(fn, [])):
+                self._fail(job, 'reviewed concerns changed before acceptance; fresh review required')
+                continue
+            if _identity(self._inputs(fn)) != data['identity']:
+                self._fail(job, 'canonical identity changed before acceptance')
+                continue
+            self._transaction(job, 'accepting')
             code, output = self.cmre.accept(fn)
             if code == 2:
+                self._transaction(job, 'waiting-lease', acceptance_result={'code': code, 'output': output})
                 waiting.append(job)   # another writer holds the lease; try next tick
                 continue
             if code != 0:
-                self._fail(job, f'accept refused: {output[-600:]}')
+                # An error return alone does not prove the ledger wasn't written.
+                # Use the same authoritative evidence contract as restart.
+                self._transaction(job, acceptance_result={'code': code, 'output': output})
+                try:
+                    evidence = self.cmre.acceptance_identity(fn)
+                except (AttributeError, NotImplementedError) as exc:
+                    self._event('acceptance-evidence-unavailable', fn=fn, detail=str(exc))
+                    evidence = None
+                if evidence == {'status': 'not-accepted'}:
+                    self._fail(job, f'accept refused: {output[-600:]}')
+                elif evidence == data['identity'] and _identity(self._inputs(fn)) == data['identity']:
+                    self._transaction(job, 'accepted', acceptance_evidence=evidence)
+                    self._accepted(job)
+                else:
+                    self._quarantine(job, 'accept error without authoritative outcome; manual/current cmre ledger review required')
                 continue
+            self._transaction(job, 'accepted', acceptance_result={'code': code, 'output': output})
+            self._accepted(job)
+        self.accept_queue = waiting
+
+    def _accepted(self, job):
+        fn = job['fn']
+        if self.state['accepted'].get(fn, {}).get('transaction_n') != job['n']:
             self._record(job, 'pass', 'accepted')
             was_held = bool(job.get('hold')) or bool(self.state['accepted'].get(fn, {}).get('was_held'))
             self.state['accepted'][fn] = {'bytes': job['bytes'], 'model': job['model'], 'kind': job['kind'],
-                                          'at': time.time(), 'was_held': was_held, 'hold': job.get('hold')}
+                                          'at': time.time(), 'was_held': was_held, 'hold': job.get('hold'),
+                                          'identity': self._transaction(job)['identity'], 'transaction_n': job['n']}
             self._event('accepted', fn=fn, bytes=job['bytes'], model=job['model'], kind=job['kind'])
-            if job['kind'] == 'adopt':   # a coordinator hand fix: audit it afresh
-                self.state['defects'].pop(fn, None)
-                self.state['audits'][fn] = {'rounds': 0, 'adopted': job.get('note', '')}
-            rounds = self.state['audits'].get(fn, {}).get('rounds', 0)
-            if self.config.audit_workers and rounds < MAX_AUDIT_ROUNDS:
-                self.audit_queue.append(fn)
-        self.accept_queue = waiting
+            self._reset_audit(fn)
+            if job['kind'] == 'adopt':
+                self.state['audits'][fn]['adopted'] = job.get('note', '')
+                if job.get('reviewed_findings', []) == self.state['defects'].get(fn, []):
+                    self.state['defects'].pop(fn, None)  # only concerns actually covered by this review
+                    self.state['audits'][fn].pop('unbound_findings', None)
+        self.seen.add(fn)
+        if self.config.audit_workers and fn not in self.audit_queue:
+            self.audit_queue.append(fn)
+        # Save acceptance before marking the transaction completed. Recovery of a
+        # persisted "accepted" phase can repeat bookkeeping but never acceptance.
+        self.save()
+        self._terminal(job, 'complete')
+        self.save()
+
+    def _has_unquarantined_requests(self):
+        for path in (self.run_dir / 'requests').glob('*.json'):
+            try:
+                fn = json.loads(path.read_bytes())['fn']
+            except (OSError, ValueError, KeyError, TypeError):
+                return True  # incomplete external requests retain their existing wait behavior
+            if fn not in self.state.get('quarantined', {}):
+                return True
+        return False
 
     def _requests(self):
         """Apply coordinator requests (`adopt`, `dismiss`) written into RUN/requests/."""
@@ -986,20 +1580,45 @@ class Farm:
                 request = json.loads(path.read_text(encoding='utf-8'))
             except (OSError, ValueError):
                 continue   # still being written; next tick
-            path.unlink(missing_ok=True)
             fn = request.get('fn', '')
+            if self._writer_busy(fn):
+                continue
+            if request.get('kind') in ('adopt', 'dismiss'):
+                try:
+                    snapshot, digest, reviewed_findings = read_review_receipt(
+                        request['review_receipt'], self.run_dir, self.root, fn)
+                    if (digest != request['review_receipt_sha256']
+                            or _identity(snapshot) != request['expected_identity']
+                            or _identity(self._inputs(fn)) != request['expected_identity']
+                            or reviewed_findings != self.state['defects'].get(fn, [])):
+                        raise ValueError('reviewed inputs changed; fresh review required')
+                    if request['kind'] == 'adopt':
+                        if (not request.get('source_sha256')
+                                or _identity({'c': _read(request['source'])})['c'] != request['source_sha256']):
+                            raise ValueError('queued proposal missing or changed; explicit resubmission required')
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    rejected = self.run_dir / 'requests/rejected'
+                    rejected.mkdir(parents=True, exist_ok=True)
+                    path.replace(rejected / path.name)
+                    self._event('request-failed', fn=fn, kind=request['kind'],
+                                detail=f'fresh review required: {exc}'[:300])
+                    continue
             if request.get('kind') == 'dismiss':
                 audit = self.state['audits'].setdefault(fn, {'rounds': 0})
-                audit.update(verdict='ok', dismissed=request.get('reason', ''),
+                audit.update(verdict='ok', identity=_identity(self._inputs(fn)), dismissed=request.get('reason', ''),
                              dismissed_findings=audit.get('findings', []), findings=[])
                 self.state['defects'].pop(fn, None)
                 self._event('dismissed', fn=fn, reason=request.get('reason', '')[:300])
+                self.save()
+                path.unlink(missing_ok=True)
             elif request.get('kind') == 'adopt':
                 job = self._new_job('adopt', fn, 'hand', bytes=self.state['accepted'].get(fn, {}).get('bytes', 0),
-                                    note=request.get('note', ''))
+                                    note=request.get('note', ''), review_receipt=request['review_receipt'],
+                                    expected_identity=request['expected_identity'], reviewed_findings=reviewed_findings,
+                                    expected_source_sha256=request['source_sha256'])
                 job['source'] = request['source']
-                job['_snap'] = {'c': _read(self.root / 'recovery/c' / f'{fn}.c'),
-                                'hint': _read(self.root / 'recovery/hints' / f'{fn}.json')}
+                job['_request'] = str(path)
+                job['_snap'] = snapshot
                 self._event('adopt', fn=fn, source=request['source'])
                 self._verify(job, False)
 
@@ -1008,6 +1627,7 @@ class Farm:
         self._requests()
         self._collect()
         self._accept()
+        self._requests()  # admit requests unblocked by acceptance before deciding the run drained
         self._dispatch()
         self.save()
 
@@ -1040,7 +1660,7 @@ def running_from_events(path):
         event = json.loads(line)
         if event['event'] == 'dispatch':
             live[event['n']] = f"{event['fn']}:{event['kind']}:{event['model']}"
-        elif event['event'] in ('result', 'model-unavailable') and 'n' in event:
+        elif event['event'] in ('result', 'model-unavailable', 'interrupted') and 'n' in event:
             live.pop(event['n'], None)
     return list(live.values())
 
@@ -1101,8 +1721,10 @@ def coordinator_agent():
     rules = [('*', '*', 'ask'), ('read', '*', 'allow'), ('grep', '*', 'allow'), ('glob', '*', 'allow'),
              ('todowrite', '*', 'allow'), ('question', '*', 'allow'), ('skill', '*', 'allow'),
              ('edit', 'docs/NEXT-SESSION-PROMPT.md', 'allow')]
-    shell = [f'{PY} scripts/cmre_farm.py *', f'{PY} scripts/cmre_session.py *', f'{PY} -m cmre *',
+    shell = [f'{PY} scripts/cmre_farm.py *', f'{PY} scripts/cmre_session.py *',
              'rg *', 'git status*', 'git diff*', 'git log*']
+    for command in ('status', 'pipeline survey', 'work show', 'family', 'show', 'job status'):
+        shell.extend((f'{PY} -m cmre {command}', f'{PY} -m cmre {command} *'))
     rules += [('shell', command, 'allow') for command in shell]
     rules += [('subagent', 'cm-defect', 'allow')]
     body = """
@@ -1114,6 +1736,21 @@ events, and send each open defect to one cm-defect subagent.
 Your information comes from the output of `cmre_farm.py` status, wait and defects,
 and from subagent result lines. Those outputs are complete: act on them directly and
 keep each event to one short line, so your context stays small for a 10-hour session.
+For defect evidence, use `py -3.13 scripts/cmre_farm.py review RUN fn_X`;
+its identity-bound paths replace stable-name audit/bundle guesses. Quarantined
+acceptance requires manual/current cmre ledger review, not another adoption.
+The defect worker explicitly claims its actual reviewed inputs with
+`review RUN fn_X --claim NAME`. Pass its immutable review_receipt on every
+adopt/dismiss as --review-receipt PATH. Never mint a new claim to rebase an older
+hand fix. A hint-evidence-needed event belongs to the parent input lane at an
+authorized boundary; workers have no canonical hint-write permission.
+Direct cmre auto-grants are read-only status/survey/work-show/family/show/job-status
+commands. Acceptance, retraction, work retry/block and source mutations are not
+automatically allowed; do not bypass the farm's checked protocol.
+Quarantine is function-local: unrelated offline requests still drain. An action
+for the blocked target returns bounded JSON/exit 2, not a global queue abort.
+fix-evidence-needed means the originating review or immutable fix inputs lost
+their binding: preserve the concern and let fresh review reestablish evidence.
 """
     return _agent_file('CM0102 coordinator: runs the recovery farm and its defect lane (docs/agent/FARM.md)',
                        'primary', COORDINATOR_MODEL, rules, body)
@@ -1122,7 +1759,7 @@ keep each event to one short line, so your context stays small for a 10-hour ses
 def defect_agent():
     rules = [('*', '*', 'deny'), ('read', '*', 'allow'), ('grep', '*', 'allow'), ('glob', '*', 'allow'),
              ('edit', 'CM0102/Analysis/cmre/farm/*/hand/*.c', 'allow')]
-    shell = [f'{PY} scripts/cmre_farm.py test *']
+    shell = [f'{PY} scripts/cmre_farm.py test *', f'{PY} scripts/cmre_farm.py review *']
     shell += [f'{PY} -m cmre {command} *' for command in WORKER_COMMANDS if command not in ('test', 'explain')]
     shell += list(READ_ONLY_SHELL)
     rules += [('shell', command, 'allow') for command in shell]
@@ -1130,7 +1767,26 @@ def defect_agent():
 You resolve one open CM0102 audit defect. The coordinator gives you RUN (a farm run
 directory) and fn_X. Follow docs/agent/FARM.md section "Defect subagent" exactly and
 finish with its one result line.
+First run `py -3.13 scripts/cmre_farm.py review RUN fn_X --claim NAME` with a
+new unique claim name. Read the returned immutable source/hints paths and keep
+review_receipt. For status "bound", also read the returned review/first_review
+listing/verdict paths.
+Expected claim failures return bounded JSON and exit 2. For "conflict", preserve
+the existing claim and return UNRESOLVED; never mint a new claim to rebase an old
+fix. For "fresh-review-required" without a review_receipt, obtain/correct the
+inputs before review; a successful legacy fresh-review claim does have a receipt.
+For "fresh-review-required", old paths are unbound evidence: perform a fresh
+listing review of current source/hints before deciding. For
+"acceptance-quarantined", return UNRESOLVED pending manual/current cmre ledger
+review. Repeat the lookup before any ADOPT/DISMISS result; if identity changed
+or previously bound evidence became unbound, return UNRESOLVED rather than reuse
+stale findings. A legacy/fresh-review branch requires a complete fresh review
+and unchanged identity/open_findings. Explicitly verify every open_findings item
+in the claim before deciding. Return ADOPT <source> <review_receipt> <note> or
+DISMISS <review_receipt> <reason>; never replace the receipt with a new current
+claim to make an old fix admissible. Never guess stable audit/bundle paths.
 """
+    body += '\n' + '\n'.join(AUDIT_AUTHORITY)
     return _agent_file('CM0102 defect fixer: checks one open audit defect against the listing, then fixes or dismisses it',
                        'subagent', DEFAULT_CONFIRM_MODEL, rules, body, steps=40)
 
@@ -1145,6 +1801,166 @@ def install_agents(root=ROOT):
         path.write_text(text, encoding='utf-8')
         paths.append(path)
     return paths
+
+
+def _review_artifact(run_dir, root, value):
+    path = Path(value)
+    path = (path if path.is_absolute() else Path(root) / path).resolve()
+    if not path.is_relative_to(Path(run_dir).resolve()):
+        raise ValueError('review artifact escapes run directory')
+    return path
+
+
+def _review_input_artifacts(run_dir, root, fn, identity, review):
+    """Shared admission/lookup checks for the exact retained dispatch inputs."""
+    if identity.get('c') is None:
+        raise ValueError('review has no target C source')
+    snapshot = _review_artifact(run_dir, root, review['snapshot'])
+    raw = (snapshot / 'identity.json').read_bytes()
+    if hashlib.sha256(raw).hexdigest() != review.get('snapshot_metadata_sha256'):
+        raise ValueError('dispatch snapshot metadata changed or has no dispatch binding')
+    metadata = json.loads(raw)
+    if metadata['identity'] != identity or metadata['fn'] != fn:
+        raise ValueError('review snapshot identity mismatch')
+    if (metadata.get('bundle') != review.get('bundle')
+            or metadata.get('bundle_sha256') != review.get('bundle_sha256')):
+        raise ValueError('bundle identity was not bound at dispatch')
+    if _identity({'c': _read(snapshot / 'source.c'), 'hint': _read(snapshot / 'hints.json')}) != identity:
+        raise ValueError('review snapshot bytes changed')
+    paths = {'source_snapshot': str(snapshot / 'source.c'),
+             'hints_snapshot': str(snapshot / 'hints.json'), 'bundle': None}
+    if 'audit_path' in review:
+        paths['audit_path'] = str(_review_artifact(run_dir, root, review['audit_path']))
+    if review.get('bundle'):
+        bundle = _review_artifact(run_dir, root, review['bundle'])
+        if _identity({'bundle': _read(bundle)})['bundle'] != review['bundle_sha256']:
+            raise ValueError('review bundle changed')
+        paths['bundle'] = str(bundle)
+    return paths, metadata
+
+
+def _bound_review(run_dir, root, fn, identity, review):
+    paths, metadata = _review_input_artifacts(run_dir, root, fn, identity, review)
+    raw = _read(paths['audit_path'])
+    if raw is None or hashlib.sha256(raw).hexdigest() != review['verdict_sha256']:
+        raise ValueError('review verdict missing or changed')
+    return paths, metadata
+
+
+def _bound_audit_reviews(run_dir, root, fn, identity, review):
+    paths, metadata = _bound_review(run_dir, root, fn, identity, review)
+    first = None
+    if metadata.get('confirm'):
+        first, _ = _bound_review(run_dir, root, fn, identity, metadata['audit_state']['review'])
+    return paths, metadata, first
+
+
+def review_paths(run_dir, root, fn):
+    """Read-only, fail-closed locator for current accepted-source-bound evidence."""
+    if not re.fullmatch(r'fn_[0-9a-fA-F]{8}', fn):
+        raise ValueError('expected fn_XXXXXXXX')
+    run_dir, root = Path(run_dir).resolve(), Path(root).resolve()
+    state_bytes = (run_dir / 'state.json').read_bytes()
+    state = json.loads(state_bytes)
+    source = root / 'recovery/c' / f'{fn}.c'
+    hints = root / 'recovery/hints' / f'{fn}.json'
+    current = lambda: _identity({'c': _read(source), 'hint': _read(hints)})
+    identity = current()
+    result = {'fn': fn, 'identity': identity, 'source': str(source), 'hints': str(hints),
+              'open_findings': state.get('defects', {}).get(fn, []),
+              'status': 'fresh-review-required',
+              'instruction': 'Perform a fresh listing review of current source/hints; old verdicts are unbound.',
+              'unbound_legacy_evidence': [
+                  str(path) for path in (run_dir / f'audit/{fn}.json',
+                                         run_dir / f'audit/{fn}.confirm.json',
+                                         run_dir / f'bundle/{fn}.md') if path.exists()]}
+    if fn in state.get('quarantined', {}):
+        result.update(status='acceptance-quarantined',
+                      instruction='Preserve inputs; manual/current cmre ledger review is required.')
+        return result
+
+    audit = state.get('audits', {}).get(fn, {})
+    if (state.get('accepted', {}).get(fn, {}).get('identity') != identity
+            or audit.get('identity') != identity or not audit.get('review')
+            or audit.get('verdict') not in ('ok', 'defect', 'unconfirmed')):
+        return result
+    try:
+        paths, metadata, first = _bound_audit_reviews(run_dir, root, fn, identity, audit['review'])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        result['reason'] = str(exc)
+        return result
+    if current() != identity or (run_dir / 'state.json').read_bytes() != state_bytes:
+        result['reason'] = 'inputs or state changed during lookup; repeat the fresh review'
+        return result
+    result.update(status='bound', instruction='Use the returned immutable review paths; repeat lookup before acting.',
+                  verdict=audit.get('verdict'), review=paths)
+    if first is not None:
+        result['first_review'] = first
+    return result
+
+
+def claim_review(run_dir, root, fn, name):
+    """Explicitly freeze reviewed inputs; a named claim is never a mutable latest alias."""
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', name):
+        raise ValueError('review claim name must be 1-80 letters, digits, underscores or hyphens')
+    run_dir, root = Path(run_dir).resolve(), Path(root).resolve()
+    view = review_paths(run_dir, root, fn)
+    if view['status'] == 'acceptance-quarantined':
+        return view
+    snapshot = {'c': _read(view['source']), 'hint': _read(view['hints'])}
+    if snapshot['c'] is None:
+        raise ValueError('canonical C source is missing; obtain actual source before claiming a fresh review')
+    if _identity(snapshot) != view['identity']:
+        raise ValueError('inputs changed during review claim; repeat lookup')
+    directory = run_dir / 'reviews' / name
+    directory.mkdir(parents=True, exist_ok=False)
+    for key, filename in (('c', 'source.c'), ('hint', 'hints.json')):
+        if snapshot[key] is not None:
+            with (directory / filename).open('xb') as stream:
+                stream.write(snapshot[key])
+                stream.flush()
+                os.fsync(stream.fileno())
+    receipt = directory / 'receipt.json'
+    _durable_json(receipt, {'schema': 'cmre-farm-review/1', 'fn': fn,
+                            'identity': view['identity'], 'review': view})
+    view.update(review_receipt=str(receipt), source=str(directory / 'source.c'),
+                hints=str(directory / 'hints.json'))
+    return view
+
+
+def read_review_receipt(path, run_dir, root, fn):
+    path = Path(path)
+    path = (path if path.is_absolute() else Path(root) / path).resolve()
+    if not path.is_relative_to(Path(run_dir).resolve() / 'reviews') or path.name != 'receipt.json':
+        raise ValueError('expected an explicitly claimed RUN/reviews/NAME/receipt.json')
+    raw = path.read_bytes()
+    receipt = json.loads(raw)
+    if receipt.get('schema') != 'cmre-farm-review/1' or receipt.get('fn') != fn:
+        raise ValueError('review receipt schema/function mismatch')
+    snapshot = {'c': _read(path.parent / 'source.c'), 'hint': _read(path.parent / 'hints.json')}
+    if snapshot['c'] is None or receipt.get('identity', {}).get('c') is None:
+        raise ValueError('review receipt has no C source; fresh review of actual source is required')
+    if _identity(snapshot) != receipt['identity']:
+        raise ValueError('review snapshot changed; fresh review required')
+    return snapshot, hashlib.sha256(raw).hexdigest(), receipt.get('review', {}).get('open_findings', [])
+
+
+def review_request_data(receipt, run_dir, root, fn):
+    if not receipt:
+        raise ValueError('use review RUN fn_X --claim NAME, then --review-receipt PATH')
+    snapshot, digest, _ = read_review_receipt(receipt, run_dir, root, fn)
+    return {'review_receipt': str((Path(root) / receipt).resolve()),
+            'review_receipt_sha256': digest, 'expected_identity': _identity(snapshot)}
+
+
+def _quarantine_status(state, fn):
+    if fn not in state.get('quarantined', {}):
+        return None
+    info = state['quarantined'][fn]
+    reason = info.get('reason', 'unresolved acceptance') if isinstance(info, dict) else info
+    return {'fn': fn, 'status': 'acceptance-quarantined', 'reason': str(reason)[:300],
+            'instruction': 'Preserve this function and request; manual/current ledger review is required. '
+                           'Unrelated functions remain actionable.'}
 
 
 def defect_lines(state):
@@ -1179,14 +1995,15 @@ def farm_live(run_dir):
 def apply_requests_now(run_dir):
     """Apply queued adopt/dismiss requests in this process when no farm runs the directory."""
     run_dir = Path(run_dir)
-    state = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))
-    config = FarmConfig(workers=0, ladder=['-'], audit_workers=0, audit_model=None, attempt_minutes=1,
-                        hours=None, min_bytes=0, max_bytes=None, include_held=False, owner=state.get('owner', ''))
-    farm = Farm(run_dir, ROOT, CmreAdapter(), None, config)
-    farm.tick()
-    while farm.accept_queue:   # another writer holds the accept lease
-        time.sleep(5)
+    with RunLock(run_dir):
+        state = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))
+        config = FarmConfig(workers=0, ladder=['-'], audit_workers=0, audit_model=None, attempt_minutes=1,
+                            hours=None, min_bytes=0, max_bytes=None, include_held=False, owner=state.get('owner', ''))
+        farm = Farm(run_dir, ROOT, CmreAdapter(), None, config)
         farm.tick()
+        while farm.verifying or farm.accept_queue or farm._has_unquarantined_requests():
+            time.sleep(5)
+            farm.tick()
     return farm
 
 
@@ -1194,6 +2011,17 @@ def _request(run_dir, fn, kind, **data):
     directory = Path(run_dir) / 'requests'
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f'{time.time_ns()}-{fn}-{kind}.json'
+    if kind == 'adopt':
+        # Pin the proposed output, not a fresh canonical/review ownership baseline.
+        raw = Path(data['source']).read_bytes()
+        proposal = directory / 'candidates' / (path.stem + '.c')
+        proposal.parent.mkdir(parents=True, exist_ok=True)
+        with proposal.open('xb') as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        data.update(proposed_source=str(data['source']), source=str(proposal.resolve()),
+                    source_sha256=hashlib.sha256(raw).hexdigest())
     tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps({'fn': fn, 'kind': kind, **data}), encoding='utf-8')
     tmp.replace(path)
@@ -1209,8 +2037,9 @@ def status_line(s):
             f"disputed {s.get('audits_disputed', 0)} "
             f"open {len(s['open_defects'])} | models {models}"
             + ''.join(f' | UNAVAILABLE {m}: {e[:80]}' for m, e in s.get('unavailable_models', {}).items())
-            + ''.join(f" | LIMITED {p} until {time.strftime('%H:%M', time.localtime(until))}"
-                      for p, until in s.get('limited', {}).items())
+             + ''.join(f" | LIMITED {p} until {time.strftime('%H:%M', time.localtime(until))}"
+                       for p, until in s.get('limited', {}).items())
+             + (f" | QUARANTINED {','.join(sorted(s['quarantined']))}" if s.get('quarantined') else '')
             + (' | STOPPING' if s['stopping'] else ''))
 
 
@@ -1284,7 +2113,19 @@ class CmreAdapter:
         code, out, err = self._cli('accept', fn, '--c')
         if code != 0 and 'Writer active' in (err + out):
             code = 2
+        elif code == 2:
+            code = 1  # 2 is reserved by the scheduler for proven lease contention
         return code, (out + err)[-2000:]
+
+    def acceptance_identity(self, fn):
+        """No controller-level ledger proof is currently exposed by this adapter.
+
+        A complete source/hints identity proves acceptance. The distinct
+        {'status': 'not-accepted'} response requires authoritative nonacceptance
+        evidence; None, a mismatch, and unavailability prove neither outcome.
+        Recovery must quarantine unresolved acceptance without changing inputs.
+        """
+        raise NotImplementedError('ledger candidate/input identity evidence unavailable')
 
 
 INFRA_ERROR = re.compile(r'API key|statusCode"?\s*:\s*(?:401|402|403)|quota|insufficient balance|'
@@ -1514,6 +2355,43 @@ def probe(models, build='v2'):
     return results
 
 
+class RunLock:
+    """OS-held per-run writer exclusion; process death releases it, never a stale PID."""
+
+    def __init__(self, run_dir):
+        self.run_dir = Path(run_dir)
+        self.handle = None
+
+    def __enter__(self):
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.handle = (self.run_dir / 'supervisor.lock').open('a+b')
+        try:
+            if self.handle.seek(0, os.SEEK_END) == 0:
+                self.handle.write(b'0')
+                self.handle.flush()
+            self.handle.seek(0)
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self.handle.close()
+            raise RuntimeError('another supervisor owns this farm run') from exc
+        (self.run_dir / 'supervisor.json').write_text(json.dumps({
+            'pid': os.getpid(), 'started_at': time.time(), 'run_dir': str(self.run_dir.resolve()),
+        }), encoding='utf-8')
+        return self
+
+    def __exit__(self, *args):
+        if os.name == 'nt':
+            import msvcrt
+            self.handle.seek(0)
+            msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+        self.handle.close()
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     sub = p.add_subparsers(dest='action', required=True)
@@ -1549,15 +2427,21 @@ def main(argv=None):
     ad.add_argument('fn')
     ad.add_argument('--source', required=True)
     ad.add_argument('--note', default='')
+    ad.add_argument('--review-receipt', help='immutable receipt created explicitly by review --claim NAME')
     di = sub.add_parser('dismiss', help='close an audit defect as a false positive, with the reason')
     di.add_argument('run_dir')
     di.add_argument('fn')
     di.add_argument('--reason', required=True)
+    di.add_argument('--review-receipt', help='immutable receipt created explicitly by review --claim NAME')
     te = sub.add_parser('test', help="cmre test --source (or explain with --case) as the run's claim owner")
     te.add_argument('run_dir')
     te.add_argument('fn')
     te.add_argument('source')
     te.add_argument('--case', type=int)
+    rv = sub.add_parser('review', help='locate current identity-bound audit/bundle/snapshot evidence (read-only)')
+    rv.add_argument('run_dir')
+    rv.add_argument('fn')
+    rv.add_argument('--claim', metavar='NAME', help='explicitly create immutable RUN/reviews/NAME inputs/receipt')
     sub.add_parser('install-agents', help='write the OpenCode coordinator and defect agents into .opencode/agents/')
     pr = sub.add_parser('probe', help='check every ladder/audit model answers before a run')
     pr.add_argument('--ladder', default=','.join(DEFAULT_LADDER + (DEFAULT_AUDIT_MODEL, DEFAULT_CONFIRM_MODEL)))
@@ -1581,6 +2465,19 @@ def main(argv=None):
     run_dir = Path(a.run_dir)
     if a.action == 'start':
         return start(run_dir, a.run_args)
+    if a.action == 'review':
+        try:
+            view = claim_review(run_dir, ROOT, a.fn, a.claim) if a.claim else review_paths(run_dir, ROOT, a.fn)
+        except FileExistsError as exc:
+            view = {'fn': a.fn, 'status': 'conflict', 'reason': str(exc)[:300],
+                    'instruction': 'Preserve the existing claim; use a new name only for an actual new review.'}
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            view = {'fn': a.fn, 'status': 'fresh-review-required', 'reason': str(exc)[:300],
+                    'instruction': 'Correct the missing/changed review inputs, then repeat the explicit lookup/claim.'}
+            print(json.dumps(view, indent=1))
+            return 2
+        print(json.dumps(view, indent=1))
+        return 2 if view['status'] in ('acceptance-quarantined', 'conflict') else 0
     if a.action == 'defects':
         for line in defect_lines(json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))):
             print(line)
@@ -1593,19 +2490,45 @@ def main(argv=None):
         if (run_dir / 'state.json').exists():
             main(['status', str(run_dir)])
         return 0
+    if a.action in ('adopt', 'dismiss'):
+        state = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))
+        blocked = _quarantine_status(state, a.fn)
+        if blocked:
+            print(json.dumps(blocked, indent=1))
+            return 2
     if a.action == 'adopt':
         source = Path(a.source).resolve()
         if not source.is_file():
             print(f'no such source: {source}', file=sys.stderr)
             return 2
-        print(_request(run_dir, a.fn, 'adopt', source=str(source), note=a.note))
+        try:
+            reviewed = review_request_data(a.review_receipt, run_dir, ROOT, a.fn)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f'fresh review required: {exc}', file=sys.stderr)
+            return 2
+        request_path = _request(run_dir, a.fn, 'adopt', source=str(source), note=a.note, **reviewed)
     if a.action == 'dismiss':
-        print(_request(run_dir, a.fn, 'dismiss', reason=a.reason))
+        try:
+            reviewed = review_request_data(a.review_receipt, run_dir, ROOT, a.fn)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f'fresh review required: {exc}', file=sys.stderr)
+            return 2
+        request_path = _request(run_dir, a.fn, 'dismiss', reason=a.reason, **reviewed)
     if a.action in ('adopt', 'dismiss'):
         if farm_live(run_dir):
+            blocked = _quarantine_status(json.loads((run_dir / 'state.json').read_bytes()), a.fn)
+            if blocked:
+                print(json.dumps(blocked, indent=1))
+                return 2
+            print(request_path)
             print('queued: the running farm applies it on its next tick')
             return 0
         applied = apply_requests_now(run_dir)
+        blocked = _quarantine_status(applied.state, a.fn)
+        if blocked:
+            print(json.dumps(blocked, indent=1))
+            return 2
+        print(request_path)
         failed = [e for e in _read_events(run_dir / 'events.jsonl', 0)[0][-5:]
                   if e.get('event') == 'request-failed' and e.get('fn') == a.fn]
         print(f"applied now (no farm running): {'FAILED ' + failed[-1]['detail'] if failed else 'ok'}; "
@@ -1625,7 +2548,7 @@ def main(argv=None):
     if a.action == 'status':
         state = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))
         config = FarmConfig(0, ['-'], 0, None, 1, None, 0, None, False, state.get('owner', ''))
-        f = Farm(run_dir, ROOT, None, None, config)
+        f = Farm(run_dir, ROOT, None, None, config, reconcile=False)
         s = f.summary()
         s['running'] = running_from_events(run_dir / 'events.jsonl')
         print(json.dumps(s, indent=1) if a.json else status_line(s))
@@ -1636,9 +2559,10 @@ def main(argv=None):
                         max_bytes=a.max_bytes, include_held=a.include_held,
                         owner=a.owner or f'farm-{run_dir.name}', stall_minutes=a.stall_minutes,
                         confirm_model=a.confirm_model or None, skip_ranges=tuple(parse_ranges(a.skip_ranges)))
-    (run_dir / 'STOP').unlink(missing_ok=True)
     from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=max(1, a.verify_threads)) as verifier:
+    with RunLock(run_dir), ThreadPoolExecutor(max_workers=max(1, a.verify_threads)) as verifier:
+        (run_dir / 'STOP').unlink(missing_ok=True)
+        (run_dir / 'farm.pid').write_text(f'{os.getpid()}\n', encoding='utf-8')
         f = Farm(run_dir, ROOT, CmreAdapter(include_held=a.include_held),
                  make_launcher(a.opencode, ROOT, run_dir), config, verifier=verifier)
         f.run(poll=a.poll)

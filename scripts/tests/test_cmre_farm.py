@@ -22,6 +22,1379 @@ spec.loader.exec_module(farm)
 GOOD = '#include "cmre.h"\nu32 cm_fn_00401000(u32 a) { return a + 1; }\n'
 
 
+def bound_automatic_fix(root):
+    changed = GOOD.replace('a + 1', 'a + 2') + '// PASS fake gate\n'
+    f, cmre, _ = make(root, [], writes(changed), workers=1, audit_workers=0)
+    fn = 'fn_00401000'
+    (root / f'recovery/c/{fn}.c').write_text(GOOD)
+    (root / f'recovery/hints/{fn}.json').write_bytes(b'{"arg_count":1}')
+    f.state['accepted'][fn] = {'bytes': 200, 'identity': farm._identity(f._inputs(fn))}
+    cmre.brief = lambda fn: 'FAKE original listing'
+    origin = f._new_job('audit', fn, 'm/auditor', bytes=200)
+    f._launch(origin)
+    concerns = [{'detail': 'unresolved fidelity concern', 'evidence': 'FAKE original instruction'}]
+    Path(origin['audit_path']).write_text(json.dumps({'verdict': 'defect', 'findings': concerns}))
+    f._audit_result(origin, False)
+    f.running = []
+    return f, cmre, origin, concerns
+
+
+def test_automatic_fix_rejects_missing_origin_snapshot_before_dispatch(root):
+    f, cmre, origin, concerns = bound_automatic_fix(root)
+    prior = f._inputs(origin['fn'])
+    (f.run_dir / 'audit/snapshots' / str(origin['n']) / 'source.c').unlink()
+    f._dispatch()
+    f._reap()
+    f._collect()
+    f._accept()
+    assert cmre.accepted == []
+    assert f._inputs(origin['fn']) == prior
+    assert f.state['defects'][origin['fn']] == concerns
+    assert origin['fn'] in f.audit_queue
+    assert not any(job['kind'] == 'fix' for job, _, _ in f.launcher.started)
+
+
+def test_automatic_fix_rejects_changed_dispatch_bundle_before_install(root):
+    f, cmre, origin, concerns = bound_automatic_fix(root)
+    prior = f._inputs(origin['fn'])
+    f._dispatch()
+    fix = next(job for job, _, _ in f.running if job['kind'] == 'fix')
+    (root / fix['bundle']).write_text('not the dispatched fix inputs')
+    f._reap()
+    f._collect()
+    f._accept()
+    assert cmre.accepted == []
+    assert f._inputs(origin['fn']) == prior
+    assert f.state['defects'][origin['fn']] == concerns
+    assert origin['fn'] in f.audit_queue
+
+
+@pytest.mark.parametrize('artifact', ['origin-source', 'fix-bundle'])
+def test_automatic_fix_rechecks_evidence_before_serial_acceptance(root, artifact):
+    f, cmre, origin, concerns = bound_automatic_fix(root)
+    prior = f._inputs(origin['fn'])
+    f._dispatch()
+    fix = next(job for job, _, _ in f.running if job['kind'] == 'fix')
+    f._reap()
+    f._collect()
+    assert f.accept_queue
+    path = (f.run_dir / 'audit/snapshots' / str(origin['n']) / 'source.c'
+            if artifact == 'origin-source' else root / fix['bundle'])
+    path.unlink()
+    f._accept()
+    assert cmre.accepted == []
+    assert f._inputs(origin['fn']) == prior
+    assert f.state['defects'][origin['fn']] == concerns
+    assert origin['fn'] in f.audit_queue
+
+
+def test_missing_canonical_source_claim_fails_before_creating_receipt(root, monkeypatch, capsys):
+    f, _, job, canonical = prepared_candidate(root)
+    canonical.unlink()
+    f.state['defects'][job['fn']] = ['unresolved concern']
+    f.save()
+    monkeypatch.setattr(farm, 'ROOT', root)
+    assert farm.main(['review', str(f.run_dir), job['fn'], '--claim', 'missing-c']) == 2
+    view = json.loads(capsys.readouterr().out)
+    assert view['status'] == 'fresh-review-required'
+    assert 'review_receipt' not in view
+    assert not (f.run_dir / 'reviews/missing-c').exists()
+
+
+@pytest.mark.parametrize('action', ['adopt', 'dismiss'])
+def test_old_missing_source_receipt_cannot_dismiss_unresolved_concern(root, action):
+    f, _, _ = make(root, [], writes(GOOD), workers=0)
+    fn = 'fn_00401000'
+    f.state['defects'][fn] = ['unresolved missing-source concern']
+    f.save()
+    directory = f.run_dir / 'reviews/old-missing-c'
+    directory.mkdir(parents=True)
+    receipt = directory / 'receipt.json'
+    receipt.write_text(json.dumps({'schema': 'cmre-farm-review/1', 'fn': fn,
+                                   'identity': {'c': None, 'hint': None},
+                                   'review': {'open_findings': f.state['defects'][fn]}}))
+    source = root / 'hand.c'
+    source.write_text(GOOD)
+    farm._request(f.run_dir, fn, action, source=str(source), reason='old unreviewable claim',
+                  review_receipt=str(receipt), review_receipt_sha256=hashlib.sha256(receipt.read_bytes()).hexdigest(),
+                  expected_identity={'c': None, 'hint': None})
+    f._requests()
+    assert f.state['defects'][fn] == ['unresolved missing-source concern']
+    assert list((f.run_dir / 'requests/rejected').glob('*.json'))
+
+
+@pytest.mark.parametrize('action', ['adopt', 'dismiss'])
+def test_offline_quarantine_blocks_only_its_function_not_unrelated_request(root, monkeypatch, action):
+    f, cmre, _ = make(root, [], writes(GOOD), workers=0)
+    first, second = 'fn_00401000', 'fn_00401100'
+    for fn in (first, second):
+        (root / f'recovery/c/{fn}.c').write_text(GOOD.replace(first, fn))
+        f.state['accepted'][fn] = {'bytes': 200}
+        f.state['defects'][fn] = [f'concern {fn}']
+    f.save()
+    proof = farm.review_request_data(review_receipt(f, first), f.run_dir, root, first)
+    blocked = farm._request(f.run_dir, first, 'dismiss', reason='prior review', **proof)
+    f.state['quarantined'] = {first: {'reason': 'unresolved acceptance'}}
+    f.save()
+    prior_first = f._inputs(first)
+    hand = root / 'second.c'
+    hand.write_text(GOOD.replace(first, second) + '// PASS\n')
+    reviewed_request(f, second, action, source=str(hand), reason='fresh second-function review')
+    monkeypatch.setattr(farm, 'ROOT', root)
+    monkeypatch.setattr(farm, 'CmreAdapter', lambda: cmre)
+    result = farm.apply_requests_now(f.run_dir)
+    assert blocked.exists()
+    assert result._inputs(first) == prior_first
+    assert first in result.state['quarantined'] and first in result.state['defects']
+    assert second not in result.state['defects']
+    assert cmre.accepted == ([second] if action == 'adopt' else [])
+
+
+@pytest.mark.parametrize('action', ['adopt', 'dismiss'])
+def test_quarantined_action_cli_returns_bounded_json_instead_of_global_abort(root, monkeypatch, capsys, action):
+    f, cmre, job, canonical = prepared_candidate(root)
+    proof = review_receipt(f)
+    before = canonical.read_bytes()
+    f.state['quarantined'] = {job['fn']: {'reason': 'unresolved acceptance'}}
+    f._event('farm-exit', status='done')
+    f.save()
+    monkeypatch.setattr(farm, 'ROOT', root)
+    monkeypatch.setattr(farm, 'CmreAdapter', lambda: cmre)
+    args = ['--source', job['source']] if action == 'adopt' else ['--reason', 'old review']
+    assert farm.main([action, str(f.run_dir), job['fn'], *args, '--review-receipt', proof]) == 2
+    view = json.loads(capsys.readouterr().out)
+    assert view['status'] == 'acceptance-quarantined'
+    assert canonical.read_bytes() == before
+    assert not list((f.run_dir / 'requests').glob('*.json'))
+
+
+def fix_artifact(f, origin, fix, artifact):
+    side, kind = artifact.split('-', 1)
+    job = origin if side == 'origin' else fix
+    if kind == 'bundle':
+        return f.root / job['bundle']
+    if kind == 'verdict':
+        return Path(job['audit_path'])
+    folder = f.run_dir / 'audit/snapshots' / str(origin['n']) if side == 'origin' else Path(fix['_fix_dispatch']['snapshot'])
+    return folder / {'source': 'source.c', 'hints': 'hints.json', 'metadata': 'identity.json'}[kind]
+
+
+@pytest.mark.parametrize('change', ['missing', 'drift'])
+@pytest.mark.parametrize('artifact', ['origin-source', 'origin-hints', 'origin-metadata', 'origin-bundle', 'origin-verdict'])
+def test_fix_dispatch_requires_complete_origin_evidence(root, artifact, change):
+    f, cmre, origin, concerns = bound_automatic_fix(root)
+    prior = f._inputs(origin['fn'])
+    path = fix_artifact(f, origin, None, artifact)
+    path.unlink() if change == 'missing' else path.write_bytes(b'changed origin evidence')
+    f._dispatch()
+    assert not any(job['kind'] == 'fix' for job, _, _ in f.launcher.started)
+    assert f._inputs(origin['fn']) == prior
+    assert f.state['defects'][origin['fn']] == concerns
+    assert origin['fn'] in f.audit_queue
+    assert cmre.accepted == []
+
+
+@pytest.mark.parametrize('stage', ['before-install', 'before-accept'])
+@pytest.mark.parametrize('change', ['missing', 'drift'])
+@pytest.mark.parametrize('artifact', [
+    'origin-source', 'origin-hints', 'origin-metadata', 'origin-bundle', 'origin-verdict',
+    'fix-source', 'fix-hints', 'fix-metadata', 'fix-bundle',
+])
+def test_fix_consumption_rechecks_all_origin_and_dispatch_artifacts(root, artifact, change, stage):
+    f, cmre, origin, concerns = bound_automatic_fix(root)
+    prior = f._inputs(origin['fn'])
+    f._dispatch()
+    fix = next(job for job, _, _ in f.running if job['kind'] == 'fix')
+    if stage == 'before-accept':
+        f._reap()
+        f._collect()
+        assert f.accept_queue
+    path = fix_artifact(f, origin, fix, artifact)
+    path.unlink() if change == 'missing' else path.write_bytes(b'changed bound fix input')
+    if stage == 'before-install':
+        f._reap()
+        f._collect()
+    f._accept()
+    assert cmre.accepted == []
+    assert f._inputs(origin['fn']) == prior
+    assert f.state['defects'][origin['fn']] == concerns
+    assert origin['fn'] in f.audit_queue
+
+
+@pytest.mark.parametrize('artifact', ['origin-source', 'fix-bundle'])
+def test_fix_evidence_changed_during_private_gate_blocks_canonical_install(root, artifact):
+    f, cmre, origin, concerns = bound_automatic_fix(root)
+    prior = f._inputs(origin['fn'])
+    f._dispatch()
+    fix = next(job for job, _, _ in f.running if job['kind'] == 'fix')
+    real_test = cmre.test
+    def changing_test(fn, source=None):
+        result = real_test(fn, source)
+        if source is not None:
+            fix_artifact(f, origin, fix, artifact).unlink()
+        return result
+    cmre.test = changing_test
+    f._reap()
+    f._collect()
+    f._accept()
+    assert cmre.accepted == []
+    assert f._inputs(origin['fn']) == prior
+    assert f.state['defects'][origin['fn']] == concerns
+    assert all(source is not None for _, source in cmre.tests)
+
+
+def test_fix_evidence_is_checked_again_after_acceptance_hold_retry(root):
+    f, cmre, origin, concerns = bound_automatic_fix(root)
+    prior = f._inputs(origin['fn'])
+    f._dispatch()
+    fix = next(job for job, _, _ in f.running if job['kind'] == 'fix')
+    f._reap()
+    f._collect()
+    cmre.holds[origin['fn']] = {'state': farm.HARD_HOLDS[0]}
+    real_retry = cmre.retry
+    def changing_retry(fn, reason):
+        real_retry(fn, reason)
+        fix_artifact(f, origin, fix, 'fix-bundle').unlink()
+    cmre.retry = changing_retry
+    f._accept()
+    assert cmre.accepted == []
+    assert f._inputs(origin['fn']) == prior
+    assert f.state['defects'][origin['fn']] == concerns
+
+
+def test_fix_origin_is_rechecked_after_bundle_creation_before_worker_start(root):
+    f, cmre, origin, concerns = bound_automatic_fix(root)
+    prior = f._inputs(origin['fn'])
+    def changing_brief(fn):
+        (f.run_dir / 'audit/snapshots' / str(origin['n']) / 'source.c').unlink()
+        return 'FAKE listing while origin disappeared'
+    cmre.brief = changing_brief
+    f._dispatch()
+    assert not any(job['kind'] == 'fix' for job, _, _ in f.launcher.started)
+    assert f._inputs(origin['fn']) == prior
+    assert f.state['defects'][origin['fn']] == concerns
+    assert origin['fn'] in f.audit_queue
+
+
+def test_stale_fix_never_restores_over_newer_canonical_or_concerns(root):
+    f, cmre, origin, concerns = bound_automatic_fix(root)
+    fn = origin['fn']
+    f._dispatch()
+    fix = next(job for job, _, _ in f.running if job['kind'] == 'fix')
+    f._reap()
+    f._collect()
+    fix_artifact(f, origin, fix, 'fix-bundle').unlink()
+    (root / f'recovery/c/{fn}.c').write_bytes(b'newer unrelated canonical source')
+    (root / f'recovery/hints/{fn}.json').write_bytes(b'{"arg_count":99}')
+    f.state['defects'][fn].append({'detail': 'new unreviewed concern'})
+    current = f._inputs(fn)
+    current_concerns = json.loads(json.dumps(f.state['defects'][fn]))
+    f._accept()
+    assert f._inputs(fn) == current
+    assert f.state['defects'][fn] == current_concerns
+    assert cmre.accepted == []
+    assert fn in f.audit_queue
+
+
+@pytest.mark.parametrize('newer', [False, True])
+def test_interrupted_fix_with_missing_origin_requeues_without_stale_restore(root, newer):
+    f, cmre, origin, concerns = bound_automatic_fix(root)
+    fn, prior = origin['fn'], f._inputs(origin['fn'])
+    f._dispatch()
+    f._reap()
+    f._collect()
+    f.save()
+    (f.run_dir / 'audit/snapshots' / str(origin['n']) / 'source.c').unlink()
+    if newer:
+        (root / f'recovery/c/{fn}.c').write_bytes(b'newer canonical after interruption')
+    expected = f._inputs(fn) if newer else prior
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert resumed._inputs(fn) == expected
+    assert resumed.state['defects'][fn] == concerns
+    assert fn in resumed.audit_queue
+    assert cmre.accepted == []
+
+
+def test_partial_fix_dispatch_identity_is_not_reused_after_restart(root):
+    f, cmre, origin, _ = bound_automatic_fix(root)
+    fix = f._next_pending()
+    def die(*args):
+        raise KeyboardInterrupt('after input snapshot, before dispatch event')
+    f.launcher.start = die
+    with pytest.raises(KeyboardInterrupt):
+        f._launch(fix)
+    path = Path(fix['_fix_dispatch']['snapshot']) / 'identity.json'
+    before = path.read_bytes()
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert resumed._new_job('audit', origin['fn'], 'm/auditor')['n'] > fix['n']
+    assert path.read_bytes() == before
+
+
+def test_unknown_acceptance_during_offline_drain_does_not_abort_other_function(root, monkeypatch):
+    f, cmre, _ = make(root, [], writes(GOOD), workers=0)
+    first, second = 'fn_00401000', 'fn_00401100'
+    for fn in (first, second):
+        (root / f'recovery/c/{fn}.c').write_text(GOOD.replace(first, fn))
+        f.state['defects'][fn] = [f'concern {fn}']
+    f.save()
+    requests = {}
+    outputs = {}
+    for fn in (first, second):
+        source = root / f'{fn}-hand.c'
+        source.write_text(GOOD.replace(first, fn).replace('a + 1', 'a + 2') + '// PASS\n')
+        outputs[fn] = source.read_bytes()
+        requests[fn] = reviewed_request(f, fn, 'adopt', source=str(source))
+    real_accept = cmre.accept
+    def uncertain_accept(fn):
+        if fn == first:
+            cmre.accepted.append(fn)
+            return 1, 'unknown error after ledger write'
+        return real_accept(fn)
+    cmre.accept = uncertain_accept
+    cmre.acceptance_identity = lambda fn: None
+    monkeypatch.setattr(farm, 'ROOT', root)
+    monkeypatch.setattr(farm, 'CmreAdapter', lambda: cmre)
+    result = farm.apply_requests_now(f.run_dir)
+    assert set(cmre.accepted) == {first, second}
+    assert first in result.state['quarantined'] and first in result.state['defects']
+    assert second not in result.state['defects']
+    assert requests[first].exists() and not requests[second].exists()
+    for fn in (first, second):
+        assert (root / f'recovery/c/{fn}.c').read_bytes() == outputs[fn]
+
+
+def test_newly_unknown_target_action_returns_bounded_quarantine_json(root, monkeypatch, capsys):
+    f, cmre, job, canonical = prepared_candidate(root)
+    proof = review_receipt(f)
+    f._event('farm-exit', status='done')
+    def uncertain_accept(fn):
+        cmre.accepted.append(fn)
+        return 1, 'unknown after ledger commit'
+    cmre.accept = uncertain_accept
+    cmre.acceptance_identity = lambda fn: None
+    monkeypatch.setattr(farm, 'ROOT', root)
+    monkeypatch.setattr(farm, 'CmreAdapter', lambda: cmre)
+    assert farm.main(['adopt', str(f.run_dir), job['fn'], '--source', job['source'],
+                      '--review-receipt', proof]) == 2
+    view = json.loads(capsys.readouterr().out)
+    assert view['status'] == 'acceptance-quarantined'
+    assert canonical.read_bytes() == Path(job['source']).read_bytes()
+    assert list((f.run_dir / 'requests').glob('*.json'))
+
+
+@pytest.mark.parametrize('confirm', [False, True])
+@pytest.mark.parametrize('verdict', ['ok', 'defect'])
+@pytest.mark.parametrize('artifact', ['source.c', 'hints.json', 'identity.json'])
+@pytest.mark.parametrize('change', ['missing', 'drift'])
+def test_verdict_admission_requires_retained_dispatch_artifacts(root, confirm, verdict, artifact, change):
+    f, _, _ = make(root, [], writes(GOOD), workers=0, audit_workers=1,
+                    confirm_model='m/judge' if confirm else None)
+    fn = 'fn_00401000'
+    (root / f'recovery/c/{fn}.c').write_text(GOOD)
+    (root / f'recovery/hints/{fn}.json').write_bytes(b'{"arg_count":1}')
+    f.state['accepted'][fn] = {'bytes': 200, 'identity': farm._identity(f._inputs(fn))}
+    concern = [{'detail': 'legacy unresolved concern'}]
+    f.state['defects'][fn] = concern.copy()
+    f.state['audits'][fn] = {'rounds': 0}
+    job = f._new_job('audit', fn, 'm/strong', bytes=200)
+    f._launch(job)
+    if confirm:
+        Path(job['audit_path']).write_text(json.dumps({'verdict': 'defect', 'findings': concern}))
+        f._audit_result(job, False)
+        job = f._new_job('audit', fn, 'm/judge', bytes=200, confirm=True)
+        f._launch(job)
+    snapshot = f.run_dir / 'audit/snapshots' / str(job['n']) / artifact
+    if change == 'missing':
+        snapshot.unlink()
+    elif artifact == 'identity.json':
+        metadata = json.loads(snapshot.read_text())
+        metadata['open_findings'] = ['metadata was changed after dispatch']
+        snapshot.write_text(json.dumps(metadata))
+    else:
+        snapshot.write_bytes(b'changed snapshot bytes')
+    Path(job['audit_path']).write_text(json.dumps({'verdict': verdict, 'findings': ['unbound finding']}))
+    f._audit_result(job, False)
+    assert f.state['defects'][fn] == concern
+    assert not f.pending
+    assert fn in f.audit_queue
+    assert f.state['audits'][fn].get('verdict') not in ('ok', 'defect')
+
+
+@pytest.mark.parametrize('case,expected', [
+    ('quarantined', 'acceptance-quarantined'),
+    ('conflict', 'conflict'),
+    ('missing-run', 'fresh-review-required'),
+])
+def test_claim_cli_returns_bounded_expected_status_json(root, case, expected):
+    f, _, job, _ = prepared_candidate(root)
+    if case == 'quarantined':
+        f.state['quarantined'] = {job['fn']: {'reason': 'unresolved acceptance'}}
+        f.save()
+    elif case == 'conflict':
+        farm.claim_review(f.run_dir, root, job['fn'], 'reviewed-once')
+    run = f.run_dir if case != 'missing-run' else root / 'missing-run'
+    scripts = root / 'scripts'
+    scripts.mkdir()
+    script = scripts / 'cmre_farm.py'
+    script.write_bytes(MODULE.read_bytes())
+    result = farm.subprocess.run(
+        [sys.executable, str(script), 'review', str(run), job['fn'], '--claim', 'reviewed-once'],
+        capture_output=True, text=True)
+    assert result.returncode == 2
+    assert 'Traceback' not in result.stderr
+    view = json.loads(result.stdout)
+    assert view['status'] == expected
+    assert 'review_receipt' not in view
+    assert len(view.get('reason', '')) <= 300
+
+
+def test_coordinator_direct_cmre_permissions_are_read_only():
+    from fnmatch import fnmatchcase
+    agent = farm.coordinator_agent()
+    rules = re.findall(r'\{ action: "shell", resource: "([^"]+)", effect: allow \}', agent)
+    for command in ('accept fn_00401000 --c', 'retract-c fn_00401000', 'work retry fn_00401000',
+                    'work block fn_00401000', 'task publish task-1', 'test fn_00401000 --c'):
+        assert not any(fnmatchcase(f'{farm.PY} -m cmre {command}', rule) for rule in rules)
+    for command in ('status', 'pipeline survey', 'work show fn_00401000', 'job status receipt.json'):
+        assert any(fnmatchcase(f'{farm.PY} -m cmre {command}', rule) for rule in rules)
+
+
+def test_queued_adoption_uses_immutable_proposal_not_later_source_path_bytes(root):
+    f, cmre, job, canonical = prepared_candidate(root)
+    queued_bytes = Path(job['source']).read_bytes()
+    reviewed_request(f, job['fn'], 'adopt', source=job['source'])
+    Path(job['source']).write_text(GOOD.replace('a + 1', 'a + 2') + '// PASS changed after queue\n')
+    f._requests()
+    f._collect()
+    f._accept()
+    assert cmre.accepted == [job['fn']]
+    assert canonical.read_bytes() == queued_bytes
+
+
+@pytest.mark.parametrize('artifact', ['source.c', 'hints.json', 'identity.json', 'verdict'])
+@pytest.mark.parametrize('change', ['missing', 'drift'])
+def test_confirmation_requires_intact_first_review_artifacts(root, artifact, change):
+    f, _, _ = make(root, [], writes(GOOD), workers=0, audit_workers=1, confirm_model='m/judge')
+    fn = 'fn_00401000'
+    (root / f'recovery/c/{fn}.c').write_text(GOOD)
+    (root / f'recovery/hints/{fn}.json').write_bytes(b'{"arg_count":1}')
+    f.state['accepted'][fn] = {'bytes': 200, 'identity': farm._identity(f._inputs(fn))}
+    f.state['defects'][fn] = ['legacy concern']
+    first = seed_unconfirmed_audit(f, fn, ['legacy concern'])
+    confirm = f._new_job('audit', fn, 'm/judge', bytes=200, confirm=True)
+    f._launch(confirm)
+    path = (Path(first['audit_path']) if artifact == 'verdict'
+            else f.run_dir / 'audit/snapshots' / str(first['n']) / artifact)
+    if change == 'missing':
+        path.unlink()
+    else:
+        path.write_bytes(b'first review evidence changed')
+    Path(confirm['audit_path']).write_text('{"verdict":"ok","findings":[]}')
+    f._audit_result(confirm, False)
+    assert f.state['defects'][fn] == ['legacy concern']
+    assert fn in f.audit_queue
+    assert not f.pending
+    assert f.state['audits'][fn].get('verdict') != 'ok'
+
+
+def test_invalid_old_snapshot_cannot_invalidate_newer_bound_review(root):
+    f, _, _ = make(root, [], writes(GOOD), workers=0, audit_workers=1)
+    fn = 'fn_00401000'
+    (root / f'recovery/c/{fn}.c').write_text(GOOD)
+    f.state['accepted'][fn] = {'bytes': 200, 'identity': farm._identity(f._inputs(fn))}
+    old = f._new_job('audit', fn, 'm/old', bytes=200)
+    f._launch(old)
+    current = f._new_job('audit', fn, 'm/current', bytes=200)
+    f._launch(current)
+    Path(current['audit_path']).write_text('{"verdict":"ok","findings":[]}')
+    f._audit_result(current, False)
+    bound = json.loads(json.dumps(f.state['audits'][fn]))
+    (f.run_dir / 'audit/snapshots' / str(old['n']) / 'source.c').unlink()
+    Path(old['audit_path']).write_text('{"verdict":"defect","findings":["old stale finding"]}')
+    f._audit_result(old, False)
+    assert f.state['audits'][fn] == bound
+    assert not f.state['defects'] and not f.pending
+    assert fn not in f.audit_queue
+
+
+@pytest.mark.parametrize('when', ['admission', 'verification'])
+def test_queued_candidate_copy_hash_is_checked_before_use(root, when):
+    f, cmre, job, canonical = prepared_candidate(root)
+    request = reviewed_request(f, job['fn'], 'adopt', source=job['source'])
+    queued = json.loads(request.read_text())
+    if when == 'verification':
+        f.verifier = ManualExecutor()
+        f._requests()
+    Path(queued['source']).write_text(GOOD.replace('a + 1', 'a + 2') + '// PASS tampered queue copy\n')
+    if when == 'admission':
+        f._requests()
+    else:
+        f.verifier.run_all()
+        f._collect()
+    assert canonical.read_bytes() == b'prior canonical'
+    assert cmre.tests == [] and cmre.accepted == []
+    assert not f.accept_queue
+
+
+def test_prepared_journal_does_not_own_external_matching_candidate_bytes(root):
+    f, cmre, job, canonical = prepared_candidate(root)
+    f.verifier = ManualExecutor()
+    f._verify(job, False)
+    external = Path(job['source']).read_bytes()
+    canonical.write_bytes(external)
+    f.verifier.run_all()
+    f._collect()
+    assert canonical.read_bytes() == external
+    assert cmre.accepted == []
+    assert job['fn'] in f.state['parked']
+
+
+def test_audit_and_defect_prompts_keep_callee_c_navigation_only(root):
+    audit = _job(root, 'audit')
+    audit['bytes'] = 200
+    for prompt in (farm.audit_prompt(root, audit), farm.confirm_prompt(root, audit), farm.defect_agent()):
+        assert 'Callee C is navigation only' in prompt
+        assert 'never authority or proof' in prompt
+        assert 'original instructions at preferred-image VAs' in prompt
+        assert '0c78e7da6d0bcb4603fa179449bbe6d1c627a22c445d14d489bd9bff86' in prompt
+        assert 'not callee composition or runtime proof' in prompt
+
+
+def test_fresh_spec_queued_legacy_adopt_cannot_rebase_onto_new_acceptance(root):
+    f, cmre, job, canonical = prepared_candidate(root)
+    f._verify(job, False)
+    f._collect()
+    newer = canonical.read_bytes()
+    old_handfix = root / 'handfix.c'
+    old_handfix.write_text(GOOD.replace('a + 1', 'a + 2') + '// PASS fake gate\n')
+    request = farm._request(f.run_dir, job['fn'], 'adopt', source=str(old_handfix))
+    f._requests()
+    assert request.exists() and not f.verifying
+    f._accept()
+    f._requests()
+    f._collect()
+    f._accept()
+    assert canonical.read_bytes() == newer
+    assert cmre.accepted == [job['fn']]
+    assert any(e['event'] == 'request-failed' for e in events(f.run_dir))
+
+
+def test_fresh_spec_bundle_changed_after_dispatch_never_binds_or_schedules_fix(root):
+    f, cmre, _ = make(root, [], writes(GOOD), workers=0)
+    fn = 'fn_00401000'
+    (root / f'recovery/c/{fn}.c').write_text(GOOD)
+    f.state['accepted'][fn] = {'bytes': 200, 'identity': farm._identity(f._inputs(fn))}
+    cmre.brief = lambda fn: 'original listing'
+    job = f._new_job('audit', fn, 'm/a', bytes=200)
+    f._launch(job)
+    (root / job['bundle']).write_text('a different source and listing, not dispatched inputs')
+    Path(job['audit_path']).write_text(json.dumps({'verdict': 'defect', 'findings': ['changed bundle']}))
+    f._audit_result(job, False)
+    f.save()
+    assert not f.pending
+    assert farm.review_paths(f.run_dir, root, fn)['status'] == 'fresh-review-required'
+
+
+def test_fresh_spec_deleted_terminal_verdict_is_reaudited_on_restart(root):
+    f, cmre, _ = make(root, [], writes(GOOD), workers=0, audit_workers=1)
+    fn = 'fn_00401000'
+    (root / f'recovery/c/{fn}.c').write_text(GOOD)
+    f.state['accepted'][fn] = {'bytes': 200, 'identity': farm._identity(f._inputs(fn))}
+    job = f._new_job('audit', fn, 'm/a', bytes=200)
+    f._launch(job)
+    Path(job['audit_path']).write_text('{"verdict":"ok"}')
+    f._audit_result(job, False)
+    f.save()
+    Path(job['audit_path']).unlink()
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert fn in resumed.audit_queue
+    assert resumed.state['audits'][fn].get('verdict') != 'ok'
+
+
+def test_queued_review_receipt_cannot_rebase_after_another_acceptance(root):
+    f, cmre, job, canonical = prepared_candidate(root)
+    receipt = review_receipt(f)  # actual review of the prior canonical inputs
+    reviewed = farm.review_request_data(receipt, f.run_dir, root, job['fn'])
+    f._verify(job, False)
+    f._collect()
+    newer = canonical.read_bytes()
+    hand = root / 'old-handfix.c'
+    hand.write_text(GOOD.replace('a + 1', 'a + 2') + '// PASS\n')
+    farm._request(f.run_dir, job['fn'], 'adopt', source=str(hand), **reviewed)
+    f._requests()
+    f._accept()
+    f._requests()
+    f._collect()
+    f._accept()
+    assert canonical.read_bytes() == newer
+    assert cmre.accepted == [job['fn']]
+    assert list((f.run_dir / 'requests/rejected').glob('*.json'))
+
+
+@pytest.mark.parametrize('kind', ['adopt', 'dismiss'])
+@pytest.mark.parametrize('changed', ['c', 'hint'])
+def test_reviewed_request_rejects_source_or_hint_drift_without_mutation(root, kind, changed):
+    f, cmre, job, canonical = prepared_candidate(root)
+    receipt = review_receipt(f)
+    reviewed = farm.review_request_data(receipt, f.run_dir, root, job['fn'])
+    if changed == 'c':
+        canonical.write_bytes(b'newer user canonical')
+    else:
+        (root / 'recovery/hints/fn_00401000.json').write_bytes(b'{"arg_count":99}')
+    before = f._inputs(job['fn'])
+    farm._request(f.run_dir, job['fn'], kind, source=job['source'], reason='old review', **reviewed)
+    f._requests()
+    assert f._inputs(job['fn']) == before
+    assert not f.verifying and not cmre.accepted
+    assert list((f.run_dir / 'requests/rejected').glob('*.json'))
+
+
+@pytest.mark.parametrize('action', ['adopt', 'dismiss'])
+def test_offline_single_action_preserves_other_two_legacy_open_defects(root, monkeypatch, action):
+    f, cmre, _ = make(root, [], writes(GOOD), workers=0)
+    names = ['fn_00401000', 'fn_00401100', 'fn_00401200']
+    for index, fn in enumerate(names):
+        (root / f'recovery/c/{fn}.c').write_text(GOOD.replace(names[0], fn))
+        f.state['accepted'][fn] = {'bytes': 200, 'model': 'old/worker'}
+        f.state['audits'][fn] = {'verdict': 'defect', 'findings': [f'legacy-{index}'], 'rounds': 2}
+        f.state['defects'][fn] = [f'legacy-{index}']
+    f.save()
+    before = json.loads(f.state_path.read_text())
+    hand = root / 'hand.c'
+    hand.write_text(GOOD)
+    reviewed_request(f, names[0], action, source=str(hand), reason='fresh review')
+    monkeypatch.setattr(farm, 'ROOT', root)
+    monkeypatch.setattr(farm, 'CmreAdapter', lambda: cmre)
+    result = farm.apply_requests_now(f.run_dir)
+    disk = json.loads(f.state_path.read_text())
+    for state in (result.state, disk):
+        assert set(state['defects']) == set(names[1:])
+        for fn in names[1:]:
+            assert state['defects'][fn] == before['defects'][fn]
+            assert state['audits'][fn] == before['audits'][fn]
+            assert state['accepted'][fn] == before['accepted'][fn]
+
+
+@pytest.mark.parametrize('artifact', ['verdict', 'source_snapshot', 'hints_snapshot', 'bundle'])
+@pytest.mark.parametrize('verdict', ['ok', 'defect'])
+def test_restart_requeues_terminal_evidence_drift_without_dismissing_concerns(root, artifact, verdict):
+    f, cmre, _ = make(root, [], writes(GOOD), workers=0, audit_workers=1)
+    fn = 'fn_00401000'
+    (root / f'recovery/c/{fn}.c').write_text(GOOD)
+    f.state['accepted'][fn] = {'bytes': 200, 'identity': farm._identity(f._inputs(fn))}
+    cmre.brief = lambda fn: 'dispatch listing'
+    job = f._new_job('audit', fn, 'm/a', bytes=200)
+    f._launch(job)
+    Path(job['audit_path']).write_text(json.dumps({'verdict': verdict, 'findings': ['concern']}))
+    f._audit_result(job, False)
+    f.save()
+    paths = farm.review_paths(f.run_dir, root, fn)['review']
+    path = Path(paths['audit_path' if artifact == 'verdict' else artifact])
+    path.write_bytes(b'changed after terminal verdict')
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert fn in resumed.audit_queue
+    assert resumed.state['audits'][fn]['fresh_review_required']
+    assert not resumed.pending
+    if verdict == 'defect':
+        assert resumed.state['defects'][fn] == ['concern']
+
+
+def test_review_claim_cli_is_immutable_and_required_by_adopt(root, monkeypatch, capsys):
+    f, _, job, canonical = prepared_candidate(root)
+    monkeypatch.setattr(farm, 'ROOT', root)
+    assert farm.main(['review', str(f.run_dir), job['fn'], '--claim', 'human-reviewed-1']) == 0
+    claimed = json.loads(capsys.readouterr().out)
+    receipt = Path(claimed['review_receipt'])
+    assert Path(claimed['source']).read_bytes() == b'prior canonical'
+    canonical.write_bytes(b'newer canonical')
+    assert Path(claimed['source']).read_bytes() == b'prior canonical'
+    original = receipt.read_bytes()
+    with pytest.raises(FileExistsError):
+        farm.claim_review(f.run_dir, root, job['fn'], 'human-reviewed-1')
+    assert receipt.read_bytes() == original
+    assert farm.main(['adopt', str(f.run_dir), job['fn'], '--source', job['source']]) == 2
+    assert not list((f.run_dir / 'requests').glob('*.json'))
+
+
+def test_documented_lookup_cli_subprocess_reads_and_claims_fake_run(root):
+    f, cmre, _ = make(root, [], writes(GOOD), workers=0)
+    fn = 'fn_00401000'
+    (root / f'recovery/c/{fn}.c').write_text(GOOD)
+    f.state['accepted'][fn] = {'bytes': 200, 'identity': farm._identity(f._inputs(fn))}
+    cmre.brief = lambda fn: 'FAKE listing for CLI smoke'
+    job = f._new_job('audit', fn, 'fake/auditor', bytes=200)
+    f._launch(job)
+    Path(job['audit_path']).write_text('{"verdict":"ok","findings":[]}')
+    f._audit_result(job, False)
+    f.save()
+    scripts = root / 'scripts'
+    scripts.mkdir()
+    copied_cli = scripts / 'cmre_farm.py'
+    copied_cli.write_bytes(MODULE.read_bytes())  # fake ROOT; never inspect live recovery
+    command = [sys.executable, str(copied_cli), 'review', str(f.run_dir), fn]
+    plain = farm.subprocess.run(command, check=True, capture_output=True, text=True)
+    assert json.loads(plain.stdout)['status'] == 'bound'
+    claimed = farm.subprocess.run(command + ['--claim', 'documented-cli-smoke'],
+                                  check=True, capture_output=True, text=True)
+    view = json.loads(claimed.stdout)
+    assert view['status'] == 'bound'
+    assert Path(view['source']).read_text() == GOOD
+    assert Path(view['review_receipt']).is_file()
+    assert Path(view['review']['bundle']).name == f"{fn}-{job['n']}.md"
+
+
+@pytest.mark.parametrize('kind', ['translate', 'fix'])
+def test_production_private_hint_lane_requires_parent_without_touching_canonical(root, kind):
+    canonical = root / 'recovery/c/fn_00401000.c'
+    hint = root / 'recovery/hints/fn_00401000.json'
+    canonical.write_text(GOOD)
+    hint.write_bytes(b'{"arg_count":2}\n')
+    before = {'c': canonical.read_bytes(), 'hint': hint.read_bytes()}
+    proposal = {'arg_count': 2, 'c_hints': {'fixtures': [hint_fixture(9)]}}
+    def worker(job, r):
+        Path(job['source']).write_text(GOOD)
+        Path(job['hint_source']).write_text(json.dumps(proposal))
+    f, cmre, _ = make(root, [], worker, workers=0)
+    job = seed_bound_fix(f) if kind == 'fix' else f._new_job(kind, 'fn_00401000', 'm/worker', bytes=200)
+    f._launch(job)
+    cfg = farm.worker_config(root, job)
+    allowed = [name for name, permission in cfg['permission']['edit'].items() if permission == 'allow']
+    assert not any('recovery/hints' in name.replace('\\', '/') for name in allowed)
+    assert job['hint_source'].replace('\\', '/') in [name.replace('\\', '/') for name in allowed]
+    assert 'Canonical recovery/hints is read-only' in f.launcher.started[0][1]
+    f._reap()
+    f._collect()
+    f._accept()
+    assert f._inputs(job['fn']) == before
+    assert cmre.tests == [] and cmre.accepted == []
+    retained = json.loads(Path(f.state['hint_proposals'][job['fn']]['receipt']).read_text())
+    assert retained['dispatch_identity'] == farm._identity(before)
+    assert json.loads(bytes.fromhex(retained['proposal'])) == proposal
+    assert any(e['event'] == 'hint-evidence-needed' for e in events(f.run_dir))
+
+
+def test_supervised_legacy_reaudit_preserves_open_backlog_in_memory_and_on_disk(root):
+    f, cmre, _ = make(root, [], writes(GOOD), workers=0, audit_workers=1)
+    names = ['fn_00401000', 'fn_00401100', 'fn_00401200']
+    for fn in names:
+        f.state['accepted'][fn] = {'bytes': 200}
+        f.state['audits'][fn] = {'verdict': 'defect', 'findings': [fn], 'rounds': 2}
+        f.state['defects'][fn] = [fn]
+    f.save()
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert set(resumed.audit_queue) == set(names)
+    assert not resumed.pending
+    for state in (resumed.state, json.loads(f.state_path.read_text())):
+        assert state['defects'] == {fn: [fn] for fn in names}
+        assert all(state['audits'][fn]['fresh_review_required'] for fn in names)
+
+
+def test_reviewed_adoption_cannot_clear_a_new_concern_added_during_verification(root):
+    f, cmre, job, canonical = prepared_candidate(root)
+    reviewed_request(f, job['fn'], 'adopt', source=job['source'])
+    f._requests()
+    f._collect()
+    f.state['defects'][job['fn']] = ['new concern not covered by the claim']
+    f._accept()
+    assert cmre.accepted == []
+    assert canonical.read_bytes() == b'prior canonical'
+    assert f.state['defects'][job['fn']] == ['new concern not covered by the claim']
+
+
+def test_audit_ok_for_old_concern_set_never_dismisses_new_open_finding(root):
+    f, _, _ = make(root, [], writes(GOOD), workers=0, audit_workers=1)
+    fn = 'fn_00401000'
+    (root / f'recovery/c/{fn}.c').write_text(GOOD)
+    f.state['accepted'][fn] = {'bytes': 200, 'identity': farm._identity(f._inputs(fn))}
+    f.state['defects'][fn] = ['legacy concern']
+    job = f._new_job('audit', fn, 'm/a', bytes=200)
+    f._launch(job)
+    assert 'legacy concern' in f.launcher.started[-1][1]
+    f.state['defects'][fn].append('new unreviewed concern')
+    Path(job['audit_path']).write_text('{"verdict":"ok"}')
+    f._audit_result(job, False)
+    assert f.state['defects'][fn] == ['legacy concern', 'new unreviewed concern']
+    assert fn in f.audit_queue
+    assert not f.pending
+
+
+@pytest.mark.parametrize('had_prior', [True, False])
+def test_spec_unknown_post_ledger_acceptance_preserves_inputs_and_quarantines(root, had_prior):
+    f, cmre, job, canonical = prepared_candidate(root)
+    if not had_prior:
+        canonical.unlink()
+        job['_snap']['c'] = None
+    request = farm._request(f.run_dir, job['fn'], 'adopt', source=job['source'])
+    job['_request'] = str(request)
+    hint = root / 'recovery/hints/fn_00401000.json'
+    hint.write_bytes(b'{"arg_count":1}')
+    job['_snap']['hint'] = hint.read_bytes()
+    def committed_then_died(fn):
+        cmre.accepted.append(fn)  # the ledger was committed
+        raise KeyboardInterrupt('death after ledger commit')
+    cmre.accept = committed_then_died
+    # Same explicit unavailability as the production adapter.
+    cmre.acceptance_identity = farm.CmreAdapter(root).acceptance_identity
+    f._verify(job, False)
+    f._collect()
+    candidate = canonical.read_bytes()
+    with pytest.raises(KeyboardInterrupt):
+        f._accept()
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert canonical.read_bytes() == candidate
+    assert hint.read_bytes() == b'{"arg_count":1}'
+    assert job['fn'] in resumed.state['quarantined']
+    resumed.tick()
+    again = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    again.tick()
+    assert cmre.accepted == [job['fn']]
+    assert request.exists()
+
+
+def test_spec_unowned_hint_created_before_verify_is_never_deleted(root):
+    f, cmre, job, canonical = prepared_candidate(root)
+    hint = root / 'recovery/hints/fn_00401000.json'
+    hint.write_bytes(b'{"arg_count":99}')  # external writer, not this job
+    f._verify(job, False)
+    f._collect()
+    assert hint.read_bytes() == b'{"arg_count":99}'
+    assert canonical.read_bytes() == b'prior canonical'
+    assert cmre.tests == [] and cmre.accepted == []
+
+
+def test_spec_accept_error_without_nonacceptance_proof_never_rolls_back(root):
+    f, cmre, job, canonical = prepared_candidate(root)
+    cmre.acceptance_identity = farm.CmreAdapter(root).acceptance_identity
+    def committed_then_error(fn):
+        cmre.accepted.append(fn)
+        return 1, 'error after ledger write'
+    cmre.accept = committed_then_error
+    f._verify(job, False)
+    f._collect()
+    before = canonical.read_bytes()
+    f._accept()
+    assert canonical.read_bytes() == before
+    assert job['fn'] in f.state['quarantined']
+    assert not f.accept_queue
+
+
+@pytest.mark.parametrize('output,expected', [('Writer active: lease', 2), ('error after ledger write', 1)])
+def test_spec_real_adapter_reserves_busy_code_for_explicit_contention(root, output, expected):
+    adapter = farm.CmreAdapter(root)
+    adapter._cli = lambda *args: (2, output, '')
+    assert adapter.accept('fn_00401000')[0] == expected
+
+
+@pytest.mark.parametrize('failure', ['infra', 'limited'])
+@pytest.mark.parametrize('kind', ['fix', 'translate', 'audit'])
+def test_spec_running_fix_provider_failure_preserves_newer_user_hints(root, failure, kind):
+    f, _, _ = make(root, [], writes(GOOD), workers=0)
+    hint = root / 'recovery/hints/fn_00401000.json'
+    hint.write_bytes(b'{"arg_count":1}')
+    if kind == 'fix':
+        (root / 'recovery/c/fn_00401000.c').write_text(GOOD)
+        job = seed_bound_fix(f)
+    else:
+        job = f._new_job(kind, 'fn_00401000', 'm/strong', bytes=200)
+    f._launch(job)
+    hint.write_bytes(b'{"arg_count":99}')  # newer unrelated edit after dispatch
+    if failure == 'infra':
+        f._infra(job, 'auth failure')
+    else:
+        f._limited(job, 'rate limit', 60)
+    assert hint.read_bytes() == b'{"arg_count":99}'
+    assert not f.pending
+
+
+def test_review_locator_binds_first_and_confirmation_paths(root, monkeypatch, capsys):
+    f, _, _ = make(root, [], writes(GOOD), workers=0, audit_workers=1, confirm_model='m/judge')
+    fn = 'fn_00401000'
+    (root / f'recovery/c/{fn}.c').write_text(GOOD)
+    f.state['accepted'][fn] = {'bytes': 200, 'identity': farm._identity(f._inputs(fn))}
+    f.cmre.brief = lambda fn: 'BRIEF with listing'
+    first = f._new_job('audit', fn, 'm/a', bytes=200)
+    f._launch(first)
+    Path(first['audit_path']).write_text(json.dumps({'verdict': 'defect', 'findings': ['first']}))
+    f._audit_result(first, False)
+    f.save()
+    before = farm.review_paths(f.run_dir, root, fn)
+    assert before['status'] == 'bound'
+    assert Path(before['review']['audit_path']) == Path(first['audit_path'])
+    assert Path(before['review']['bundle']).name == f"{fn}-{first['n']}.md"
+    failed_confirm = f._new_job('audit', fn, 'm/b', bytes=200, confirm=True)
+    f._launch(failed_confirm)
+    f._audit_result(failed_confirm, False)  # no verdict; keep the valid first-audit locator
+    f.save()
+    assert Path(farm.review_paths(f.run_dir, root, fn)['review']['audit_path']) == Path(first['audit_path'])
+    confirm = f._new_job('audit', fn, 'm/b', bytes=200, confirm=True)
+    f._launch(confirm)
+    Path(confirm['audit_path']).write_text(json.dumps({'verdict': 'defect', 'findings': ['confirmed']}))
+    f._audit_result(confirm, False)
+    f.save()
+    monkeypatch.setattr(farm, 'ROOT', root)
+    assert farm.main(['review', str(f.run_dir), fn]) == 0
+    located = json.loads(capsys.readouterr().out)
+    assert located['status'] == 'bound'
+    assert Path(located['review']['audit_path']) == Path(confirm['audit_path'])
+    assert Path(located['first_review']['audit_path']) == Path(first['audit_path'])
+    assert Path(located['review']['source_snapshot']).read_text() == GOOD
+    # A per-job verdict is evidence, not an editable current-verdict alias.
+    Path(confirm['audit_path']).write_text('{"verdict":"ok"}')
+    assert farm.review_paths(f.run_dir, root, fn)['status'] == 'fresh-review-required'
+    (root / f'recovery/c/{fn}.c').write_bytes(b'new canonical source')
+    assert farm.review_paths(f.run_dir, root, fn)['status'] == 'fresh-review-required'
+
+
+def test_status_never_reconciles_or_changes_interrupted_inputs(root, monkeypatch, capsys):
+    f, _, job, canonical = prepared_candidate(root)
+    f._verify(job, False)
+    before = canonical.read_bytes()
+    journal = Path(job['_transaction']).read_bytes()
+    state = f.state_path.read_bytes()
+    monkeypatch.setattr(farm, 'ROOT', root)
+    assert farm.main(['status', str(f.run_dir), '--json']) == 0
+    assert json.loads(capsys.readouterr().out)['quarantined'] == {}
+    assert canonical.read_bytes() == before
+    assert Path(job['_transaction']).read_bytes() == journal
+    assert f.state_path.read_bytes() == state
+
+
+def test_private_hint_redispatch_archives_draft_without_claiming_canonical_ownership(root):
+    f, _, _ = make(root, [], writes(GOOD), workers=0)
+    hint = root / 'recovery/hints/fn_00401000.json'
+    hint.write_bytes(b'{"arg_count":1}')
+    (root / 'recovery/c/fn_00401000.c').write_text(GOOD)
+    job = seed_bound_fix(f)
+    f._launch(job)
+    private = Path(job['hint_source'])
+    private.write_bytes(b'{"arg_count":1,"c_hints":{"notes":"draft"}}')
+    # A retry gets a new immutable dispatch and leaves the old private draft in place.
+    draft = private.read_bytes()
+    old_dispatch = json.loads(json.dumps(job['_fix_dispatch']))
+    f._retry_worker(job)
+    again = f.pending.pop()
+    f._launch(again)
+    assert again['n'] != job['n']
+    assert private.read_bytes() == draft
+    assert Path(again['hint_source']).read_bytes() == hint.read_bytes()
+    assert hashlib.sha256((Path(old_dispatch['snapshot']) / 'identity.json').read_bytes()).hexdigest() == old_dispatch['snapshot_metadata_sha256']
+    hint.write_bytes(b'{"arg_count":99}')
+    f._infra(again, 'auth failure')
+    assert hint.read_bytes() == b'{"arg_count":99}'
+    assert not f.pending
+
+
+@pytest.mark.parametrize('changed', ['source_snapshot', 'hints_snapshot', 'bundle', 'canonical_hints'])
+def test_review_locator_rejects_changed_artifacts_without_writing_state(root, changed):
+    f, _, _ = make(root, [], writes(GOOD), workers=0)
+    fn = 'fn_00401000'
+    (root / f'recovery/c/{fn}.c').write_text(GOOD)
+    f.cmre.brief = lambda fn: 'BRIEF with listing'
+    f.state['accepted'][fn] = {'bytes': 200, 'identity': farm._identity(f._inputs(fn))}
+    job = f._new_job('audit', fn, 'm/a', bytes=200)
+    f._launch(job)
+    Path(job['audit_path']).write_text('{"verdict":"ok","findings":[]}')
+    f._audit_result(job, False)
+    f.save()
+    located = farm.review_paths(f.run_dir, root, fn)
+    assert located['status'] == 'bound'
+    path = (root / f'recovery/hints/{fn}.json' if changed == 'canonical_hints'
+            else Path(located['review'][changed]))
+    path.write_bytes(b'changed by another writer')
+    state = f.state_path.read_bytes()
+    assert farm.review_paths(f.run_dir, root, fn)['status'] == 'fresh-review-required'
+    assert f.state_path.read_bytes() == state
+
+
+def test_documented_and_generated_agents_use_supported_review_lookup():
+    docs = (MODULE.parents[1] / 'docs/agent/FARM.md').read_text(encoding='utf-8')
+    for prompt in (farm.coordinator_agent(), farm.defect_agent(), docs):
+        assert 'scripts/cmre_farm.py review RUN fn_X' in prompt
+    assert 'scripts/cmre_farm.py review *' in farm.defect_agent()
+    assert 'unbound_legacy_evidence' in docs
+    assert 'No journal/snapshot' in docs and 'verified archive' in docs
+
+
+def test_review_locator_marks_legacy_and_source_drift_unbound(root):
+    f, _, _ = make(root, [], writes(GOOD), workers=0)
+    fn = 'fn_00401000'
+    (root / f'recovery/c/{fn}.c').write_text(GOOD)
+    legacy = f.run_dir / f'audit/{fn}.json'
+    legacy.parent.mkdir()
+    legacy.write_text('{"verdict":"defect"}')
+    f.state['accepted'][fn] = {'bytes': 200}
+    f.state['audits'][fn] = {'verdict': 'defect', 'findings': ['legacy']}
+    f.save()
+    located = farm.review_paths(f.run_dir, root, fn)
+    assert located['status'] == 'fresh-review-required'
+    assert str(legacy.resolve()) in located['unbound_legacy_evidence']
+    assert 'review' not in located
+    assert 'fresh' in located['instruction']
+
+
+def prepared_candidate(root):
+    f, cmre, _ = make(root, [], writes(GOOD), workers=0)
+    canonical = root / 'recovery/c/fn_00401000.c'
+    canonical.write_bytes(b'prior canonical')
+    job = f._new_job('adopt', 'fn_00401000', 'hand', bytes=200)
+    source = root / 'candidate.c'
+    source.write_text(GOOD)
+    job.update(source=str(source), _snap={'c': canonical.read_bytes(), 'hint': None})
+    f.save()
+    return f, cmre, job, canonical
+
+
+def review_receipt(f, fn='fn_00401000'):
+    name = f"claim-{len(list((f.run_dir / 'reviews').glob('*')))}"
+    return farm.claim_review(f.run_dir, f.root, fn, name)['review_receipt']
+
+
+def reviewed_request(f, fn, kind, **data):
+    receipt = review_receipt(f, fn)
+    return farm._request(f.run_dir, fn, kind,
+                         **farm.review_request_data(receipt, f.run_dir, f.root, fn), **data)
+
+
+def seed_unconfirmed_audit(f, fn, findings, model='fake/first-auditor'):
+    """Build real dispatch artifacts for a fake first verdict, not an unbound state dictionary."""
+    launcher = f.launcher
+    f.launcher = FakeLauncher(f.root, writes(GOOD))
+    first = f._new_job('audit', fn, model, bytes=f.state['accepted'][fn]['bytes'])
+    f._launch(first)
+    Path(first['audit_path']).write_text(json.dumps({'verdict': 'defect', 'findings': findings}))
+    f._audit_result(first, False)
+    f.running = [row for row in f.running if row[0] is not first]
+    f.launcher = launcher
+    f.save()
+    return first
+
+
+def seed_bound_fix(f, fn='fn_00401000'):
+    """Authorize a running fix through retained fake review evidence, not a bare job dictionary."""
+    assert f._inputs(fn)['c'] is not None
+    assert f.config.confirm_model is None
+    f.state['accepted'].setdefault(fn, {'bytes': 200, 'identity': farm._identity(f._inputs(fn))})
+    launcher = f.launcher
+    f.launcher = FakeLauncher(f.root, writes(GOOD))
+    first = f._new_job('audit', fn, 'fake/first-auditor', bytes=200)
+    f._launch(first)
+    Path(first['audit_path']).write_text(json.dumps({
+        'verdict': 'defect', 'findings': [{'detail': 'FAKE reviewed concern', 'evidence': 'FAKE listing'}]}))
+    f._audit_result(first, False)
+    f.running = [row for row in f.running if row[0] is not first]
+    f.launcher = launcher
+    fix = next(job for job in f.pending if job['kind'] == 'fix' and job['fn'] == fn)
+    f.pending.remove(fix)
+    return fix
+
+
+def test_serial_accept_rechecks_candidate_identity(root):
+    f, cmre, job, canonical = prepared_candidate(root)
+    f._verify(job, False)
+    f._collect()
+    canonical.write_bytes(b'new unrelated user work')
+    f._accept()
+    assert cmre.accepted == []
+    assert canonical.read_bytes() == b'new unrelated user work'
+
+
+@pytest.mark.parametrize('phase', ['installed', 'accepting'])
+@pytest.mark.parametrize('newer', [False, True])
+def test_interrupted_candidate_restores_only_owned_bytes(root, phase, newer):
+    f, cmre, job, canonical = prepared_candidate(root)
+    f._verify(job, False)
+    if phase == 'accepting':
+        def die(fn):
+            raise KeyboardInterrupt('death during acceptance')
+        cmre.accept = die
+        f._collect()
+        with pytest.raises(KeyboardInterrupt):
+            f._accept()
+    if newer:
+        canonical.write_bytes(b'new unrelated user work')
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert canonical.read_bytes() == (b'new unrelated user work' if newer else b'prior canonical')
+    assert 'fn_00401000' not in resumed.state['accepted']
+
+
+def test_death_after_accept_reconciles_explicit_ledger_identity(root):
+    f, cmre, job, canonical = prepared_candidate(root)
+    identity = {'c': hashlib.sha256(Path(job['source']).read_bytes()).hexdigest(), 'hint': None}
+    def accepted_then_died(fn):
+        cmre.acceptance_identity = lambda fn: identity
+        raise KeyboardInterrupt('after ledger write, before return')
+    cmre.accept = accepted_then_died
+    f._verify(job, False)
+    f._collect()
+    with pytest.raises(KeyboardInterrupt):
+        f._accept()
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert canonical.read_text() == GOOD
+    assert 'fn_00401000' in resumed.state['accepted']
+
+
+@pytest.mark.parametrize('failure', ['limited', 'infra', 'defect'])
+def test_stale_audit_never_restores_or_fixes_newer_canonical(root, failure):
+    f, _, launcher = make(root, [], writes(GOOD), workers=0, audit_workers=1)
+    fn = 'fn_00401000'
+    canonical = root / f'recovery/c/{fn}.c'
+    canonical.write_text(GOOD)
+    f.state['accepted'][fn] = {'bytes': 200}
+    job = f._new_job('audit', fn, 'm/strong', bytes=200)
+    f._launch(job)
+    canonical.write_bytes(b'new unrelated user work')
+    if failure == 'limited':
+        f._limited(job, 'rate limit', 60)
+    elif failure == 'infra':
+        f._infra(job, 'auth')
+    else:
+        Path(job['audit_path']).write_text(json.dumps({'verdict': 'defect', 'findings': ['old defect']}))
+        f._audit_result(job, False)
+    assert canonical.read_bytes() == b'new unrelated user work'
+    assert not f.pending
+    assert fn not in f.state['defects']
+    assert fn in f.audit_queue
+
+
+@pytest.mark.parametrize('identity', [None, {'c': 'old', 'hint': None}])
+def test_restart_requeues_terminal_audit_without_current_identity(root, identity):
+    f, cmre, _ = make(root, [], writes(GOOD), workers=0, audit_workers=1)
+    fn = 'fn_00401000'
+    f.state['accepted'][fn] = {'bytes': 200}
+    f.state['audits'][fn] = {'verdict': 'ok', 'rounds': 2}
+    if identity is not None:
+        f.state['audits'][fn]['identity'] = identity
+    f.save()
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert fn in resumed.audit_queue
+
+
+def test_offline_lock_precedes_state_read(root, monkeypatch):
+    f, _, _ = make(root, [], writes(GOOD), workers=0)
+    f.save()
+    with farm.RunLock(f.run_dir):
+        with pytest.raises(RuntimeError, match='supervisor'):
+            farm.apply_requests_now(f.run_dir)
+
+
+def test_offline_drains_second_request_queued_during_verification(root, monkeypatch):
+    from concurrent.futures import Future
+    f, cmre, job, canonical = prepared_candidate(root)
+    monkeypatch.setattr(farm, 'ROOT', root)
+    monkeypatch.setattr(farm, 'CmreAdapter', lambda: cmre)
+    reviewed_request(f, job['fn'], 'adopt', source=job['source'])
+    calls = []
+    queued_second = []
+    class Deferred:
+        def submit(self, fn, *args):
+            future = Future()
+            calls.append((future, fn, args))
+            return future
+    monkeypatch.setattr(farm, 'InlineExecutor', Deferred)
+    def progress(_):
+        # Competing offline writer must fail even while the first is verifying.
+        with pytest.raises(RuntimeError, match='supervisor'):
+            farm.apply_requests_now(f.run_dir)
+        for future, fn, args in calls:
+            if not future.done():
+                outcome = fn(*args)
+                # Review the installed candidate while its verification is still
+                # pending, not the older dispatch baseline that it replaced.
+                if len(calls) == 1 and not queued_second:
+                    reviewed_request(f, job['fn'], 'adopt', source=job['source'])
+                    queued_second.append(True)
+                future.set_result(outcome)
+                break
+    monkeypatch.setattr(farm.time, 'sleep', progress)
+    result = farm.apply_requests_now(f.run_dir)
+    assert len(cmre.accepted) == 2
+    assert not result.verifying and not result.accept_queue
+    assert not list((f.run_dir / 'requests').glob('*.json'))
+
+
+@pytest.mark.parametrize('boundary', ['prepared', 'installing', 'installed', 'accepted', 'complete'])
+def test_candidate_journal_crash_boundaries_keep_prior_bytes_and_identity(root, monkeypatch, boundary):
+    f, cmre, job, canonical = prepared_candidate(root)
+    hints = root / 'recovery/hints/fn_00401000.json'
+    before = b'{ "arg_count": 1, "c_hints": {} }\n'
+    after = before  # canonical hints are now read-only; proposals have their own lane
+    hints.write_bytes(after)
+    job['_snap']['hint'] = before
+    original_json = farm._durable_json
+    def checkpoint(path, data):
+        original_json(path, data)
+        if Path(path).parent.name == 'transactions' and data['phase'] == boundary:
+            # This is exactly the disk record available to a new controller.
+            assert bytes.fromhex(data['prior']['c']) == b'prior canonical'
+            assert bytes.fromhex(data['prior']['hint']) == before
+            assert bytes.fromhex(data['candidate']['hint']) == after
+            assert data['identity'] == farm._identity(farm._decode_snapshot(data['candidate']))
+            raise KeyboardInterrupt(boundary)
+    monkeypatch.setattr(farm, '_durable_json', checkpoint)
+    with pytest.raises(KeyboardInterrupt):
+        f._verify(job, False)
+        f._collect()
+        f._accept()
+    monkeypatch.setattr(farm, '_durable_json', original_json)
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    accepted = boundary in ('accepted', 'complete')
+    assert canonical.read_text() == (GOOD if accepted else 'prior canonical')
+    assert hints.read_bytes() == (after if accepted else before)
+    assert ('fn_00401000' in resumed.state['accepted']) == accepted
+    # Repeated startup must not reapply acceptance or duplicate accounting.
+    again = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert again.state['attempts'] == resumed.state['attempts']
+
+
+@pytest.mark.parametrize('evidence', [None, {'c': 'wrong candidate', 'hint': None}])
+def test_accepting_without_matching_ledger_proof_requires_reverification(root, evidence):
+    f, cmre, job, canonical = prepared_candidate(root)
+    cmre.acceptance_identity = lambda fn: evidence
+    def die(fn):
+        raise KeyboardInterrupt()
+    cmre.accept = die
+    f._verify(job, False)
+    f._collect()
+    with pytest.raises(KeyboardInterrupt):
+        f._accept()
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert canonical.read_text() == GOOD
+    assert not resumed.state['accepted']
+    assert job['fn'] in resumed.state['quarantined']
+    assert any(e['event'] == 'acceptance-quarantined' for e in events(f.run_dir))
+
+
+def test_resume_collect_pending_is_resumable_with_existing_prefix_and_receipt(root):
+    f, cmre, _ = make(root, [item('fn_00401000')], writes('bad'), workers=1)
+    executor = ManualExecutor()
+    f.verifier = executor
+    fn = 'fn_00401000'
+    canonical = root / f'recovery/c/{fn}.c'
+    canonical.write_bytes(b'prior unfinished source prefix')
+    retained = f.run_dir / 'retained.c'
+    retained.write_text(GOOD)
+    receipt = f.run_dir / 'inherited-receipt.json'
+    receipt.write_bytes(b'{"green":true,"inherited":"parent"}')
+    (f.run_dir / 'resume-candidates.json').write_text(json.dumps({
+        'schema': 'cmre-farm-resume-candidates/1',
+        'receipt': str(receipt),
+        'sources': {fn: {'path': retained.name, 'sha256': hashlib.sha256(retained.read_bytes()).hexdigest(),
+                         'collect': True, 'hints_sha256': None}}}))
+    f.tick()
+    assert f.verifying
+    assert fn not in f.state.get('resume_collected', {})
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert canonical.read_bytes() == b'prior unfinished source prefix'
+    assert resumed._resume_seed(fn, collect=True) == retained.read_bytes()
+    resumed._dispatch()
+    resumed._collect()
+    resumed._accept()
+    assert cmre.accepted == [fn]
+    assert resumed.state['resume_collected'][fn] == hashlib.sha256(retained.read_bytes()).hexdigest()
+    assert receipt.read_bytes() == b'{"green":true,"inherited":"parent"}'
+
+
+@pytest.mark.parametrize('changed', ['c', 'hint', 'findings'])
+def test_confirmation_is_bound_to_snapshot_and_first_verdict(root, changed):
+    f, _, _ = make(root, [], writes(GOOD), workers=0, audit_workers=1, confirm_model='m/judge')
+    fn = 'fn_00401000'
+    canonical = root / f'recovery/c/{fn}.c'
+    canonical.write_text(GOOD)
+    f.state['accepted'][fn] = {'bytes': 200}
+    f.state['audits'][fn] = {'rounds': 1, 'verdict': 'unconfirmed', 'findings': ['first'],
+                             'identity': farm._identity(f._inputs(fn))}
+    job = f._new_job('audit', fn, 'm/judge', confirm=True, bytes=200)
+    f._launch(job)
+    if changed == 'c':
+        canonical.write_bytes(b'new user source')
+    elif changed == 'hint':
+        (root / f'recovery/hints/{fn}.json').write_bytes(b'{}')
+    else:
+        f.state['audits'][fn]['findings'] = ['different first verdict']
+    Path(job['audit_path']).write_text(json.dumps({'verdict': 'defect', 'findings': ['obsolete']}))
+    f._audit_result(job, False)
+    assert fn not in f.state['defects']
+    assert not f.pending
+    assert f.state['audit_history'][fn][-1].get('outcome') == 'stale' or any(
+        row.get('outcome') == 'stale' for row in f.state['audit_history'][fn])
+
+
+def test_delayed_fix_does_not_apply_old_findings_to_new_source(root):
+    f, _, _ = make(root, [], writes(GOOD), workers=0, audit_workers=1)
+    fn = 'fn_00401000'
+    canonical = root / f'recovery/c/{fn}.c'
+    canonical.write_text(GOOD)
+    f.state['accepted'][fn] = {'bytes': 200}
+    f._defect(fn, ['old finding'])
+    canonical.write_bytes(b'new user source')
+    assert f._next_pending() is None
+    assert canonical.read_bytes() == b'new user source'
+    assert f.state['defects'][fn] == ['old finding']  # unresolved, not silently dismissed
+
+
+def test_acceptance_checks_hints_after_hold_retry(root):
+    f, cmre, job, canonical = prepared_candidate(root)
+    f._verify(job, False)
+    f._collect()
+    cmre.holds[job['fn']] = {'state': 'hold', 'reason': 'old concern'}
+    # Use an actual hard-hold name, rather than assuming its spelling.
+    cmre.holds[job['fn']]['state'] = next(iter(farm.HARD_HOLDS))
+    original_retry = cmre.retry
+    def retry(fn, reason):
+        original_retry(fn, reason)
+        (root / f'recovery/hints/{fn}.json').write_bytes(b'{"user":"newer"}')
+    cmre.retry = retry
+    f._accept()
+    assert cmre.accepted == []
+    assert (root / 'recovery/hints/fn_00401000.json').read_bytes() == b'{"user":"newer"}'
+    assert canonical.read_bytes() == b'prior canonical'
+
+
+def test_audit_snapshots_and_verdict_paths_are_per_job(root):
+    f, _, _ = make(root, [], writes(GOOD), workers=0, audit_workers=1)
+    fn = 'fn_00401000'
+    canonical = root / f'recovery/c/{fn}.c'
+    hints = root / f'recovery/hints/{fn}.json'
+    canonical.write_bytes(GOOD.encode())
+    hints.write_bytes(b'{"c_hints":{}}')
+    first = f._new_job('audit', fn, 'm/a', bytes=200)
+    f._launch(first)
+    Path(first['audit_path']).write_bytes(b'{"verdict":"ok"}')
+    canonical.write_bytes(b'newer source')
+    hints.write_bytes(b'newer hints')
+    second = f._new_job('audit', fn, 'm/b', bytes=200)
+    f._launch(second)
+    assert (root / first['review_source']).read_bytes() == GOOD.encode()
+    assert (root / first['review_hints']).read_bytes() == b'{"c_hints":{}}'
+    assert (root / second['review_source']).read_bytes() == b'newer source'
+    assert first['audit_path'] != second['audit_path']
+    assert Path(first['audit_path']).read_bytes() == b'{"verdict":"ok"}'
+
+
+def test_conflicted_restart_parks_instead_of_recollecting_over_userwork(root):
+    f, cmre, job, canonical = prepared_candidate(root)
+    cmre.items = [item(job['fn'])]
+    f._verify(job, False)
+    canonical.write_bytes(b'newer unrelated user source')
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert job['fn'] in resumed.state['parked']
+    assert resumed._next_item() is None
+    assert canonical.read_bytes() == b'newer unrelated user source'
+
+
+def test_corrupt_candidate_identity_stops_reconciliation_without_writes(root):
+    f, cmre, job, canonical = prepared_candidate(root)
+    f._verify(job, False)
+    path = Path(job['_transaction'])
+    data = json.loads(path.read_text())
+    data['identity']['c'] = 'wrong'
+    path.write_text(json.dumps(data))
+    before = canonical.read_bytes()
+    with pytest.raises(RuntimeError, match='journal identity mismatch'):
+        farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert canonical.read_bytes() == before
+
+
 @pytest.mark.parametrize("include_held", [False, True])
 def test_real_adapter_forwards_explicit_held_claim_option(monkeypatch, tmp_path, include_held):
     from cmre import work
@@ -68,6 +1441,11 @@ class FakeCmre:
         if code == 0:
             self.accepted.append(fn)
         return code, 'ok' if code == 0 else 'busy'
+
+    def acceptance_identity(self, fn):
+        # This fake's complete ledger is accepted[]. Absence is authoritative
+        # here, unlike an unavailable production ledger query.
+        return {'status': 'not-accepted'} if fn not in self.accepted else None
 
     def hold(self, fn):
         return self.holds.get(fn)
@@ -191,6 +1569,65 @@ def test_run_saves_heartbeat_before_first_tick(root, monkeypatch):
     f.run(poll=0)
 
 
+def test_resume_job_numbers_do_not_overwrite_interrupted_logs(root):
+    f, _, _ = make(root, [], writes(GOOD))
+    f._event('dispatch', fn='fn_00401000', kind='translate', model='m/cheap', n=21)
+    f.save()
+    resumed, _, _ = make(root, [], writes(GOOD))
+    assert resumed._new_job('translate', 'fn_00401000', 'm/cheap')['n'] == 22
+
+
+def test_resume_collect_retests_retained_candidate_without_model(root):
+    f, cmre, launcher = make(root, [item('fn_00401000')], writes('bad'), workers=1)
+    retained = f.run_dir / 'retained.c'
+    retained.write_text(GOOD)
+    (f.run_dir / 'resume-candidates.json').write_text(json.dumps({
+        'schema': 'cmre-farm-resume-candidates/1',
+        'sources': {'fn_00401000': {
+            'path': retained.name, 'sha256': hashlib.sha256(retained.read_bytes()).hexdigest(),
+            'collect': True, 'hints_sha256': None,
+        }},
+    }))
+    drain(f)
+    assert launcher.started == []
+    assert cmre.accepted == ['fn_00401000']
+    assert len(cmre.tests) == 2
+    assert retained.read_text() == GOOD
+
+
+def test_resume_collection_refuses_changed_hints(root):
+    f, _, _ = make(root, [], writes(GOOD))
+    retained = f.run_dir / 'retained.c'
+    retained.write_text(GOOD)
+    (f.run_dir / 'resume-candidates.json').write_text(json.dumps({
+        'schema': 'cmre-farm-resume-candidates/1',
+        'sources': {'fn_00401000': {
+            'path': retained.name, 'sha256': hashlib.sha256(retained.read_bytes()).hexdigest(),
+            'collect': True, 'hints_sha256': None,
+        }},
+    }))
+    (root / 'recovery/hints/fn_00401000.json').write_text('{}')
+    assert f._resume_seed('fn_00401000', collect=True) is None
+
+
+def test_interrupted_dispatch_is_not_reported_as_a_live_worker(tmp_path):
+    path = tmp_path / 'events.jsonl'
+    path.write_text('\n'.join(json.dumps(e) for e in [
+        {'event': 'dispatch', 'fn': 'fn_00401000', 'kind': 'translate', 'model': 'm/cheap', 'n': 21},
+        {'event': 'interrupted', 'fn': 'fn_00401000', 'n': 21},
+    ]) + '\n')
+    assert farm.running_from_events(path) == []
+
+
+def test_run_lock_rejects_competing_supervisor_and_releases(tmp_path):
+    with farm.RunLock(tmp_path):
+        with pytest.raises(RuntimeError, match='supervisor'):
+            with farm.RunLock(tmp_path):
+                pytest.fail('second supervisor acquired run')
+    with farm.RunLock(tmp_path):
+        assert (tmp_path / 'supervisor.json').exists()
+
+
 def drain(f, ticks=20):
     for _ in range(ticks):
         f.tick()
@@ -269,7 +1706,7 @@ def test_worker_shared_hint_change_is_rejected_before_gate_and_restored(root, fi
         changed = json.loads(before)
         changed[field] = value
         changed['c_hints'] = {'fixtures': [hint_fixture(9)]}
-        hint.write_text(json.dumps(changed))
+        Path(job['hint_source']).write_text(json.dumps(changed))
         writes(GOOD)(job, r)
 
     f, cmre, _ = make(root, [item('fn_00401000')], behaviour, ladder=['m/cheap'])
@@ -299,7 +1736,7 @@ def test_worker_invalid_c_hints_are_rejected_before_gate_and_restore_snapshot(ro
     def behaviour(job, r):
         changed = json.loads(before) if existing else {}
         changed['c_hints'] = proposal
-        hint.write_text(json.dumps(changed))
+        Path(job['hint_source']).write_text(json.dumps(changed))
         writes(GOOD)(job, r)
 
     f, cmre, _ = make(root, [item('fn_00401000')], behaviour, ladder=['m/cheap'])
@@ -318,9 +1755,9 @@ def test_worker_cannot_delete_corrupt_or_remove_shared_hints(root, replacement):
 
     def behaviour(job, r):
         if replacement is None:
-            hint.unlink()
+            Path(job['hint_source']).unlink()
         else:
-            hint.write_bytes(replacement)
+            Path(job['hint_source']).write_bytes(replacement)
         writes(GOOD)(job, r)
 
     f, cmre, _ = make(root, [item('fn_00401000')], behaviour, ladder=['m/cheap'])
@@ -339,8 +1776,8 @@ def test_worker_hint_edit_is_reverted_on_failure_and_kept_on_success(root):
     starts = []
 
     def behaviour(job, r):
-        starts.append(json.loads(hint.read_text()))
-        hint.write_text(json.dumps(edited))
+        starts.append(json.loads(Path(job['hint_source']).read_text()))
+        Path(job['hint_source']).write_text(json.dumps(edited))
         Path(job['source']).parent.mkdir(parents=True, exist_ok=True)
         Path(job['source']).write_text('bad' if job['model'] == 'm/cheap' else GOOD)
 
@@ -349,9 +1786,13 @@ def test_worker_hint_edit_is_reverted_on_failure_and_kept_on_success(root):
     f.tick()  # reap failure, restore, dispatch strong
     assert json.loads(hint.read_text()) in (shared, edited)
     drain(f)
-    assert cmre.accepted == ['fn_00401000']
-    assert starts == [shared, shared]  # failure restored the original before escalation dispatch
-    assert json.loads(hint.read_text()) == edited
+    assert cmre.accepted == []
+    assert starts == [shared]  # a valid private proposal stops for the parent's authorized input lane
+    assert json.loads(hint.read_text()) == shared
+    receipt = Path(f.state['hint_proposals']['fn_00401000']['receipt'])
+    retained = json.loads(receipt.read_text())
+    assert json.loads(bytes.fromhex(retained['proposal'])) == edited
+    assert retained['dispatch_identity']['hint'] == hashlib.sha256(hint.read_bytes()).hexdigest()
 
 
 def test_mechanical_rejections_never_reach_the_gate(root):
@@ -538,12 +1979,14 @@ def test_deadline_stops_dispatch_and_stop_file_drains(root):
 
 
 def test_worker_config_limits_edits_and_commands(root):
-    job = {'fn': 'fn_00401000', 'kind': 'translate', 'source': str(root / 'run/src/fn_00401000.c')}
+    job = {'fn': 'fn_00401000', 'kind': 'translate', 'source': str(root / 'run/src/fn_00401000.c'),
+           'hint_source': str(root / 'run/hints/fn_00401000-1.json')}
     cfg = farm.worker_config(root, job)
     perm = cfg['permission']
     assert perm['edit']['*'] == 'deny'
     assert any(k.endswith('run/src/fn_00401000.c') and v == 'allow' for k, v in perm['edit'].items())
-    assert perm['edit']['recovery/hints/fn_00401000.json'] == 'allow'
+    assert perm['edit'].get('recovery/hints/fn_00401000.json', perm['edit']['*']) == 'deny'
+    assert perm['edit']['run/hints/fn_00401000-1.json'] == 'allow'
     assert perm['bash']['*'] == 'deny'
     assert perm['bash']['py -3.13 -m cmre test *'] == 'allow'
     assert 'py -3.13 -m cmre accept *' not in perm['bash']
@@ -798,6 +2241,7 @@ def _job(root, kind='translate'):
         job['audit_path'] = str(root / 'CM0102/Analysis/cmre/farm/r/audit/fn_0000beef.json')
     else:
         job['source'] = str(root / 'CM0102/Analysis/cmre/farm/r/src/fn_0000beef.c')
+        job['hint_source'] = str(root / 'CM0102/Analysis/cmre/farm/r/hints/fn_0000beef-7.json')
     return job
 
 
@@ -808,7 +2252,8 @@ def test_v2_agent_scopes_edit_to_own_files_and_shell_to_the_allowlist(root):
     assert text.startswith('---\n') and 'mode: primary' in text
     assert '{ action: "*", resource: "*", effect: deny }' in text
     assert '{ action: "edit", resource: "CM0102/Analysis/cmre/farm/r/src/fn_0000beef.c", effect: allow }' in text
-    assert '{ action: "edit", resource: "recovery/hints/fn_0000beef.json", effect: allow }' in text
+    assert '{ action: "edit", resource: "recovery/hints/fn_0000beef.json", effect: allow }' not in text
+    assert '{ action: "edit", resource: "CM0102/Analysis/cmre/farm/r/hints/fn_0000beef-7.json", effect: allow }' in text
     assert '{ action: "shell", resource: "py -3.13 -m cmre test *", effect: allow }' in text
     assert '{ action: "shell", resource: "rg *", effect: allow }' in text
     assert 'grep *' not in text and 'ls *' not in text and 'mutate' not in text
@@ -1052,13 +2497,11 @@ def test_a_confirmed_defect_fixes_only_the_confirmed_findings(root):
 
 
 def test_unconfirmed_defects_from_earlier_runs_are_confirmed_on_restart(root):
-    run = root / 'run'
-    run.mkdir()
-    (run / 'state.json').write_text(json.dumps({
-        'schema': 'cmre-farm/1', 'started_at': 0, 'owner': 'farm-t', 'attempts': {},
-        'accepted': {'fn_00401000': {'bytes': 200, 'model': 'm/x', 'kind': 'translate', 'at': 0}},
-        'parked': {}, 'skipped': {}, 'defects': {}, 'fix_rounds': {}, 'unavailable_models': {},
-        'audits': {'fn_00401000': {'rounds': 1, 'verdict': 'unconfirmed', 'findings': [A], 'model': 'm/x'}}}))
+    first, _, _ = make(root, [], writes(GOOD), workers=0, audit_workers=1, confirm_model='m/judge')
+    fn = 'fn_00401000'
+    (root / f'recovery/c/{fn}.c').write_text(GOOD)
+    first.state['accepted'][fn] = {'bytes': 200, 'identity': farm._identity(first._inputs(fn))}
+    seed_unconfirmed_audit(first, fn, [A], 'm/x')
     behaviour = audit_writer([('ok', [])])
     f, cmre, launcher = make(root, [], behaviour, audit_workers=1, confirm_model='m/judge')
     drain(f)
@@ -1194,7 +2637,8 @@ def test_adopt_request_accepts_a_hand_fix_and_reaudits_it(root):
     f.save()
     hand = root / 'hand.c'
     hand.write_text(GOOD.replace('a + 1', 'a + 1 /*PASS by hand*/'))
-    assert farm.main(['adopt', str(f.run_dir), 'fn_00401000', '--source', str(hand), '--note', 'restored EAX']) == 0
+    assert farm.main(['adopt', str(f.run_dir), 'fn_00401000', '--source', str(hand),
+                      '--note', 'restored EAX', '--review-receipt', review_receipt(f)]) == 0
     drain(f, 10)
     assert cmre.accepted == ['fn_00401000']
     assert 'PASS by hand' in (root / 'recovery/c/fn_00401000.c').read_text()
@@ -1210,7 +2654,8 @@ def test_failed_adopt_keeps_the_defect_and_the_accepted_source(root):
     (root / 'recovery/c/fn_00401000.c').write_text(GOOD)
     (root / 'bad.c').write_text('#include "cmre.h"\nu32 cm_fn_00401000(u32 a) { return a; }\n')
     f.save()   # a live farm: fresh state, no exit event
-    farm.main(['adopt', str(f.run_dir), 'fn_00401000', '--source', str(root / 'bad.c')])
+    farm.main(['adopt', str(f.run_dir), 'fn_00401000', '--source', str(root / 'bad.c'),
+               '--review-receipt', review_receipt(f)])
     drain(f, 5)
     assert (root / 'recovery/c/fn_00401000.c').read_text() == GOOD
     assert 'fn_00401000' in f.state['defects'] and cmre.accepted == []
@@ -1222,8 +2667,10 @@ def test_dismiss_request_closes_a_false_positive_with_its_reason(root):
     f.state['accepted']['fn_00401000'] = {'bytes': 200, 'model': 'm/x', 'kind': 'translate', 'at': 0}
     f.state['audits']['fn_00401000'] = {'rounds': 1, 'verdict': 'defect', 'findings': [A]}
     f.state['defects']['fn_00401000'] = [A]
+    (root / 'recovery/c/fn_00401000.c').write_text(GOOD)
     f.save()
-    farm.main(['dismiss', str(f.run_dir), 'fn_00401000', '--reason', 'cmp si, cx is a 16-bit compare'])
+    farm.main(['dismiss', str(f.run_dir), 'fn_00401000', '--reason', 'cmp si, cx is a 16-bit compare',
+               '--review-receipt', review_receipt(f)])
     f.tick()
     audit = f.state['audits']['fn_00401000']
     assert audit['verdict'] == 'ok' and audit['dismissed'] == 'cmp si, cx is a 16-bit compare'
@@ -1360,7 +2807,7 @@ def test_default_terra_lane_works_when_other_providers_are_limited(root, monkeyp
                              confirm_model=farm.DEFAULT_CONFIRM_MODEL)
     f.state['limited_providers'] = {
         provider: {'until': 4600, 'message': 'quota exhausted'}
-        for provider in ('opencode-go', 'minimax-coding-plan')}
+        for provider in ('opencode-go', 'minimax-coding-plan', 'commandcode')}
     drain(f)
     assert launcher.started and all(j['model'] == 'openai/gpt-6.1-terra'
                                     for j, _, _ in launcher.started)
@@ -1370,6 +2817,32 @@ def test_default_terra_lane_works_when_other_providers_are_limited(root, monkeyp
         assert f.state['audits']['fn_00401000']['verdict'] == 'ok'
     else:
         assert 'fn_00401000' in f.state['parked']
+
+
+def test_commandcode_flash_matches_go_effort_tiers_not_fast():
+    go = 'opencode-go/deepseek-v4.1-flash'
+    commandcode = 'commandcode/deepseek/deepseek-v4.1-flash'
+    assert farm.COMMANDCODE_FLASH_MODEL == commandcode
+    assert farm.DEFAULT_LADDER[1:-1] == (
+        go + '#low', commandcode + '#low', go, commandcode)
+    assert not any('flash-fast' in model for model in farm.DEFAULT_LADDER)
+
+
+@pytest.mark.parametrize('provider, expected', [
+    ('opencode-go', 'commandcode/deepseek/deepseek-v4.1-flash#low'),
+    ('commandcode', 'opencode-go/deepseek-v4.1-flash#low'),
+])
+def test_equivalent_flash_provider_remains_available(root, monkeypatch, provider, expected):
+    monkeypatch.setattr(farm.time, 'time', lambda: 1000.0)
+    f, cmre, launcher = make(root, [item('fn_00401000')], writes(GOOD), workers=1,
+                             ladder=list(farm.DEFAULT_LADDER))
+    f.state['limited_providers'] = {
+        name: {'until': 4600, 'message': 'quota exhausted'}
+        for name in ('minimax-coding-plan', provider)}
+    drain(f)
+    assert [job['model'] for job, _, _ in launcher.started] == [expected]
+    assert cmre.accepted == ['fn_00401000']
+    assert len(cmre.tests) == 2
 
 
 @pytest.mark.parametrize('confirm', [False, True])
@@ -1391,11 +2864,13 @@ def test_audit_and_confirmation_fall_back_to_terra(root, monkeypatch, confirm, f
                                       audit_model=preferred, confirm_model=preferred)
     fn = 'fn_00401000'
     (root / 'recovery/c' / f'{fn}.c').write_text(GOOD)
-    f.state['accepted'][fn] = {'bytes': 200, 'model': preferred, 'kind': 'translate', 'at': 0}
+    f.state['accepted'][fn] = {'bytes': 200, 'model': preferred, 'kind': 'translate', 'at': 0,
+                               'identity': farm._identity(f._inputs(fn))}
     if confirm:
-        f.state['audits'][fn] = {'rounds': 1, 'verdict': 'unconfirmed',
-                                 'findings': [B], 'model': preferred}
-    f.audit_queue.append(fn)
+        seed_unconfirmed_audit(f, fn, [B], preferred)
+    prior_attempts = len(f.state['attempts'].get(fn, []))
+    if fn not in f.audit_queue:
+        f.audit_queue.append(fn)
     if failure == 'limited':
         f.state['limited_providers']['opencode-go'] = {'until': 4600, 'message': 'usage limit'}
     drain(f)
@@ -1405,7 +2880,7 @@ def test_audit_and_confirmation_fall_back_to_terra(root, monkeypatch, confirm, f
     assert f.state['audits'][fn]['verdict'] == 'ok'
     assert f.config.audit_model == preferred and f.config.confirm_model == preferred
     assert cmre.accepted == [] and cmre.tests == []
-    assert all(row['model'] == terra for row in f.state['attempts'][fn])
+    assert all(row['model'] == terra for row in f.state['attempts'][fn][prior_attempts:])
 
 
 def test_a_limited_audit_waits_for_the_reset_instead_of_erroring(root, monkeypatch):
@@ -1446,12 +2921,15 @@ def test_adopt_and_dismiss_apply_directly_when_the_run_has_no_live_farm(root, mo
     f._event('farm-exit', status='done')
     f.save()
     (root / 'recovery/c/fn_00401000.c').write_text(GOOD)
+    (root / 'recovery/c/fn_00401100.c').write_text(GOOD.replace('fn_00401000', 'fn_00401100'))
     hand = root / 'hand.c'
     hand.write_text(GOOD.replace('a + 1', 'a + 1 /*PASS by hand*/'))
     monkeypatch.setattr(farm, 'ROOT', root)
     monkeypatch.setattr(farm, 'CmreAdapter', lambda *a, **k: cmre)
-    assert farm.main(['adopt', str(f.run_dir), 'fn_00401000', '--source', str(hand)]) == 0
-    assert farm.main(['dismiss', str(f.run_dir), 'fn_00401100', '--reason', 'false positive']) == 0
+    assert farm.main(['adopt', str(f.run_dir), 'fn_00401000', '--source', str(hand),
+                      '--review-receipt', review_receipt(f)]) == 0
+    assert farm.main(['dismiss', str(f.run_dir), 'fn_00401100', '--reason', 'false positive',
+                      '--review-receipt', review_receipt(f, 'fn_00401100')]) == 0
     state = json.loads((f.run_dir / 'state.json').read_text())
     assert cmre.accepted == ['fn_00401000']
     assert state['defects'] == {} and state['audits']['fn_00401100']['dismissed'] == 'false positive'
@@ -1491,4 +2969,5 @@ def test_every_default_deepseek_model_is_v4_1_flash():
     agents = farm.coordinator_agent() + farm.defect_agent()
     models = defaults + re.findall(r'^model: (\S+)', agents, re.M)
     deepseek = [m for m in models if 'deepseek' in m]
-    assert deepseek and all(m.split('#')[0] == 'opencode-go/deepseek-v4.1-flash' for m in deepseek), deepseek
+    allowed = {'opencode-go/deepseek-v4.1-flash', 'commandcode/deepseek/deepseek-v4.1-flash'}
+    assert deepseek and all(m.split('#')[0] in allowed for m in deepseek), deepseek

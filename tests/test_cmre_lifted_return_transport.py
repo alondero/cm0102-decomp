@@ -106,6 +106,37 @@ def test_unbound_ordinary_lifted_call_keeps_its_relocated_return_word(tmp_path):
     assert result.regs[0] == compiled.symbols[lift.label(RETURN)] != RETURN
 
 
+@pytest.mark.parametrize('bound', [False, True])
+def test_consumed_return_word_survives_partial_scratch_overwrite(tmp_path, bound):
+    # Authored seam, not a game-callee model: RET consumes but does not erase
+    # its slot, which is subsequently reused as partially initialized data.
+    continuation = ('mov byte ptr [esp-4], 0xa\n'
+                    'mov edx, dword ptr [esp-4]\n mov eax, edx')
+    _, compiled, entries = toy(tmp_path, continuation=continuation)
+    if bound:
+        vm = machine(compiled, bind(compiled, entries))
+        return_word = RETURN
+    else:
+        vm = emu.Machine(image.primary(), compiled.image)
+        return_word = compiled.symbols[lift.label(RETURN)]
+    expected = (return_word & 0xffffff00) | 0xa
+    result = vm.run(compiled.entry, case(), 1000)
+    assert result.outcome == 'return', (result.outcome, result.detail)
+    assert result.regs[0] == result.regs[2] == expected
+    # Do not normalize a partly overwritten numeric value as a code pointer.
+    other_word = compiled.symbols[lift.label(RETURN)] if bound else RETURN
+    assert expected != ((other_word & 0xffffff00) | 0xa)
+    slot = emu.STACK_TOP - 8
+    events = result.events
+    consumed = events.index(('r', slot, 4, return_word))
+    overwritten = events.index(('w', slot, 1, 0xa), consumed + 1)
+    loaded = events.index(('r', slot, 4, expected), overwritten + 1)
+    assert consumed < overwritten < loaded
+    if bound:
+        assert vm.return_runtime.dispatches == 1
+        assert not vm.return_runtime.frames and vm.return_runtime.pending is None
+
+
 def test_actual_generated_lift_round_trip_and_source_stay_unchanged(tmp_path):
     lifted, text, compiled = build.lift_and_build(OWNER,tmp_path)
     assert compiled is not None, lifted.problems
