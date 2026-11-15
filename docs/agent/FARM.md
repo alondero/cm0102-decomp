@@ -12,6 +12,12 @@ fidelity rules in AGENTS.md are unchanged. Why: per-function serial review
 and an LLM coordinator cut throughput from 100–230 KB/day (19–28 Oct) to
 ~7 KB/day (8–13 Nov), with 8 overhead tasks per authored function.
 
+Adam added `openai/gpt-6.1-terra` on 2026-11-15 as an ordinary farm lane,
+alongside MiniMax and DeepSeek. It uses the same worker permissions, mechanical
+checks, differential gates and serial acceptance. Terra is also the default
+auditor, confirmation worker and defect fixer while the other quotas are scarce.
+Confirmation remains a separate worker run, including when both auditors use Terra.
+
 ## OpenCode coordinator (default)
 
 Adam runs sessions from OpenCode 2.x with the `cm-coordinator` agent (MiniMax
@@ -48,8 +54,9 @@ Coordinator procedure:
      tell Adam if a key needs renewal.
    - `model-limited`: a provider usage limit (OpenCode Go: 5 hours, shared by every
      DeepSeek model) paused that provider until the time `status` shows. The farm
-     requeues without spending attempts and resumes on its own. Hold `cm-defect`
-     work (DeepSeek) until then; tell Adam once, since Extra Usage is his call.
+     requeues without spending attempts and falls through to an available provider.
+     Audits and confirmations also use an available ladder model; they wait only
+     when all their lanes are unavailable. Tell Adam once, since Extra Usage is his call.
    - `supply-empty`: no testable function left. Let the run drain, then report the
      first supply-lane item below to Adam.
    - `timeout` (hourly): read `status` and apply step 5 of "Run by hand".
@@ -61,7 +68,7 @@ Coordinator procedure:
 
 ## Defect subagent
 
-`cm-defect` (DeepSeek v4.1 Flash, 40 steps) resolves one open defect. It gets `RUN fn_X`.
+`cm-defect` (GPT-6.1 Terra, 40 steps) resolves one open defect. It gets `RUN fn_X`.
 
 1. Read `RUN/audit/fn_X.json`, `RUN/audit/fn_X.confirm.json` when present,
    `RUN/bundle/fn_X.md` (or run `py -3.13 -m cmre brief fn_X`), and `recovery/c/fn_X.c`.
@@ -92,11 +99,12 @@ Coordinator procedure:
 
    Options: `--include-held` also takes held functions (each prompt carries
    the hold reason; the audit checks it). `--min-bytes/--max-bytes` bound the
-   queue. `--ladder` is the model escalation order, cheapest first
+   queue. `--ladder` is the model escalation order
    (default MiniMax M3.1 Flash → DeepSeek v4.1 Flash `#low` → DeepSeek v4.1
-   Flash, DeepSeek via OpenCode Go; MiniMax M3 passed 3 of 13 on 2026-11-13 and
-   is off the ladder). DeepSeek runs use v4.1 Flash; other models are Adam's call. `--audit-model` defaults to DeepSeek
-   v4.1 Flash; when it is unavailable the strongest available rung audits.
+   Flash → GPT-6.1 Terra, DeepSeek via OpenCode Go and Terra via OpenAI;
+   MiniMax M3 passed 3 of 13 on 2026-11-13 and is off the ladder). DeepSeek runs
+   use v4.1 Flash. `--audit-model` defaults to `openai/gpt-6.1-terra`; when the
+   preferred auditor is limited or retired, the last available ladder rung audits.
    `--stall-minutes` (default 15) kills a worker whose transcript stops growing.
    OpenCode 2.x writes nothing while a step thinks, so a shorter limit kills real
    work. DeepSeek models take an effort variant (`opencode-go/deepseek-v4.1-flash#low`).
@@ -105,12 +113,21 @@ Coordinator procedure:
    256k output ceiling and the current credentials. `--opencode v1` runs the
    Chocolatey 1.x `opencode` on PATH, which caps output at 32k unless raised and
    reported the OpenCode Go key as expired on 2026-11-13 while 2.x worked.
-   `--confirm-model` (default DeepSeek v4.1 Flash) is the second auditor; `''`
-   disables it. `--skip-ranges` (default `0x00940000-0x00953000`, the x87
+   `--confirm-model` (default `openai/gpt-6.1-terra`) is the second auditor, with
+   the same availability fallback; `''` disables it. `--skip-ranges` (default
+   `0x00940000-0x00953000`, the x87
    runtime helpers behind 7 of 10 production defects) is never dispatched.
    `--verify-threads` (default 8) runs gate re-tests beside the dispatcher.
    Every job reads one generated `RUN/bundle/fn_X.md`: the brief with the
    listing, the draft, the rules and `cmre.h`.
+
+   To conserve MiniMax/OpenCode Go quota, select Terra for all farm workers:
+   `py -3.13 scripts/cmre_farm.py start RUN --workers 16 --audit-workers 4 --include-held --hours 10 --ladder openai/gpt-6.1-terra --audit-model openai/gpt-6.1-terra --confirm-model openai/gpt-6.1-terra`.
+   Explicit `--ladder` settings replace the defaults, including on resumed runs;
+   add Terra to an older explicit list to enable its lane. Re-run `install-agents`
+   to update the local `cm-defect` model. Model discovery is not a successful
+   inference/authentication probe; the normal pre-run probe still checks that.
+
 4. Run `py -3.13 scripts/cmre_farm.py wait RUN --minutes 60` (it returns early on
    an open defect, an unavailable model, empty supply or the farm's exit), or
    check `py -3.13 scripts/cmre_farm.py status RUN` about once an hour. Status
