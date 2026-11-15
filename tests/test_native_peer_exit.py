@@ -22,6 +22,40 @@ def exit_race_fixture():
         pytest.skip(str(exc))
 
 
+def _worker_exit_events(protocol):
+    """Exclude reused non-worker TIDs: they once made 24 worker exits count as 25."""
+    worker_identities = {(record["tid"], record["thread_generation"])
+                         for record in protocol["invocations"]}
+    return [event for event in protocol["events"]
+            if event["kind"] == "thread-exit"
+            and (event["tid"], event["generation"]) in worker_identities]
+
+
+def test_worker_exit_selection_distinguishes_reused_thread_generations():
+    # Selection-only synthetic sample, not a complete protocol witness.
+    # Multiple invocations can belong to the same worker generation.
+    protocol = {
+        "invocations": [
+            {"tid": 41, "thread_generation": 2},
+            {"tid": 41, "thread_generation": 2},
+            {"tid": 41, "thread_generation": 3},
+            {"tid": 42, "thread_generation": 1},
+        ],
+        "events": [
+            {"kind": "thread-exit", "tid": 41, "generation": 1, "exit_code": 0},
+            {"kind": "thread-exit", "tid": 41, "generation": 2, "exit_code": 259},
+            {"kind": "thread-exit", "tid": 43, "generation": 1, "exit_code": 259},
+            {"kind": "thread-start", "tid": 41, "generation": 3},
+            {"kind": "thread-exit", "tid": 41, "generation": 3, "exit_code": 0},
+            {"kind": "thread-exit", "tid": 42, "generation": 1, "exit_code": 259},
+        ],
+    }
+    # Exclude an older non-worker generation, not a worker's wrong exit code:
+    # the live test must still catch that zero exit rather than hide it.
+    assert _worker_exit_events(protocol) == [
+        protocol["events"][1], protocol["events"][4], protocol["events"][5]]
+
+
 def test_native_multiwave_peer_exit_transition(exit_race_fixture):
     # 12 waves x 2 threads: many exit/peer-trap interleavings in one owned child.
     for _ in range(12):
@@ -33,9 +67,7 @@ def test_native_multiwave_peer_exit_transition(exit_race_fixture):
         assert result["protocol"]["cleanup_complete"]
         assert result["cleanup"]["all_debugger_bytes_restored"]
         assert all(step["trap_flag_after"] == 0 for step in result["steps"])
-        worker_tids = {record["tid"] for record in records}
-        exits = [event for event in result["protocol"]["events"]
-                 if event["kind"] == "thread-exit" and event["tid"] in worker_tids]
+        exits = _worker_exit_events(result["protocol"])
         assert len(exits) == 24 and all(event["exit_code"] == 259 for event in exits)
         for proof in result.get("peer_exit_deferrals", []):
             confirmed = proof["confirmed_by_exit_event"]
