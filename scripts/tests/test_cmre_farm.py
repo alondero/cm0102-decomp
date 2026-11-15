@@ -556,8 +556,27 @@ def test_audit_and_defect_prompts_keep_callee_c_navigation_only(root):
         assert 'Callee C is navigation only' in prompt
         assert 'never authority or proof' in prompt
         assert 'original instructions at preferred-image VAs' in prompt
-        assert '0c78e7da6d0bcb4603fa179449bbe6d1c627a22c445d14d489bd9bff86' in prompt
+        assert '0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86' in prompt
         assert 'not callee composition or runtime proof' in prompt
+
+
+def test_generated_authority_uses_complete_target_sha256_pin(root):
+    from cmre import env
+    assert re.fullmatch(r'[0-9a-f]{64}', env.TARGET_SHA256)
+    audit = _job(root, 'audit')
+    audit['bytes'] = 200
+    translate = _job(root, 'translate')
+    translate['bytes'] = 200
+    texts = [
+        '\n'.join(farm.AUDIT_AUTHORITY),
+        farm.audit_prompt(root, audit),
+        farm.confirm_prompt(root, audit),
+        farm.fix_prompt(root, _job(root, 'fix')),
+        farm.translate_prompt(root, translate),
+        farm.defect_agent(),
+    ]
+    for text in texts:
+        assert re.findall(r'SHA-256 ([0-9a-f]+)', text) == [env.TARGET_SHA256]
 
 
 def test_fresh_spec_queued_legacy_adopt_cannot_rebase_onto_new_acceptance(root):

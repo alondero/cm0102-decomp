@@ -73,7 +73,7 @@ AUDIT_AUTHORITY = (
     'The target source, hints and audit bundle MUST be the supplied immutable snapshots, never moving canonical files.',
     'Callee C is navigation only: never authority or proof for signatures, ABI or fidelity. Every ABI finding must '
     'cite original instructions at preferred-image VAs and the pinned CM0102 3.9.68 binary SHA-256 '
-    '0c78e7da6d0bcb4603fa179449bbe6d1c627a22c445d14d489bd9bff86.',
+    '0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.',
     'A bound target review is not callee composition or runtime proof; callee reads introduce no automatic global dependency.',
 )
 

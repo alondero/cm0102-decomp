@@ -94,6 +94,8 @@ Coordinator procedure:
    `review_receipt` and immutable `source` / `hints` paths under
    `RUN/reviews/NAME/`; an existing claim is never overwritten. Read these
    claimed source/hints bytes. A claim freezes inputs; it does not certify a review.
+   A returned hints path is absent when no canonical hints existed; that means no
+   hints, for both bound and fresh-review-required claims.
    - `status: "bound"`: read the returned `review.audit_path`, `review.bundle`
      when non-null (otherwise run `py -3.13 -m cmre brief fn_X`), and
      `review.source_snapshot` / `review.hints_snapshot` (missing hints means none).
@@ -127,7 +129,7 @@ Coordinator procedure:
    immutable snapshots. Callee C may be read ONLY for navigation, NEVER as
    signature/ABI/fidelity authority or proof. Every ABI finding must cite
    original instructions at preferred-image VAs for the pinned CM0102 3.9.68
-   binary, SHA-256 `0c78e7da6d0bcb4603fa179449bbe6d1c627a22c445d14d489bd9bff86`.
+   binary, SHA-256 `0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86`.
    A bound target review does not establish callee composition or live runtime
    equivalence; reading callee C does not silently add a global dependency hash.
 3. None confirmed: after the identity check in step 5, finish with
@@ -197,7 +199,8 @@ Coordinator procedure:
    inference/authentication probe; the normal pre-run probe still checks that.
 
 4. Run `py -3.13 scripts/cmre_farm.py wait RUN --minutes 60` (it returns early on
-   an open defect, an unavailable model, empty supply or the farm's exit), or
+   a notable event, including open defects, provider limits/unavailability,
+   failed requests, quarantine, missing hint/fix evidence, empty supply or exit), or
    check `py -3.13 scripts/cmre_farm.py status RUN` about once an hour. Status
    prints accepted functions and bytes, bytes per hour, parked items, audit
    results, open defects and pass rate per model. The farm needs no supervision
