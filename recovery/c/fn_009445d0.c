@@ -1,67 +1,54 @@
-/* WIP: -O2 build blocked (GCC -Warray-bounds on the constant null-page store
-   CM_GLOBAL(volatile u32, 0x9c) in the arg1==0 branch, under -Werror); -O0 passes.
-   Preferred-image VA 0x009445d0, image base 0x00400000.
-   Cdecl, two stack inputs (arg1 loaded into ECX, arg2 reloaded into EAX).
-   Sentinel dword at arg2-0x10, byte checks at [[header+4]+header+0x10] and +0x11,
-   then a store of 0 into the table at [ECX+0xc] indexed by [header+8], decrement
-   of [ECX+4], and a call to cm_fn_009452ca. Error paths store 0x5500aaff at
-   [ECX+0x9c], advance ECX by 0x10, call cm_fn_0094791c and fall through to the
-   listing's continuation. Return is EAX: zero when arg2 is zero, otherwise the
-   EAX left by cm_fn_009452ca. */
+/* Preferred-image VA 009445D0, base 00400000; CM0102 3.9.68 SHA-256
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+   CDECL2. Physical EAX/EDX prefixes add no stack words. Preserve the full
+   EDX:EAX pair: null allocation leaves incoming EDX, otherwise original
+   009452CA supplies it. Every known EAX/EDX/ECX input is explicit at native
+   boundaries. Original longjmp performs context transfer, never host C.
+   The volatile address local retains the original erroneous 9Ch store
+   without GCC treating that constant address as a bounded C array. */
 #include "cmre.h"
-
-extern unsigned long long CM_CDECL cm_fn_009452ca(u32 arg4);
-extern void CM_CDECL cm_fn_0094791c(int *_Buf, int _Value);
-
-u32 CM_CDECL cm_fn_009445d0(u32 arg1, u32 arg2)
+extern unsigned long long CM_CDECL __attribute__((regparm(3)))
+    cm_fn_009452ca(u32,u32,u32,u32);
+extern void CM_CDECL __attribute__((regparm(3),noreturn))
+    cm_fn_0094791c(u32,u32,u32,u32,u32);
+unsigned long long CM_CDECL __attribute__((regparm(2)))
+cm_fn_009445d0(u32 entry_eax,u32 entry_edx,
+               volatile u32 owner_home,volatile u32 allocation_home)
 {
-    u32 ecx = arg1;
-    u32 eax;
-    u32 edx;
-    u32 esi;
-
-    if (ecx == 0) {
-        CM_GLOBAL(volatile u32, 0x0000009c) = 0x5500aaffu;
-        cm_fn_0094791c((int *)0x10, 0x271b);
+    u32 owner=owner_home;
+    u32 allocation,header,edx,index;
+    if (owner==0u) {
+        volatile u32 fault_address=0x9cu;
+        CM_GLOBAL(volatile u32,fault_address)=0x5500aaffu;
+        cm_fn_0094791c(entry_eax,entry_edx,0u,0x10u,0x271bu);
     }
-
-    eax = arg2;
-    if (eax == 0) {
-        return eax;
+    allocation=allocation_home;
+    if (allocation==0u)
+        return (unsigned long long)entry_edx<<32;
+    header=allocation-0x10u;
+    edx=CM_GLOBAL(volatile u32,header);
+    if (edx!=0xaa53c5aau)
+        goto bad_marker;
+    edx=CM_GLOBAL(volatile u32,header+4u);
+    if (CM_GLOBAL(volatile u8,edx+header+0x10u)!=0x5au)
+        goto bad_marker;
+    if (CM_GLOBAL(volatile u8,edx+header+0x11u)!=0xf0u)
+        goto bad_marker;
+    edx=CM_GLOBAL(volatile u32,owner+0xcu);
+    index=CM_GLOBAL(volatile u32,header+8u);
+    if (CM_GLOBAL(volatile u32,edx+index*4u)!=header) {
+        CM_GLOBAL(volatile u32,owner+0x9cu)=0x5500aaffu;
+        cm_fn_0094791c(header,edx,owner+0x10u,owner+0x10u,0x271fu);
     }
-
-    edx = *(u32 *)(eax - 0x10u);
-    eax = eax - 0x10u;
-    if (edx != 0xaa53c5aau) {
-        *(u32 *)(ecx + 0x9cu) = 0x5500aaffu;
-        ecx = ecx + 0x10u;
-        cm_fn_0094791c((int *)ecx, 0x2719);
+    CM_GLOBAL(volatile u32,edx+index*4u)=0u;
+    edx=CM_GLOBAL(volatile u32,owner+4u);
+    --edx;
+    CM_GLOBAL(volatile u32,owner+4u)=edx;
+    {
+        volatile unsigned long long result=cm_fn_009452ca(header,edx,owner,header);
+        return result;
     }
-
-    edx = *(u32 *)(eax + 4u);
-    if (*(u8 *)(edx + eax + 0x10u) != 0x5au) {
-        *(u32 *)(ecx + 0x9cu) = 0x5500aaffu;
-        ecx = ecx + 0x10u;
-        cm_fn_0094791c((int *)ecx, 0x2719);
-    }
-
-    if (*(u8 *)(edx + eax + 0x11u) != 0xf0u) {
-        *(u32 *)(ecx + 0x9cu) = 0x5500aaffu;
-        ecx = ecx + 0x10u;
-        cm_fn_0094791c((int *)ecx, 0x2719);
-    }
-
-    edx = *(u32 *)(ecx + 0xcu);
-    esi = *(u32 *)(eax + 8u);
-    if (*(u32 *)(edx + esi * 4u) != eax) {
-        *(u32 *)(ecx + 0x9cu) = 0x5500aaffu;
-        ecx = ecx + 0x10u;
-        cm_fn_0094791c((int *)ecx, 0x271f);
-    }
-
-    *(u32 *)(edx + esi * 4u) = 0u;
-    edx = *(u32 *)(ecx + 4u);
-    edx = edx - 1u;
-    *(u32 *)(ecx + 4u) = edx;
-    return (u32)cm_fn_009452ca(eax);
+bad_marker:
+    CM_GLOBAL(volatile u32,owner+0x9cu)=0x5500aaffu;
+    cm_fn_0094791c(header,edx,owner+0x10u,owner+0x10u,0x2719u);
 }
