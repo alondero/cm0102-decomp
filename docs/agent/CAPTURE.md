@@ -54,6 +54,20 @@ the unchanged lifted gate. Its summary lists `passing` functions and their
 bytes. Both commands default to every function that has stored captures; name
 `fn_XXXXXXXX` IDs to bound them. Neither takes the writer lease.
 
+By default `expand` changes only captured registers, stack words and memory
+bytes. `--mutate-import-seed` opts into also mutating the u32
+`import_seed`, which selects the seeded import-stub results for a case. This is
+input-coverage exploration of import scaffolding, **not** native or runtime
+evidence and not an observation of a real Windows/API result, captured memory or
+game behaviour. The default is off and reproduces the previous mutation and RNG
+sequence exactly. An enabled run propagates the chosen seed into the original
+run, the saved derived capture and later mutations of that capture. A
+**seed-mutated** derived capture keeps `"kind": "mutated"`, names its parent,
+records the old and new seed in `edits`, and carries the explicit `scaffolding`
+label. Derived captures from ordinary register, stack or memory edits keep their
+existing metadata unchanged. The flag applies only to `expand` and changes no
+capture format, difftest, emulator, import or gate behaviour.
+
 Completion: `apply` output with a status for every function. `low-coverage`
 after expansion means the session did not exercise enough of that function:
 record a different activity. `fail` is a lift mismatch on a real input: keep

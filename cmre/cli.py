@@ -381,6 +381,9 @@ def cmd_mutate(a) -> int:
 def cmd_capture(a) -> int:
     """Captured entry inputs (ADR 0009): record from the live game, expand, apply to hints."""
     from . import capture, capture_expand, inventory
+    if a.mutate_import_seed and a.action != 'expand':
+        print('--mutate-import-seed applies only to capture expand', file=sys.stderr)
+        return 2
     inv = inventory.load()
     if a.action == 'record':
         from . import capture_record, ledger
@@ -400,7 +403,8 @@ def cmd_capture(a) -> int:
         print(json.dumps({'functions': sum(1 for _, n in rows if n), 'captures': sum(len(n) for _, n in rows),
                           'body_bytes': total, 'store': env.rel(capture.store_dir())}, indent=1))
         return 0
-    options = ({'iterations': a.iterations, 'target': a.target} if a.action == 'expand'
+    options = ({'iterations': a.iterations, 'target': a.target,
+                'mutate_import_seed': a.mutate_import_seed} if a.action == 'expand'
                else {'test': not a.no_test})
     results = capture_expand.run_many(a.action, vas, a.jobs, **options)
     if a.output:
@@ -737,6 +741,8 @@ def main(argv=None) -> int:
     s.add_argument('--status', type=Path, help='record: live JSON progress file')
     s.add_argument('--iterations', type=int, default=1500, help='expand: mutation attempts per function')
     s.add_argument('--target', type=float, default=0.9, help='expand: stop at this instruction coverage')
+    s.add_argument('--mutate-import-seed', action='store_true',
+                   help='expand: opt-in mutation of the u32 import seed (seeded stub input, not observation)')
     s.add_argument('--jobs', type=int, default=8, help='expand/apply: parallel processes')
     s.add_argument('--no-test', action='store_true', help='apply: write hints without running the lifted gate')
     s.add_argument('--output', type=Path, help='expand/apply: per-function JSON results')

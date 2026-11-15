@@ -13,6 +13,9 @@ from . import capture, env
 
 PAGE = capture.PAGE
 MUTATION_VALUES = (0, 1, 2, 0xFF, 0x7F, 0x80, 0xFFFF, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF)
+# Opt-in exploration of the seeded import-stub inputs (not observed API results).
+SEED_MUTATION_PROBABILITY = 0.25
+SEED_SCAFFOLDING = "seeded-import-stub-input (not observed)"
 
 
 def _function(va: int):
@@ -69,44 +72,60 @@ def _value(rng: random.Random, old: int, size: int) -> int:
     return rng.getrandbits(8 * size)
 
 
-def _mutate(rng: random.Random, machine, parent: dict) -> tuple[dict, list]:
-    """One to three small edits of a parent input, at bytes a previous run read."""
+def _mutate(rng: random.Random, machine, parent: dict, *, mutate_seed: bool = False) -> tuple[dict, list]:
+    """One to three small edits of a parent input, at bytes a previous run read.
+
+    With `mutate_seed`, sometimes replace all edits with one mutation of the u32
+    import seed. That seed only chooses seeded import-stub results: a scaffolding
+    input, not an observation of a real API result or of captured memory.
+    """
     regs, stack = dict(parent["regs"]), list(parent["stack"])
     pages = {page: bytearray(blob) for page, blob in parent["pages"].items()}
+    seed = parent.get("seed", 0)
     notes = []
-    for _ in range(rng.choice((1, 1, 2, 3))):
-        choice = rng.random()
-        if choice < 0.15 and stack:
-            index = rng.randrange(min(len(stack), 10))
-            stack[index] = _value(rng, stack[index], 4)
-            notes.append(["stack", index, stack[index]])
-        elif choice < 0.25:
-            name = rng.choice(("eax", "ecx", "edx", "ebx", "esi", "edi"))
-            regs[name] = _value(rng, regs[name], 4)
-            notes.append(["reg", name, regs[name]])
-        elif parent["reads"]:
-            address, size = rng.choice(parent["reads"])
-            page, offset = address & ~(PAGE - 1), address & (PAGE - 1)
-            if offset + size > PAGE:
-                continue
-            if page not in pages:
-                if not any(lo <= page < hi for lo, hi in machine._writable_image):
-                    continue  # code, constants and absent memory are not inputs
-                pages[page] = bytearray(machine.pristine[page])
-            old = int.from_bytes(pages[page][offset:offset + size], "little")
-            new = _value(rng, old, size)
-            pages[page][offset:offset + size] = new.to_bytes(size, "little")
-            notes.append(["mem", address, size, new])
-    return {"regs": regs, "stack": stack, "pages": {p: bytes(b) for p, b in pages.items()}}, notes
+    if mutate_seed and rng.random() < SEED_MUTATION_PROBABILITY:
+        old = seed & 0xFFFFFFFF
+        seed = _value(rng, old, 4)
+        if seed == old:
+            seed ^= 1
+        notes.append(["import_seed", old, seed])
+    else:
+        for _ in range(rng.choice((1, 1, 2, 3))):
+            choice = rng.random()
+            if choice < 0.15 and stack:
+                index = rng.randrange(min(len(stack), 10))
+                stack[index] = _value(rng, stack[index], 4)
+                notes.append(["stack", index, stack[index]])
+            elif choice < 0.25:
+                name = rng.choice(("eax", "ecx", "edx", "ebx", "esi", "edi"))
+                regs[name] = _value(rng, regs[name], 4)
+                notes.append(["reg", name, regs[name]])
+            elif parent["reads"]:
+                address, size = rng.choice(parent["reads"])
+                page, offset = address & ~(PAGE - 1), address & (PAGE - 1)
+                if offset + size > PAGE:
+                    continue
+                if page not in pages:
+                    if not any(lo <= page < hi for lo, hi in machine._writable_image):
+                        continue  # code, constants and absent memory are not inputs
+                    pages[page] = bytearray(machine.pristine[page])
+                old = int.from_bytes(pages[page][offset:offset + size], "little")
+                new = _value(rng, old, size)
+                pages[page][offset:offset + size] = new.to_bytes(size, "little")
+                notes.append(["mem", address, size, new])
+    mutant = {"regs": regs, "stack": stack, "pages": {p: bytes(b) for p, b in pages.items()}, "seed": seed}
+    return mutant, notes
 
 
-def expand(va: int, *, iterations: int = 600, target: float = 0.9, limit: int = 64) -> dict:
+def expand(va: int, *, iterations: int = 600, target: float = 0.9, limit: int = 64,
+           mutate_import_seed: bool = False) -> dict:
     """Coverage-guided mutation of this function's captures, original side only.
 
     A mutant is kept only when the original executes an instruction of the
     function that no stored input reached. It is saved as an ordinary capture
     whose metadata names its parent and edits: a derived test input, not an
-    observation of the game.
+    observation of the game. `mutate_import_seed` is an opt-in exploration of
+    the seeded import-stub inputs; it adds no evidence about real imports.
     """
     starts, region = _function(va)
     names = capture.names_for(va)
@@ -129,21 +148,24 @@ def expand(va: int, *, iterations: int = 600, target: float = 0.9, limit: int = 
         if len(covered) / len(starts) >= target or added >= limit:
             break
         parent = rng.choice(corpus)
-        mutant, notes = _mutate(rng, machine, parent)
+        mutant, notes = _mutate(rng, machine, parent, mutate_seed=mutate_import_seed)
         if not notes:
             continue
+        seed = mutant["seed"]
         result = _run(machine, va, opts, mutant["regs"], mutant["stack"], mutant["pages"],
-                      parent["seed"], parent["fpcw"])
+                      seed, parent["fpcw"])
         fresh = (result.covered & starts) - covered
         if not fresh:
             continue
         meta = {"kind": "mutated", "parent": parent["name"], "edits": notes, "outcome": result.outcome,
                 "budget": opts.budget, "arg_count": opts.arg_count}
+        if seed != parent["seed"]:
+            meta["scaffolding"] = SEED_SCAFFOLDING
         name = capture.save(va, mutant["regs"], parent["fpcw"], mutant["stack"], mutant["pages"],
-                            parent["seed"], meta)
+                            seed, meta)
         covered |= fresh
         added += 1
-        corpus.append({**mutant, "name": name, "seed": parent["seed"], "fpcw": parent["fpcw"],
+        corpus.append({**mutant, "name": name, "fpcw": parent["fpcw"],
                        "reads": _input_reads(result)})
     return {"va": f"{va:#010x}", "captures": len(names), "added": added,
             "coverage_before": round(before, 4), "coverage": round(len(covered) / len(starts), 4)}
