@@ -118,8 +118,11 @@ void CM_FASTCALL cm_fn_0043a900(u32 self)
     u32 pb = CM_LD32(q + 0xb1);
     second = CM_LD32(pb);
   }
+  /* 0x0043a990 reads [edi] before 0x0043a994 stores [edi+4];
+     the branch uses that saved value (cmp at 0x0043a992). */
+  first = p8[0];
   p8[1] = second;
-  if (p8[0] == second) {
+  if (first == second) {
     /* 0x0043a999 */
     u32 o;
     u32 vb;

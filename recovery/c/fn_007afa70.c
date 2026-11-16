@@ -31,9 +31,21 @@
    L+0x3f is never written by the original: the stores at 007afd5b (dword
    -> L+0x39), 007afd5f (L+0x3d), 007afd67 (L+0x3e), 007afd90/007afd96
    (L+0x40) leave that one byte as whatever the stack held, and 007afe50
-   later transports it into candidate+0x2b.  That original bug is preserved
-   here by reading sc[0x3f] without initialising it; no synthetic value,
-   padding or fixture narrowing is used. */
+    later transports it into candidate+0x2b.
+
+    UNRESOLVED FIDELITY DEFECT (not repaired by leaving sc uninitialised):
+    CM0102 3.9.68 SHA-256
+    0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86,
+    preferred-image VAs 007afa70/007afa72/007afa7d push 12 bytes,
+    007afa85 reserves 0x25c, and 007afa8b/007afa8c/007afa8f/007afa90
+    push 16 bytes. Thus 007afe50 reads entry ESP-0x229, and 007afe54
+    copies that byte to candidate+0x2b. The independent C allocation has
+    no established correspondence to that incoming stack byte.
+    A faithful repair requires an entry-stack preservation boundary before
+    compiler frame writes, with that byte available at the original read.
+    Merely computing an entry-relative address in C would not preserve its
+    contents against compiler locals/spills or intervening calls. Do not
+    infer fidelity from a passing gate or tune the compiler frame layout. */
 
 #include "cmre.h"
 
@@ -345,7 +357,7 @@ record:
     *(u32 *)(void *)(cand + 0x25) = SCD(0x39);
     *(u8 *)(void *)(cand + 0x29) = SCB(0x3d);
     *(u8 *)(void *)(cand + 0x2a) = SCB(0x3e);
-    *(u8 *)(void *)(cand + 0x2b) = SCB(0x3f);   /* original uninitialised byte */
+    *(u8 *)(void *)(cand + 0x2b) = SCB(0x3f);   /* UNRESOLVED: not entry ESP-0x229 */
     *(u8 *)(void *)(cand + 0x2c) = SCB(0x40);
     *(u32 *)(void *)(self + 0x1f6) = *(u32 *)(void *)(self + 0x1f6) + 1;
 

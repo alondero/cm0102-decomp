@@ -57,7 +57,9 @@ extern u32 CM_THISCALL cm_fn_004d0c60(u32,u32,u32,u32,u32,u32);
 extern u32 CM_THISCALL cm_fn_0054cdb0(u32,u32,u32);
 extern u32 CM_THISCALL cm_fn_0054cc30(u32,u32,u32,u32);
 extern u32 CM_THISCALL cm_fn_00417c10(u32,u32,u32);
-extern long double CM_STDCALL cm_fn_00864550(u32,u32,u32,u32,u32,u32);
+/* Pinned binary/hash above: 0085E97B saves ECX in ESI; 0085EC97..0085ECA0
+   push six arguments, then 0085ECA1 restores ECX=ESI before 0085ECA3 CALL. */
+extern long double CM_THISCALL cm_fn_00864550(u32,u32,u32,u32,u32,u32,u32);
 extern unsigned long long CM_CDECL __attribute__((regparm(2)))
     cm_fn_0090cfc0(u32,u32,u32);
 typedef long long s64;
@@ -215,7 +217,7 @@ set_end_date:
     cm_fn_00417c10(self+0x2du,l+0x34u,person+0x46u);
     goto terms;
 calculate_fee:                                  /* 0x0085EC97 */
-    fp=cm_fn_00864550(person,club,0,0xffffffffu,11,0);
+    fp=cm_fn_00864550(self,person,club,0,0xffffffffu,11,0);
     eax=CONVERT(0085eca8,fp);D(l+0x10u)=eax;
     edx=D(0x00dd6ec8u);eax=D(0x00dd6eccu);
     D(l+0x24u)=edx;year=W(l+0x26u);D(l+0x28u)=eax;
@@ -362,8 +364,12 @@ bonuses:                                        /* 0x0085F12D */
     pointer=D(l+0x14u);
     if((s8)B(pointer+0x15u)>=15) {
         amount=D(l+0x10u);
-        bound=(u32)quotient_0085e960((s32)amount,0x66666667u,4);
-        a=(u32)cm_fn_0090cfc0(bound>>31,bound,bound);
+        /* Pinned binary/hash above, 0085F13B..0085F14D: EAX is the sign
+           of shifted high product BEFORE correction, not sign(bound).
+           For amount=-1 this preserves EAX=1, EDX=0, stack bound=0. */
+        edx=(u32)((((s64)(s32)amount*(s64)0x66666667)>>32)>>4);
+        eax=edx>>31;bound=edx+eax;
+        a=(u32)cm_fn_0090cfc0(eax,bound,bound);
         b=(u32)quotient_0085e960((s32)amount,0x66666667u,3);
         D(self+0x10u)=b-a+25u;
     }else {amount=D(l+0x10u);D(self+0x10u)=0xffffffffu;}
@@ -371,13 +377,16 @@ bonuses:                                        /* 0x0085F12D */
         D(self+0x14u)=0xffffffffu;
     else {
         bound=(u32)quotient_0085e960((s32)amount,0x66666667u,4);
-        a=(u32)cm_fn_0090cfc0(bound>>31,bound,bound);
+        /* 0085F19A..0085F1AC (pinned binary/hash above): sign correction
+           uses ECX; EAX retains IMUL's low DWORD at the RNG boundary. */
+        a=(u32)cm_fn_0090cfc0(amount*0x66666667u,bound,bound);
         b=(u32)quotient_0085e960((s32)amount,0x66666667u,3);
         D(self+0x14u)=b-a+25u;
     }
     if(B(pointer+0xfu)==20) {
         bound=(u32)quotient_0085e960((s32)amount,0x66666667u,4);
-        a=(u32)cm_fn_0090cfc0(bound>>31,bound,bound);
+        /* 0085F1D9..0085F1EB: same low-product EAX, ECX sign correction. */
+        a=(u32)cm_fn_0090cfc0(amount*0x66666667u,bound,bound);
         b=(u32)quotient_0085e960((s32)amount,0x66666667u,3);
         D(self+0x18u)=b-a+25u;
     }else D(self+0x18u)=0xffffffffu;

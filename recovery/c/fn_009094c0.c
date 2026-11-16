@@ -222,13 +222,14 @@ void CM_THISCALL cm_fn_009094c0(u32 self)
                                 (u16)*(volatile u16 *)(this_r + 0x40),
                                 2, 1, (u16)out_b, 0x12, 1, 0, 0, 0);
       }                                             /* 0x0090971a */
-      frame.state = 0xffffffffu;                    /* 0x00909727 */
 
       {
         u32 holder;
         u32 stored;
 
         holder = *(volatile u32 *)(this_r + 0xc);   /* 0x00909723 */
+        /* Keep state zero through the holder load, including a load fault. */
+        frame.state = 0xffffffffu;                 /* 0x00909727 */
         *(u32 *)(holder + 8) = result;              /* 0x00909732 */
         cm_fn_009452ca(sched);                      /* 0x00909735 */
         holder = *(volatile u32 *)(this_r + 0xc);   /* 0x0090973a */

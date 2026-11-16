@@ -1,5 +1,5 @@
 /* fn_0042e430, preferred-image VA 0x0042e430, image base 0x00400000, pinned
-   CM0102 3.9.68 (SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1c627a22c445d14d489bd9bff86).
+   CM0102 3.9.68 (SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86).
    Module comp\leagues\bra_nat_third.cpp.  ECX is read before written (mov edi,ecx at
    0x0042e450) and the routine returns with a bare `ret` (0x0042e6f2): thiscall, no
    stack arguments, void result.  ESI is only written by `or esi,0xffffffff`
@@ -21,14 +21,16 @@
    - cm_fn_00522e00 call at 0x0042e63b pushes 15 dwords (0x0042e61b..0x0042e638) and
      sets ecx at 0x0042e639; 0x0042e644/0x0042e647 afterwards address the same frame
      as before (esp B-12 after the pop), so the callee pops 60 bytes (ret 0x3c).
-     The pushed dwords, right to left, are 0,0,0,0,0x14,[B+0x1c],1,7,cx(=WORD
+      The pushed dwords, right to left, are 0,0,0,0,0x14,[B+0x18],1,7,cx(=WORD
      [edi+0x40]),esi(0x0042e5f9),[edi+4],[B+0x14],[B+0x10],0x10,edi, with ecx = the
-     0x944cf1(0xb2) allocation.  Slot [B+0x1c] holds that same allocation pointer
-     (stored at 0x0042e603 as [esp+0x2c] with esp = B-16, reloaded at 0x0042e613 as
-     [esp+0x24] with esp = B-12), so both the receiver and that dword argument carry
-     the full pointer; that argument is therefore declared u32 here.  Likewise
-     [B+0x14] is read as a full dword at 0x0042e621 and pushed whole, so it is passed
-     as u32.  The cx pushed at 0x0042e629 leaves the dword's high half as whatever
+      0x944cf1(0xb2) allocation.  Slot [B+0x1c] holds that allocation pointer
+      (stored at 0x0042e603 as [esp+0x2c] with esp = B-16).  In contrast,
+      0x0042e613 reads [esp+0x24] with esp = B-12, hence B+0x18, the second
+      virtual-call output addressed at 0x0042e5e2 and pushed at 0x0042e5eb.
+      0x0042e621 forwards this entire DWORD, including its untouched upper half;
+      that argument remains u32.  Likewise [B+0x14] is read as a full DWORD at
+      0x0042e62a and pushed at 0x0042e634, so it is passed as u32.
+      The cx pushed at 0x0042e629 leaves the dword's high half as whatever
      ecx held after the vtable call; only the 16-bit value is knowable and is passed
      as u16.
    - cm_fn_0090d130 is called three times with three cdecl pushes (0x0042e591-97,
@@ -39,8 +41,8 @@
    Frame layout (B + offset), from the listing's lea/byte displacements:
      +0x000 16-byte index table (bytes 0,2,4,6,8,10,12,14,15,13,11,9,7,5,3,1)
      +0x010 0x40-byte target allocation pointer (0x944e46(0x40))
-     +0x014 vtable output slot 1 (0x0042e5e7)      read as a dword at 0x0042e621
-     +0x018 vtable output slot 2 (0x0042e5eb)      never read back
+      +0x014 vtable output slot 1 (0x0042e5e7)      read as a dword at 0x0042e62a
+      +0x018 vtable output slot 2 (0x0042e5eb)      read as a dword at 0x0042e613
      +0x01c 0xb2 allocation pointer (0x944cf1(0xb2))
      +0x020 .. +0x07f  sixteen 6-byte candidate slots {u32,u16} filled from seven
                       objects (two slots each) at 0x0042e51a..0x0042e52f; the last
@@ -55,16 +57,17 @@
      by the frame arithmetic above.  No branch, field or return convention of that
      callee is reproduced or invented here.
    - The two output slots are left uninitialised 32-bit words because the listing
-     only reserves them; they are read back as full dwords (0x0042e621 with esp =
-     B-12, [esp+0x24]) and pushed whole to cm_fn_00522e00, so no WORD narrowing or
+      only reserves them; they are read back as full dwords (0x0042e62a and
+      0x0042e613 respectively) and pushed whole to cm_fn_00522e00, so no WORD narrowing or
      zero-extension of the untouched high half is introduced.
    - cm_fn_00522e00 stack slots are passed at the widths the pushes show: the value
-     stored at [B+0x14] and the 0xb2 pointer are full dwords (u32), the cp-visible
+      stored at [B+0x14] and [B+0x18] are full dwords (u32), the cp-visible
      16-bit `mov cx,[edi+0x40]` (0x0042e617) is passed as u16 since its upper half is
      the unknown post-call ecx remainder.
    - The null-selected dereference after the 0x30b diagnostic is retained: the
-     report block at 0x0042e564..0x0042e5c0 does not return, and 0x0042e5cf then
-     loads through the still-null `esi`, exactly as kept below.
+      report block at 0x0042e564..0x0042e5c0 falls through, and 0x0042e5cf then
+      loads through the still-null `esi`.  Volatile DWORD accesses below retain
+      this mandatory load and the following store (0x0042e5d2).
    - Entry ESI needs no preservation: the only read of ESI before its definition is
      `or esi,0xffffffff` (0x0042e4ec), whose result is -1 for every input, and no
      saved-register slot is ever read back (the listing's stack reads address the
@@ -213,10 +216,10 @@ void CM_THISCALL cm_fn_0042e430(u32 self)
       }
 
       k = (s8)f.opt[i];                       /* movsx ecx,[esp+ebp+0x10], 0x0042e5c6 */
-      v = *(u32 *)best;                       /* 0x0042e5cf; best may be the null
+      v = *(volatile u32 *)best;              /* 0x0042e5cf; best may be the null
                                                  selected above, as in the original */
       i = i + 1u;                             /* 0x0042e5d1 */
-      *(u32 *)best = 0u;                      /* 0x0042e5d2 */
+      *(volatile u32 *)best = 0u;             /* 0x0042e5d2 */
       *(u32 *)((u8 *)f.list_alloc + (u32)(s32)k * 4u) = v;  /* 0x0042e5cb/0x0042e5d7 */
     } while (i < 0x10u);                      /* 0x0042e5d4/0x0042e5da */
 
@@ -232,7 +235,7 @@ void CM_THISCALL cm_fn_0042e430(u32 self)
     else {
       res = cm_fn_00522e00(f.sched_alloc, self, 0x10, f.list_alloc, f.out_word_14,
                            *(u32 *)(obj + 4), vcall, (u16)*(u16 *)(obj + 0x40),
-                           (u8)7, (u8)1, f.sched_alloc, (u8)0x14, 0u, 0u, 0u, 0u);
+                           (u8)7, (u8)1, f.out_word_18, (u8)0x14, 0u, 0u, 0u, 0u);
     }
     seh.state = 0xffffffffu;                  /* 0x0042e647 */
     *(u32 *)((u8 *)*(u32 *)(obj + 0xc) + 0x1c) = res;          /* 0x0042e644/0x0042e652 */

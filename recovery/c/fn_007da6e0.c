@@ -20,10 +20,18 @@
      L+0x130 212-byte record R (007daa2e/007daa4c, count 0xd4)
      L+0x204 text D      (007da78a, 007da7be)
      L+0x268 100-byte text E (007da779, 007da9d0)
-   The record bytes L+0x196..L+0x1f9 (R+0x66..R+0xca, 100 bytes) are never
-   written by this routine: they are left uninitialized here, exactly as the
-   original leaves its own stack bytes, and the complete 212-byte copy to the
-   callee is preserved (no zeroing, no invented padding, no shortened copy). */
+   FIDELITY BLOCKER: record bytes L+0x196..L+0x1f9 (R+0x66..R+0xc9,
+   100 bytes) retain original incoming stack residue. At preferred-image VAs
+   0x007da9ce/0x007da9d0/0x007da9d9 only L+0x132..L+0x195 is copied;
+   stores at 0x007da9e6 and 0x007daa0f..0x007daa1d start at L+0x1fa.
+   Nevertheless 0x007daa24 pushes 0xd4 and 0x007daa2e/0x007daa4c pass
+   L+0x130 to 0x007daa36/0x007daa54. These VAs refer to the pinned
+   image/hash above. The fresh C allocation below does NOT preserve that
+   incoming residue. No supplied plain-C boundary exposes the original frame
+   (reserved at 0x007da6e4); gate success is not evidence for these bytes.
+   Parent must supply an evidenced frame-state boundary or establish their
+   non-observation before this candidate can be considered faithful. Do not
+   substitute zeros, shorten the record, or rely on compiler frame placement. */
 
 #include "cmre.h"
 
@@ -198,7 +206,8 @@ lab_867:
     /* 007da8e9-007da915: lea eax,[edi+edi*8]; shl eax,4; add eax,edi;
        add ecx,edi; mov eax,[ecx+eax*4+0x69] */
     {
-      u32 tv = (u32)(i + i * 8);
+      /* 0x007da8ef LEA wraps before the following SHL/ADD. */
+      u32 tv = (u32)i + (u32)i * 8u;
       u32 v;
       u32 w;
 

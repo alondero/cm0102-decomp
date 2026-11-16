@@ -24,20 +24,23 @@
      L+0x20  256B   [esp+0x30]  local buffer                  (0x007e9a84)
      L+0x120 256B   [esp+0x130] local buffer                  (0x007e9a88)
      L+0x220 100*4  [esp+0x230] entry pool passed to 4afbd0   (0x007e9b52)
-   Note 0x007e9a12 writes L+0x14 (the 0x9cf920 product) but no instruction in
-   this routine ever reads L+0x14 again; that dead store is retained.
+   0x007e9a12 writes L+0x14 with the allocation argument still pushed.
+   After its cleanup at 0x007e9a77, 0x007e9b33 reads that slot as
+   [esp+0x24]. The result stored at 0x007e9b0c with two arguments pushed
+   instead occupies L+0x0c, later read at 0x007e9bf2.
 
    Held harness concern: the pool at L+0x220 is only written for indices
    [0,A) by the scan at 0x007e9b24..0x007e9b6c (A = byte L+0x03, capped at 100)
    and 4afbd0(pool,A,14) does not fill the suffix when A < 14, yet the loop at
    0x007e9c2c..0x007e9c7d reads pool dwords L+0x220 .. L+0x24c whenever the
-   L+0x02 counter is below 0x20 (B < 32).  The translation resolves that
-   explicitly by reading exactly those original frame bytes: the pool is a
-   member of the same 0x3b0 scratch allocation at its original offset, it is
-   not zeroed, padded, clamped or bypassed, and the reads are volatile so the
-   compiled code performs the real frame load the original performs at
-   0x007e9c41.  No early return, no fabricated team and no input restriction is
-   introduced; the values seen are whatever occupies those frame bytes. */
+   L+0x02 counter is below 0x20 (B < 32).
+   UNRESOLVED FIDELITY BOUNDARY: this automatic aggregate does not transport
+   the incoming original stack bytes reserved at 0x007e99a0. Volatile loads
+   at the translated 0x007e9c41 cannot repair that missing input. No
+   all-path initialization follows from this listing. Parent intervention
+   is required for an original-frame-byte transport contract; passing the
+   current gate is not fidelity evidence for the unwritten suffix.
+   Do not initialize, clamp, or fabricate these bytes. */
 #include "cmre.h"
 
 #define G_009cf914 CM_GLOBAL(u32, 0x009cf914)
@@ -77,7 +80,7 @@ struct cm_frame_7e99a0 {
     u32 v92c;                   /* L+0x08 [esp+0x18] */
     u32 v4afd;                  /* L+0x0c [esp+0x24] before the 8-byte cleanup */
     u32 v930;                   /* L+0x10 [esp+0x20] */
-    u32 v920;                   /* L+0x14 [esp+0x24] dead in the original */
+    u32 v920;                   /* L+0x14 [esp+0x24] read at 0x007e9b33 */
     u32 v924;                   /* L+0x18 [esp+0x28] */
     u32 v928;                   /* L+0x1c [esp+0x2c] */
     u8 buf1[0x100];             /* L+0x20 [esp+0x30] */
@@ -154,7 +157,7 @@ u32 CM_FASTCALL cm_fn_007e99a0(int param_1)
         do {
             fld = *(volatile u32 *)(p + 0x57); /* 0x007e9b24 */
             if (fld == edi_ || fld == ebp_ || fld == ebx_ ||
-                fld == f.v4afd || fld == f.v924 || fld == f.v92c) {
+                fld == f.v920 || fld == f.v924 || fld == f.v92c) {
                 if ((s32)(s8)f.pooln < 0x64) { /* 0x007e9b49 `cmp al,0x64; jge` */
                     idx = (s32)(s8)f.pooln;    /* 0x007e9b4d `movsx edx,al` */
                     edxv = (u32)idx;           /* EDX left by that movsx */
@@ -204,7 +207,7 @@ u32 CM_FASTCALL cm_fn_007e99a0(int param_1)
 
     /* 0x007e9c23 .. 0x007e9c7d: copy at most 14 pool dwords while the counter is
        still below 0x20.  The pool suffix may be unwritten by the original, see
-       the header comment: the loads below are the original frame loads. */
+       the header comment: original-frame-byte transport is unresolved. */
     i = 0;
     pp = f.pool;
     for (;;) {

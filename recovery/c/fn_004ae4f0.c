@@ -55,7 +55,10 @@ u32 CM_CDECL __attribute__((regparm(3))) cm_fn_004ae4f0(
         sum = p14 + p12;
         sum = sum + (s32)al;
         record = (u32)sum;
-        if ((long double)(s32)record < product) {
+        /* 0x004AE54D FCOMPP, 0x004AE54F FNSTSW AX and
+           0x004AE551 TEST AH,1: C0 is set for less-than OR unordered.
+           Negating >= preserves that NaN path with masked x87 invalid. */
+        if (!((long double)(s32)record >= product)) {
             return (eax & 0xffff0000u) | 4u;
         }
     }

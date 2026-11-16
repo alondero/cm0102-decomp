@@ -1,5 +1,15 @@
 /* fn_00743d30, preferred-image VA 0x00743d30 (image base 0x00400000).
-   Translated statement by statement from the original instruction listing.
+   Body translated from the original instruction listing; entry hold UNRESOLVED.
+   CM0102 3.9.68 SHA-256:
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+   Preferred-image VAs 0x00743d30/0x00743d35 load 0x1588 into EAX and
+   call 0x00945610 before the formal loads at 0x00743d3a/0x00743d44.
+   The array below represents body scratch adjacency ONLY: it does not
+   implement that entry helper, its ordered probes or entry-relative layout.
+   An ordinary C call to the helper cannot supply its EAX/ESP contract.
+   Resolving this hold requires an authorized ABI entry boundary; plain C
+   array allocation, volatile array reads and compiler frame tuning are not
+   evidence of an equivalent entry operation. Gate success cannot clear it.
 
    Entry stack layout: 0x743d30 is `mov eax,0x1588; call 0x00945610`.  That helper
    (0x945610, 47 bytes) probes callerESP-0x1000 and callerESP-0x1588 and returns
@@ -7,7 +17,7 @@
       L = E - 0x1588            (E = entry ESP; [E] = return address)
    and the four saved registers live at [L-0x10,L).  Every access below is an
    L-relative scratch offset; the three formals are read from their caller-owned
-   homes E+8 (branch selector), E-0xc (object, equals the first stack slot) and
+   homes E+8 (branch selector), E+4 (object, equals the first stack slot) and
    E+0xc (receiver of 0x4ae660 / 0x4ae8a0), i.e. the first, second and third
    caller stack slots.
 

@@ -25,7 +25,23 @@
    - 0x009224d6 `cmp ax, 5` / 0x009224e5 `cmp ax, 6` compare only the low word
      of 0x00954a3f0's result, so the C compares `(u16)`.
 
-   Uninitialised stack bytes preserved as in the original (no zero fill):
+   UNRESOLVED FIDELITY HOLD: original stack residue is not mapped by this C.
+   Evidence below uses preferred-image VAs and the pinned binary hash above.
+   If S is original entry ESP, the prologue at 0x00922356..0x0092236f
+   leaves ESP=S-0x47c and L=S-0x470. Thus 0x009223c1 reads S-0x41b,
+   not an arbitrary uninitialised C allocation. F.loc has no established
+   correspondence to those pre-existing bytes.
+   The masks at 0x009223ce/0x009223de/0x009223f1 retain original bits
+   12..15; 0x0092244c stores them at L+0x55. The record at L+0x08
+   crosses the call boundary at 0x00922573 (address formed/pushed at
+   0x00922567/0x0092256c), with this word at record offset 0x4d.
+   No non-observation or intervening overwrite is established here.
+   A passing gate does not discharge this hold. Resolving it needs an
+   authorized original-stack input boundary or original-instruction proof
+   that the retained bits cannot affect observable behavior. Zero fill,
+   volatile residue, or matching a compiler frame layout is not a fix.
+
+   Original uninitialised accesses (not proven preserved by this candidate):
    - 0x009223c1 `mov ecx, dword ptr [esp + 0x61]` reads L+0x55 before any store
      to that dword; bits 4..15 survive through `and ecx, 0xfff0`, `or eax, ecx`,
      `and eax, 0xff0f`, `or eax, ecx (dl<<4)` and are stored at
@@ -35,8 +51,8 @@
      entry-ESP-0x47c there: the two pushes of the virtual call were popped by
      the callee, as proved by 0x009225ca/0x009226a2 sharing the epilogue, which
      reloads the saved SEH link from [esp+0x470] = L+0x464).
-   Both stay genuine uninitialised reads of the single scratch frame; nothing
-   is zeroed or invented to hide them. */
+   Both currently read the C scratch frame, not proven original stack residue.
+   Executable code is retained pending that missing boundary/evidence. */
 
 #include "cmre.h"
 
@@ -166,7 +182,7 @@ cm_fn_00922350(void *self_arg, s8 arg1, u32 arg2, u32 arg3, u32 arg4, u32 arg5,
     goto err_range;
 
   /* 0x009223be..0x009223ec: packed flag word, low bits from [esi+0x49]/[esi+0x4a],
-     upper bits retained from the unread dword at L+0x55. */
+      upper bits require original residue at L+0x55 (unresolved hold above). */
   t32 = ld32(L + 0x55);                                 /* 0x009223c1 */
   pack = (u16)((u32)ld8(self + 0x49) & 0x0fu);          /* 0x009223be/c8/ca */
   pack = (u16)((u32)pack | (t32 & 0x0000fff0u));        /* 0x009223ce/d7 */

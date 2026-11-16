@@ -1,47 +1,35 @@
-/* fn_00804590 (VA 0x00804590): thiscall, this = ECX, one stack argument, ret 4.
-   Callees are explicit original boundaries:
-   - cm_fn_007b7690: ECX = element pointer puVar4, one pushed pointer.
-   - cm_fn_007af720: ECX = element pointer p (saved at frame slot E-4), one pushed
-     argument param_2. */
 #include "cmre.h"
 
-extern u32 CM_THISCALL cm_fn_007af720(int *param_1,int param_2);
-extern void CM_THISCALL cm_fn_007b7690(u32 *param_1,u32 *param_2);
+extern void CM_THISCALL cm_fn_007b7690(u32 *self, u32 *source);
+extern u32 CM_THISCALL cm_fn_007af720(u32 self, u32 record);
 
-u32 CM_THISCALL cm_fn_00804590(u8 *param_1,u32 param_2)
+u32 CM_THISCALL cm_fn_00804590(u8 *self, u32 argument)
 {
-  s8 cVar1;
-  u8 *p;
-  u32 *puVar3;
-  u8 *puVar4;
-  int iVar2;
-  s32 local_8;
+    u32 i;
+    u32 record;
+    u32 value;
 
-  cVar1 = 0;
-  do {
-    p = param_1 + (s32)cVar1 * 0x2b0 + 1;
-    if (p[0xa] == 1) {
-      param_1[0x1b0d] = param_1[0];
-      puVar3 = (u32 *)(param_1 + 0x35ee);
-      puVar4 = param_1 + 0x1b0e;
-      iVar2 = (int)param_1 - (int)(param_1 + 0x1b0d);
-      local_8 = 10;
-      do {
-        cm_fn_007b7690((u32 *)puVar4,(u32 *)(puVar4 + iVar2));
-        *puVar3 = *(u32 *)((int)puVar3 + iVar2);
-        puVar4 = puVar4 + 0x2b0;
-        puVar3 = puVar3 + 1;
-        local_8 = local_8 - 1;
-      } while (local_8 != 0);
-      *(u32 *)(param_1 + 0x3616) = *(u32 *)(param_1 + 0x1b09);
-      *(u32 *)(param_1 + 0x361a) = 1;
-      cm_fn_007af720((int *)p,(int)param_2);
-      *(u32 *)(param_1 + cVar1 * 4 + 0x1ae1) = 1;
-      *(u32 *)(param_1 + 0x1b09) = 1;
-      *(u32 *)(param_1 + 0x3634) = 0;
-      return 1;
+    for (i = 0; i < 10; ++i) {
+        record = (u32)self + 1 + i * 0x2b0;
+        if (*(volatile u8 *)(record + 0xa) == 1)
+            break;
     }
-    cVar1 = (s8)(cVar1 + 1);
-  } while (cVar1 < 10);
-  return 0;
+    if (i == 10)
+        return 0;
+
+    *(volatile u8 *)(self + 0x1b0d) = *(volatile u8 *)self;
+    for (u32 j = 0; j < 10; ++j) {
+        cm_fn_007b7690((u32 *)(self + 0x1b0e + j * 0x2b0),
+                       (u32 *)(self + 1 + j * 0x2b0));
+        value = *(volatile u32 *)(self + 0x1ae1 + j * 4);
+        *(volatile u32 *)(self + 0x35ee + j * 4) = value;
+    }
+    value = *(volatile u32 *)(self + 0x1b09);
+    *(volatile u32 *)(self + 0x3616) = value;
+    *(volatile u32 *)(self + 0x361a) = 1;
+    cm_fn_007af720(record, argument);
+    *(volatile u32 *)(self + 0x1ae1 + i * 4) = 1;
+    *(volatile u32 *)(self + 0x1b09) = 1;
+    *(volatile u32 *)(self + 0x3634) = 0;
+    return 1;
 }

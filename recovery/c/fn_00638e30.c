@@ -1,14 +1,21 @@
 /* Preferred-image VA 0x00638e30, image base 0x00400000.
-   Faithful translation of the pinned CM0102 3.9.68 listing
+   Partial translation of the pinned CM0102 3.9.68 listing
    (SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1c627a22c445d14d489bd9bff86).
 
-   The pool at original [L+0x10] is represented by one uninitialized
-   scratch allocation shared with the two adjacent message buffers
-   (local_200 at L+0xb0, local_100 at L+0x1b0).  On count<16 the helper
-   cm_fn_004afbd0 returns without initializing it, and the original still
-   copies the fixed 16 DWORDs at 0x0063909d..0x006390b5; the stale pool
-   bytes are therefore read and copied without padding, zero fill, or a
-   shortened count. */
+   UNRESOLVED FIDELITY HOLD: original incoming stack bytes are not inputs
+   to this C entry. With L the ESP after 0x00638e30 sub esp,0x2b0,
+   0x00638f19 conditionally writes pool DWORDs at L+0x10. After the call
+   at 0x00639089, 0x00639093 addresses L+0x10 and 0x0063909d through
+   0x006390b5 copy sixteen DWORDs regardless of the selected count.
+   If the helper leaves unwritten entries untouched, those reads observe
+   original pre-existing frame bytes. This fresh scratch allocation does
+   NOT preserve those bytes; its indeterminate DWORD reads are not a
+   faithful representation. Passing the current gate cannot close this hold.
+   An explicit original-frame input/boundary is needed outside this worker's
+   authorized plain-C interface. Do not replace missing bytes with defaults,
+   static storage, compiler-layout assumptions, or a shortened copy.
+   Scratch keeps only the evidenced adjacency of pool and message buffers
+   (local_200 at L+0xb0, local_100 at L+0x1b0). */
 #include "cmre.h"
 
 #define DAT_009cf80c CM_GLOBAL(s32, 0x009cf80c)

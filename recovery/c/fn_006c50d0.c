@@ -1,4 +1,20 @@
-/* HELD: this void boundary is not a proven recovery of the return contract.
+/* HELD: audit 1872 confirmed; this is NOT a repaired return contract.
+   Original-instruction evidence, preferred-image VAs, CM0102 3.9.68,
+   SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86:
+   006c51c7 CALL 007160e0; 006c51cc ADD ESI,1be; 006c51d2 DEC EBX;
+   006c51d3 JNE 006c5124; 006c51d9..006c51de POPs and RET preserve EAX.
+   Bound-target review (not composition or runtime proof): 007160e0 MOV AL,
+   [ESP+4]; 007160e4 MOV [ECX+2b],AL; 007160e7 RET 4. Thus the last
+   call preserves upper EAX, rather than producing an independent u32 result.
+   Merely widening both declarations would still lose its incoming EAX.
+   Widening 006f46b0 also cannot establish an independent full return:
+   006f46b0 MOV AL,[ECX+102]; 006f46c0 CMP DL,AL; 006f46cc JNE 006f46da;
+   006f46ce CMP BL,[ECX+103]; 006f46d4 JE 006f4910 can reach the
+   006f4910..006f4919 epilogue with incoming upper EAX unchanged.
+   Repair needs an authorized explicit register boundary or further evidenced
+   deadness proof; neither is supplied by a passing void semantic test.
+   No guessed return, duplicate callee field reads, or inline assembly added.
+   This void boundary is not a proven recovery of the return contract.
    A semantic test of it cannot establish that forwarded upper EAX is dead.
    Declaring 007160e0 as returning u32 would capture its output, but would not
    preserve its incoming EAX: plain C does not pass that register to a thiscall

@@ -6,6 +6,26 @@
    receiver arrives in ECX and nothing is popped from the stack: fastcall with
    the object in ECX. EDX is a live input too (see the colour merges below).
 
+   FIX REVIEW 1791 -- UNRESOLVED FIDELITY DEFECT; NOT READY FOR ACCEPTANCE.
+   Original CM0102 3.9.68 SHA-256:
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+   All addresses below are preferred-image VAs.
+   The hi16 substitution below is NOT an evidenced register-output model.
+   At 00403d56 EDX is entry EDX only on the no-allocation path. The other
+   path loads EDX at 00403d0e and calls 005e3dd0 at 00403d26 first.
+   At 00403d90 ECX comes from the call at 00403d7e; at 00403dd4 EDX
+   comes from the call at 00403dcf; at 00403e01 ECX comes from the call
+   at 00403dfc; at 00403e54 ECX comes from the call at 00403e2c (the
+   intervening 00403e31 CL load does not replace its upper half).
+   Each merge is pushed as a full DWORD at 00403d65/00403dab/00403de9/
+   00403e19/00403e63. Reusing entry EDX for these values is unjustified.
+   The current ordinary C extern boundaries do not expose post-call ECX.
+   Repair needs an authorized register-output boundary or a separately
+   evidenced semantic derivation, not zero extension, invented extra inputs,
+   or compiler register-allocation tricks. The existing executable statements
+   are retained pending that repair; a gate pass does not resolve this defect.
+
+   Historical (incorrect) colour-model rationale, retained for diagnosis:
    Colour arguments: the original merges a 16-bit colour global into only the
    low half of a register that already holds a value:
      mov dx, word ptr [0xae317e]   (0x00403d56, 0x00403dd4)

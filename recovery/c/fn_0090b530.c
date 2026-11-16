@@ -9,10 +9,14 @@
      L+0x0d0  dword[50] second matched-record array
      L+0x198  byte[256] error buffer 1
      L+0x298  byte[256] error buffer 2
-   The matched-record arrays are deliberately left uninitialized: the original
-   unconditionally copies the first ten dwords of each array after the scans,
-   even when a scan selected fewer than ten (004afbd0 then leaves the tail
-   untouched).  No initialization, padding or low-count suppression is added. */
+   UNRESOLVED FIDELITY DEFECT: this C scratch allocation does not capture the
+   original entry-stack bytes. At preferred-image VA 0x0090b530 the original
+   reserves 0x398 bytes without clearing them; 0x0090b586/0x0090b58c can skip
+   population, yet 0x0090b6b2/0x0090b6c2 and 0x0090b6ef/0x0090b6ff copy ten
+   DWORDs from each array. Fresh indeterminate C storage is not those concrete
+   stale bytes. Faithful recovery needs an explicit original-entry-stack backing
+   boundary; zero initialization or compiler-frame placement is not a repair.
+   The accesses below remain unresolved, even if the existing gate passes. */
 #include "cmre.h"
 
 #define DAT_009cf590 CM_GLOBAL(u32, 0x009cf590)

@@ -43,11 +43,23 @@ u32 CM_THISCALL cm_fn_00452710(u32 self, u32 *index, u32 create)
                 CM_GLOBAL(volatile u32, 0xb67a34) = 0;
                 cm_fn_005cc7d0();
                 cm_fn_005a8f60();
-                /* Unresolved: original 00452866 pushes -1 and 00452868 calls
-                   00945934, whose RET leaves that word on ESP. Plain C's
-                   cdecl cleanup cannot represent the returning path faithfully.
-                   Pinned SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
-                   This candidate is not evidence for that path. */
+                /* CONFIRMED UNRESOLVED ABI BOUNDARY.
+                   CM0102 3.9.68 SHA-256
+                   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86;
+                   all addresses below are preferred-image VAs.
+                   00452866 pushes -1; 00452868 calls 00945934;
+                   0045286d continues without caller cleanup. If that call
+                   returns without popping its argument, 00452898 balances
+                   only the argument pushed at 00452892 for 00452893.
+                   Entry 00452714 allocates 0x200 bytes, then 0045271c/1d
+                   save ESI/EDI. Both epilogues (00452785..0045278f and
+                   004528a9..004528c5) consequently pop -1 into EDI and
+                   saved EDI into ESI, then RET 8 through saved ESI.
+                   The listing does not establish the callee's return policy.
+                   This ordinary C call does NOT preserve that conditional
+                   stack displacement. Fixing it requires an authorized ABI
+                   boundary, not a stdcall/noreturn guess or frame-layout
+                   trick. Gate success is not evidence for this path. */
                 cm_fn_00945934(0xffffffffu);
             }
         }

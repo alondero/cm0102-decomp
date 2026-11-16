@@ -106,6 +106,12 @@ callees as explicit boundaries. C acceptance does not establish composed executi
      value once in a scratch copy (for example drop one FADD) and run
      `cmre test fn_X --c --source COPY`. If that copy also passes, add evidenced
      `c_hints` fixtures that reach the value before accepting.
+   - A `call 0x00945ff0` (`_CIpow`) is `pow` with the base in ST1 and the
+     exponent in ST0 ([ADR 0010](../adr/0010-x87-register-argument-bridges.md)).
+     `#include "cmre_x87.h"` and write `cm_x87_CIpow(base, exponent)` with both
+     operands as `long double` computed as the listing does; the bridge calls the
+     original helper. Never declare `cm_fn_00945ff0` with stack parameters, and
+     never substitute a C `pow`. Name each original call VA in a comment.
    - MSVC pushes arguments right to left and may run a nested call between pushes.
      Pushes before `call A` that A's `(void)` signature does not take belong to the
      next call: `push x; push y; call A; push eax; push fmt; call B` is `B(fmt, A(), y, x)`.

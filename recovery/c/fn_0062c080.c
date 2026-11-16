@@ -6,8 +6,12 @@
 
    Frame (0062c080 sub esp,0x20; 4 saved registers pushed):
      the original's 0x20-byte scratch is [esp+0x10..esp+0x2f] after the pushes.
-     Every scratch slot below is written at its original [esp+disp] site and is
-     intentionally NOT initialized here (see the note on +0x04 / +0x0c). */
+     Slot offsets below are relative to L, immediately after sub esp,0x20.
+     FIDELITY HOLD: the automatic array does not bind original incoming stack
+     bytes. At 0x0062c23d a first score <=50 leaves L+4 stale; at 0x0062c254
+     only L+0xc is written before the DWORD reads at 0x0062c273/0x0062c27f.
+     A supported original-stack input boundary is required for those paths;
+     neither zero initialization nor compiler frame placement is a repair. */
 #include "cmre.h"
 
 #define DAT_00ae2364 CM_GLOBAL(int, 0x00ae2364)
@@ -37,8 +41,8 @@ extern unsigned long long CM_CDECL cm_fn_0090cfc0(u32 bound);
 
 void CM_THISCALL cm_fn_0062c080(u32 self, u8 *param_2, u8 *param_3)
 {
-  /* The original's single 0x20-byte scratch allocation. Untouched bytes keep
-     whatever the frame already held; nothing here initializes them. */
+  /* Scratch adjacency only: untouched bytes here are NOT established to equal
+     original stack bytes. See the fidelity hold above. */
   u8 L[0x20];
   u8 *rec;   /* edx at 0x0062c0a9: current record, stride 0x49 */
   u8 idx;    /* cl */
@@ -58,8 +62,8 @@ void CM_THISCALL cm_fn_0062c080(u32 self, u8 *param_2, u8 *param_3)
     idx = 0;
     /* 0062c0a1 */
     *(volatile u32 *)(L + 0x08) = (u32)rec;
-    /* 0062c0a5 */
-    *(volatile u8 *)(L + 0x13) = idx;
+    /* 0062c0a5: esp=L-0x10, so [esp+0x13] is L+3. */
+    *(volatile u8 *)(L + 0x03) = idx;
 
     for (;;) {
       u32 pr;
@@ -142,7 +146,14 @@ l_127:
           {
             long double t = (long double)*(volatile s32 *)(L + 0x18)
                           * CM_GLOBAL(double, 0x00968928);
-            edi_v = (u32)(s32)(long long)t;
+             /* Original helper, same pinned binary as the file header:
+                preferred-image VAs 0x00945647 saves CW, 0x0094564f sets
+                chop rounding, 0x00945659 FISTP qword consumes ST0,
+                0x0094565c restores CW, 0x0094565f/62 return EDX:EAX.
+                ADR 0006 permits this long long lowering of call 0x0062c188;
+                it is not an ordinary C call with a fabricated stack input.
+                Emission/sensitivity validation remains outstanding. */
+             edi_v = (u32)(s32)(long long)t;
           }
         }
         else {
@@ -217,14 +228,14 @@ l_127:
       }
 
       /* 0062c29f: cl and edx restored from the scratch mirrors */
-      idx = *(volatile u8 *)(L + 0x13);
+      idx = *(volatile u8 *)(L + 0x03);
       rec = (u8 *)*(volatile u32 *)(L + 0x08);
 l_2ab:
       idx = (u8)(idx + 1);                            /* 0062c2ab */
       rec = rec + 0x49;                               /* 0062c2ad */
-      if ((s8)idx >= 0x14) break;                     /* 0062c2b0 */
-      *(volatile u8 *)(L + 0x13) = idx;               /* 0062c2b3 */
+      *(volatile u8 *)(L + 0x03) = idx;               /* 0062c2b3 */
       *(volatile u32 *)(L + 0x08) = (u32)rec;         /* 0062c2b7 */
+      if ((s8)idx >= 0x14) break;                     /* 0062c2bb */
     }
 
     /* 0062c2c1 */

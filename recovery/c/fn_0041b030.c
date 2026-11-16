@@ -6,12 +6,17 @@
    - 0x0041b1a0 / 0x0041b3c4 `ret 0xc` pop 12 bytes of stack arguments.
    - 0x0041b030..0x0041b035 (`mov eax,0x1b74` / `call 0x945610`) followed by
      `add esp,0x1b74` in both epilogues (0x0041b19a, 0x0041b3be) is MSVC's
-     large-frame allocation helper (the `_alloca_probe`-style companion that
-     moves ESP and carries the return word across the allocation), not a
-     source-level call: it is the prologue of this function's own 0x1b74-byte
-      frame. A plain C local below represents its storage, but does NOT establish
-      equivalent compiler probing, return-word migration or fault ordering.
-      That transport remains unproved; this source is not acceptance evidence.
+      frame-allocation boundary. The supplied caller listing does not show the
+      helper body and cannot establish its exact probing or return-word accesses.
+      It does establish that the helper executes before the saved-register
+      pushes at 0x0041b03a..0x0041b03c and the first body call at 0x0041b049.
+      A plain C local below represents storage only, NOT equivalent compiler
+      probing, return-word transport or fault ordering. Audit 1747 remains held:
+      a passing semantic gate does not discharge this boundary. Resolving it
+      requires original-helper instruction evidence and verified prologue
+      transport support outside this source-only plain-C repair scope; adding
+      an ordinary C call to the helper would not establish that transport.
+      This source is not acceptance evidence for the prologue.
       The three stack words at
      0x0041b03d [esp+0x1b84], 0x0041b0bf [esp+0x1b8c] and 0x0041b136
      [esp+0x1b90] are this function's real stack arguments

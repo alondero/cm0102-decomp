@@ -59,8 +59,13 @@ void CM_THISCALL cm_fn_00663a50(u32 self)
         a = CM_GLOBAL(volatile u32,self+12);
         a = CM_GLOBAL(volatile u32,a+8);
         if (a) {
+            /* Preferred-image VAs 00663bf7/00663bfe/00663c07: capture the
+               predecessor before the potentially aliasing object store.
+               CM0102 3.9.68 SHA-256:
+               0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86. */
+            u32 prev = frame.prev;
             CM_GLOBAL(volatile u32,self+0x30) = 2;
-            CM_FS(u32,0) = frame.prev;
+            CM_FS(u32,0) = prev;
             return;
         }
         x = s+0x30c; y = s+0x10c; line = 0x25c;

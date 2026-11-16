@@ -27,8 +27,20 @@ void CM_THISCALL cm_fn_007a8510(u32 self, u32 source)
             CM_GLOBAL(volatile u32, 0xb67a34) = 0;
             cm_fn_005cc7d0();
             cm_fn_005a8f60();
-            /* 007a85c7-007a85d9 leaves a pushed word on return.
-               Plain C cannot reproduce the shifted original frame and epilogue. */
+            /* UNRESOLVED fidelity blocker, not a recovered continuation.
+               CM0102 3.9.68 SHA-256:
+               0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+               All addresses below are preferred-image VAs.
+               007a85c7 pushes -1; 007a85c9 calls 00945934 without
+               caller cleanup. The target's 00945941 add esp,12
+               removes its own outgoing arguments; 00945944 is plain RET.
+               If it returns, 007a85d9 therefore reads the entry return
+               address, not source. At 007a867e POP ESI consumes scratch,
+               and 007a8685 RET 4 consumes the displaced saved-ESI slot.
+               An ordinary C call and epilogue cannot represent this.
+               Neither a stdcall declaration nor noreturn is justified.
+               Requires an authorized ABI boundary/continuation solution;
+               a passing semantic gate does not resolve this blocker. */
             cm_fn_00945934(0xffffffff);
         }
     }

@@ -9,10 +9,18 @@
 
    Dispatch convention: the listing pushes three dwords (0, the popped value,
    object) and then does `add esp, 0xc` after the indirect call.  Caller
-   cleanup of the full argument block is the cdecl contract, so the target is
-    cdecl. ECX also holds the popped value at dispatch. Whether a target
-    consumes that register requires target evidence; caller cleanup alone
-    does not prove that it is unused.
+    cleanup of the full argument block proves caller stack cleanup, not a
+    complete cdecl register contract. At preferred-image VA 0x0093a7b6,
+    ECX receives the popped value; 0x0093a7b8 pushes that value, 0x0093a7b9
+    pushes self, and 0x0093a7ba dispatches with ECX still holding the value.
+    VA 0x0093a7c0 removes the three stack arguments. These instructions are
+    from the pinned binary identified above.
+
+    UNRESOLVED FIDELITY DEFECT: the cdecl pointer below does not establish
+    this ECX input. A thiscall pointer would instead presume callee stack
+    cleanup, contradicting the evidenced boundary. Do not treat a passing
+    differential gate as resolution; a caller-cleaned ECX boundary needs an
+    authorized representation before this candidate is accepted again.
 
     Evidence limitation: the supplied listing identifies no original callback
     target or mapped receiver fixture. Passing fault-only cases cannot

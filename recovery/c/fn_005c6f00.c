@@ -1,6 +1,6 @@
 /* cm_fn_005c6f00  (module comp/friendly.cpp)
    Pinned binary: CM0102 3.9.68 cm0102.exe, SHA-256
-   0c78e7da6d0bcb4603fa179449bbe6d1c627a22c445d14d489bd9bff86
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86
    (preferred-image base 0x00400000; all VAs below are preferred-image VAs).
 
    ABI evidence from the original instructions:
@@ -27,7 +27,7 @@
    The four buffers occupy [E-0x40c, E-0x0c) and are kept in one scratch
    allocation with explicit offsets so their adjacency survives.
 
-   OPEN ITEM (held; recorded, not invented away):
+   OPEN ITEM (still held: existing-record ECX transport):
    0x005c7001 `mov cx,[edi+2]` and 0x005c7005 `mov dx,[edi]` write only the low
    16 bits of ECX/EDX, and 0x005c700a/0x005c7011 then push the FULL 32-bit
    ECX/EDX into 0x005ae870. The upper halves are live register residue (on the
@@ -37,15 +37,25 @@
    into 0x005abf10, 0x005abf56/0x005abf81 forward the whole year into
    0x005aa2d0/0x005a9cf0, so the upper 16 bits of that argument are not proven
    unobserved; only the second argument is masked to 16 bits at 0x005abfc7.
-   Plain C cannot transport that residue, so the two values below are built
-   from the stated 16-bit loads only (`year`/`day` in the body) and the missing
-   upper halves are explicitly unmodelled rather than claimed to be zero.
-   The same applies to EDX at 0x005c714b: it is a live residue (whatever the
-   preceding 0x005c88f0/0x0068d020/0x0090d130 path leaves) and is the edx_in
-   input of 0x0068d0d0; no C value can stand in for it, so the call site is
-   marked rather than asserted.  The allocator's own result is kept at its
-   declared 64-bit EDX:EAX width even though only EAX is consumed, exactly as
-   at 0x005c7150 `mov edi,eax`.
+    EDX is now transported through EDX:EAX return declarations, not replaced
+    with zero. For this call's zero first stack argument, 0x005c8926 skips
+    0x004a7f20; the original 0x005c895c loads EDX from the second argument,
+    and 0x0068d1b0 writes EDX at 0x0068d1b0/0x0068d1b9. Both return paths
+    of 0x005c88f0 leave that EDX intact.
+    On the new-record path, 0x00944cfc/0x00944cfd pop ECX, then
+    0x005c6f5c sets ECX to obj. 0x0054a110..0x0054a124 never writes ECX
+    or EDX, so obj supplies ECX and the allocator supplies EDX.
+    Existing-record ECX remains untransported: 0x005c890f/0x005c897c
+    load it from the manager field; 0x0068d1b0..0x0068d1c2 preserve it.
+    Re-reading that field here would add a memory access absent from the
+    caller and is not a general ABI transport solution.
+
+    The EDX input at 0x005c714b is now resolved: 0x00417c35 loads EDX
+    from [ECX], and 0x00417c37..0x00417c40 leave it intact. Capture that
+    actual return register through EDX:EAX. If 0x005c7094 calls the allocator,
+    its EDX replaces it; 0x0068d020..0x0068d030 never writes EDX.
+    These are bound original-target reviews, not callee composition or
+    runtime proof. All instruction VAs refer to the pinned binary above.
 
     The error-path pushes preceding 0x0090d130 belong to 0x00944c9f:
     at 0x005c6f9d/6fa2/6fa3 they push line, second buffer, first buffer;
@@ -67,10 +77,10 @@ typedef struct {
 /* Callee boundaries.  Legacy/compiled callees keep their recorded
    conventions; the receiver of each thiscall is the value the listing sets
    in ECX immediately before the call. */
-extern void CM_THISCALL cm_fn_00417c10(u32 *self, u32 *arg1, u16 *arg2);
+extern unsigned long long CM_THISCALL cm_fn_00417c10(u32 *self, u32 *arg1, u16 *arg2);
 extern void CM_FASTCALL cm_fn_0054a110(u16 *self);
 extern u32 CM_THISCALL cm_fn_005ae870(u8 *self, u32 arg1, u32 arg2, u32 arg3, u32 arg4);
-extern u32 CM_THISCALL cm_fn_005c88f0(u32 self, u32 arg1, u32 arg2);
+extern unsigned long long CM_THISCALL cm_fn_005c88f0(u32 self, u32 arg1, u32 arg2);
 extern void cm_fn_005e8290(const char *arg1, const char *arg2, int arg3);
 extern u32 CM_THISCALL cm_fn_0068d020(u32 self);
 extern unsigned long long CM_FASTCALL cm_fn_0068d0d0(volatile u8 *self, u32 edx_in,
@@ -91,6 +101,8 @@ u32 CM_THISCALL cm_fn_005c6f00(u32 self, u32 arg1, u16 *arg2, u32 arg3, u32 arg4
   u32 field;    /* EAX scratch: object field / manager / formatted string */
   u32 day;      /* full EDX pushed at 0x005c7011 -- low 16 observed */
   u32 year;     /* full ECX pushed at 0x005c700a -- low 16 observed */
+  unsigned long long pair;
+  u32 edx_value;
 
   /* 0x005c6f00 push -1 / 0x005c6f02 push 0x95a15c / 0x005c6f07-0x005c6f0e
      read fs:[0], push it, then link the frame. */
@@ -104,9 +116,13 @@ u32 CM_THISCALL cm_fn_005c6f00(u32 self, u32 arg1, u16 *arg2, u32 arg3, u32 arg4
   *(u32 *)(scratch + 4) = self;
   *(u32 *)(scratch + 0) = 0;
 
-  obj = cm_fn_005c88f0(self, 0, arg1);
+  pair = cm_fn_005c88f0(self, 0, arg1);
+  obj = (u32)pair;
+  edx_value = (u32)(pair >> 32);
   if (obj == 0) {
-    obj = (u32)cm_fn_00944cf1(0x19);
+    pair = cm_fn_00944cf1(0x19);
+    obj = (u32)pair;
+    edx_value = (u32)(pair >> 32);
     *(u32 *)(scratch + 8) = obj;
     frame.state = 0;
     if (obj != 0) {
@@ -140,8 +156,11 @@ u32 CM_THISCALL cm_fn_005c6f00(u32 self, u32 arg1, u16 *arg2, u32 arg3, u32 arg4
     if (field != 0) {
       /* 0x005c7001 `mov cx,word[edi+2]`, 0x005c7005 `mov dx,word[edi]`:
          only the low 16 bits of ECX/EDX are written; see the OPEN ITEM. */
+      /* Existing-record case retains the starting defect, not a proven zero. */
       year = (u32)arg2[1];
-      day = (u32)arg2[0];
+      if (*(u32 *)(scratch + 0) == 0)
+        year |= obj & 0xffff0000u;
+      day = (edx_value & 0xffff0000u) | (u32)arg2[0];
       if (cm_fn_005ae870((u8 *)CM_GLOBAL(u32, 0x00ae2a58), field, day, year,
                          0xffffffffu) != 0) {
         result = 0;
@@ -153,8 +172,11 @@ u32 CM_THISCALL cm_fn_005c6f00(u32 self, u32 arg1, u16 *arg2, u32 arg3, u32 arg4
     field = *(u32 *)(arg3 + 0x69);
     if (field != 0) {
       /* 0x005c702e/0x005c7032, same partial-register pushes. */
+      /* Existing-record case retains the starting defect, not a proven zero. */
       year = (u32)arg2[1];
-      day = (u32)arg2[0];
+      if (*(u32 *)(scratch + 0) == 0)
+        year |= obj & 0xffff0000u;
+      day = (edx_value & 0xffff0000u) | (u32)arg2[0];
       if (cm_fn_005ae870((u8 *)CM_GLOBAL(u32, 0x00ae2a58), field, day, year,
                          0xffffffffu) != 0) {
         result = 0;
@@ -167,7 +189,8 @@ u32 CM_THISCALL cm_fn_005c6f00(u32 self, u32 arg1, u16 *arg2, u32 arg3, u32 arg4
      0x005c7054 push arg2; 0x005c7055 push that address; 0x005c7056 this = obj;
      0x005c7058 store arg1; 0x005c705b call. */
   *(u32 *)(obj + 0xc) = arg1;
-  cm_fn_00417c10((u32 *)obj, (u32 *)(scratch + 8), arg2);
+  pair = cm_fn_00417c10((u32 *)obj, (u32 *)(scratch + 8), arg2);
+  edx_value = (u32)(pair >> 32);
 
   /* 0x005c7060..0x005c707f */
   *(u8 *)(obj + 0x18) = 1;
@@ -185,7 +208,9 @@ u32 CM_THISCALL cm_fn_005c6f00(u32 self, u32 arg1, u16 *arg2, u32 arg3, u32 arg4
   mgr = *(u32 *)(scratch + 4);
   if (*(u32 *)(mgr + 0x34c8) == 0) {
     /* 0x005c7092..0x005c70c7 */
-    field = (u32)cm_fn_00944cf1(0xe);
+    pair = cm_fn_00944cf1(0xe);
+    field = (u32)pair;
+    edx_value = (u32)(pair >> 32);
     *(u32 *)(scratch + 8) = field;
     frame.state = 1;
     if (field != 0) {
@@ -218,10 +243,10 @@ u32 CM_THISCALL cm_fn_005c6f00(u32 self, u32 arg1, u16 *arg2, u32 arg3, u32 arg4
   }
   else {
     /* 0x005c7142 ECX = the manager field, 0x005c7148/0x005c714a push count and
-       source, 0x005c714b call.  EDX is live residue at this call (see the
-       OPEN ITEM) and is not source-derivable; the 64-bit result is kept and
+       source, 0x005c714b call. EDX is the captured original return register
+       from 0x00417c10 or the allocator; the 64-bit result is kept and
        only EAX is used (0x005c7150 `mov edi,eax`). */
-    result = (u32)cm_fn_0068d0d0((volatile u8 *)*(u32 *)(mgr + 0x34c8), 0,
+    result = (u32)cm_fn_0068d0d0((volatile u8 *)*(u32 *)(mgr + 0x34c8), edx_value,
                                  (const u8 *)obj, 0x19);
     if (result != 0) {
       /* 0x005c71c2 */

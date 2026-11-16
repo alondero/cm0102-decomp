@@ -41,6 +41,51 @@ extern u32 CM_CDECL cm_fn_00944cff(u32 arg1, u32 arg2, u32 arg3, void *arg4, voi
 #define A_00AD9C64 0x00ad9c64u                 /* formatter argument 3 */
 #define A_00AE24D0 0x00ae24d0u                 /* scratch message buffer */
 
+/* CM0102 3.9.68, SHA-256
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+   Preferred-image VAs 004a3a0e-004a3a29: scan before writing, then
+   forward DWORD transfers followed by the saved count's remaining bytes.
+   Volatile accesses retain scan/copy order and overlapping-transfer widths. */
+static u32 scan_count_004a39c0(u32 source)
+{
+  u32 remaining = 0xffffffffu;
+  while (remaining != 0) {
+    u8 b = CM_GLOBAL(volatile u8, source);
+    source++;
+    remaining--;
+    if (b == 0)
+      break;
+  }
+  return ~remaining;
+}
+
+static void copy_count_004a39c0(u32 destination, u32 source, u32 count)
+{
+  u32 n;
+  for (n = count >> 2; n != 0; n--) {
+    u32 word = CM_GLOBAL(volatile u32, source);
+    CM_GLOBAL(volatile u32, destination) = word;
+    source += 4;
+    destination += 4;
+  }
+  for (n = count & 3u; n != 0; n--) {
+    u8 byte = CM_GLOBAL(volatile u8, source);
+    CM_GLOBAL(volatile u8, destination) = byte;
+    source++;
+    destination++;
+  }
+}
+
+/* Same pinned image: preferred-image VAs 004a3b55-004a3b78,
+   004a3c2c-004a3c4f and 004a3d03-004a3d26 save the SOURCE
+   count before scanning the destination; never re-test copied bytes for NUL. */
+static void append_004a39c0(char *destination, char *source)
+{
+  u32 count = scan_count_004a39c0((u32)source);
+  u32 end = (u32)destination + scan_count_004a39c0((u32)destination) - 1u;
+  copy_count_004a39c0(end, (u32)source, count);
+}
+
 /* `ret 0x14` with five stack arguments and no incoming ECX receiver: stdcall. */
 u32 CM_STDCALL cm_fn_004a39c0(u32 arg1, s8 arg2, char *arg3, int arg4, int arg5)
 {
@@ -61,21 +106,18 @@ u32 CM_STDCALL cm_fn_004a39c0(u32 arg1, s8 arg2, char *arg3, int arg4, int arg5)
     goto tail;
   }
 
-  /* 004a39e9: strcpy(dest, 0x99cc4c or 0x99cc54), length includes the NUL. */
+  /* 004a39e9-004a3a29: pre-scanned count includes the NUL. */
   {
     const char *s;
-    char *d;
+    u32 count;
     if (arg2 == 3 || arg2 == 4 || arg2 == 5 || arg2 == 2) {
       s = A_0099CC4C;
     }
     else {
       s = A_0099CC54;
     }
-    d = arg3;
-    while ((*d = *s) != 0) {
-      d++;
-      s++;
-    }
+    count = scan_count_004a39c0((u32)s);
+    copy_count_004a39c0((u32)arg3, (u32)s, count);
   }
 
   rec = (u8 *)arg1;
@@ -131,14 +173,7 @@ u32 CM_STDCALL cm_fn_004a39c0(u32 arg1, s8 arg2, char *arg3, int arg4, int arg5)
         s = (char *)(L + 0);
       }
       if (s != (char *)0) {
-        char *d = dest;
-        while (*d != 0) {
-          d++;
-        }
-        while ((*d = *s) != 0) {
-          d++;
-          s++;
-        }
+        append_004a39c0(dest, s);
       }
       p--;
       if ((s32)(*bound + (u32)p) < 0) {
@@ -175,14 +210,7 @@ u32 CM_STDCALL cm_fn_004a39c0(u32 arg1, s8 arg2, char *arg3, int arg4, int arg5)
         s = (char *)(L + 0);
       }
       if (s != (char *)0) {
-        char *d = dest;
-        while (*d != 0) {
-          d++;
-        }
-        while ((*d = *s) != 0) {
-          d++;
-          s++;
-        }
+        append_004a39c0(dest, s);
       }
       p--;
       if ((s32)(*bound + (u32)p) < 0) {
@@ -219,14 +247,7 @@ u32 CM_STDCALL cm_fn_004a39c0(u32 arg1, s8 arg2, char *arg3, int arg4, int arg5)
         s = (char *)(L + 0);
       }
       if (s != (char *)0) {
-        char *d = dest;
-        while (*d != 0) {
-          d++;
-        }
-        while ((*d = *s) != 0) {
-          d++;
-          s++;
-        }
+        append_004a39c0(dest, s);
       }
       p--;
       if ((s32)(*bound + (u32)p) < 0) {

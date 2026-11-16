@@ -1,6 +1,6 @@
 /* fn_00589880 -- preferred-image VA 0x00589880, image base 0x00400000,
    CM0102 3.9.68, binary SHA-256
-   0c78e7da6d0bcb4603fa179449bbe6d1c627a22c445d14d489bd9bff86.
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
 
    Frame allocation / stack-probe helper 0x00945610.
    The original body opens with
@@ -9,24 +9,22 @@
      00589885  call 0x945610
      0058988a  mov eax, dword ptr [esp + 0x1768]
 
-   which is MSVC's large-frame stack-probe lowering (__chkstk): EAX carries the
-   frame size, the helper probes the pages above the relocated ESP, rewrites the
-   return slot it uses as its probe base, then moves ESP by 0x1760.  The frame
-   size is fixed independently by the epilogue `add esp, 0x1760` followed by
+   EAX supplies 0x1760 to the original helper before the first formal load.
+   The frame size is independently evidenced by `add esp, 0x1760` followed by
    `ret` (0x00589adc / 0x00589ae2, and the twin at 0x00589bac / 0x00589bb2),
    and by every root formal displacement below ([esp+0x1768] = arg2 after the
    probe, [esp+0x1778] with the five entry pushes = arg1, [esp+0x1788] with 7
    live pushed dwords = arg3, ...).
 
-   The helper is a compiler-inserted construct, not an engine callee: its EAX
-   count, its own probe reads and its ESP/return-slot relocation cannot be
-   expressed through a C call interface (a C call would leave ESP unmoved and
-   would place the count outside EAX), so it is represented by the plain C
-   frame of exactly 0x1760 bytes below -- the same class of lowering as the
-   `call 0x00945640` / __ftol case in docs/adr/0006.  The helper is therefore
-   not omitted and not stubbed: the allocation, its extent and the probe
-   transport are the frame itself, and every original frame-relative root
-   formal access is kept at its original displacement beneath it. */
+   UNRESOLVED FIDELITY BOUNDARY: the automatic C object below models scratch
+   adjacency only. It does not implement or bind the original helper call,
+   its probe accesses/fault order, or its stack/return-slot transport. The
+   caller listing does not supply the helper's internal instructions, so no
+   probe algorithm is inferred here. A normal C extern call would not express
+   this EAX input and frame relocation contract. A faithful repair needs an
+   authorized ABI boundary or a separately verified compiler-lowering contract;
+   inline assembly, naked functions and CM_ORIGINAL_CALL are prohibited in
+   this plain-C worker. Passing the existing gate does not resolve this hold. */
 
 #include "cmre.h"
 
@@ -38,7 +36,7 @@ extern char *CM_CDECL cm_fn_0066f4e0(u32 destination, u32 format, ...);
 extern unsigned long long CM_THISCALL cm_fn_00785830(void *self, u32 index);
 extern u32 CM_CDECL cm_fn_00944c9f(u32 destination, u32 format, ...);
 
-/* One 0x1760-byte allocation (the probed frame), with the touched sub-regions
+/* One 0x1760-byte scratch object (not an implementation of probing), with sub-regions
    at their original offsets relative to the frame base F (ESP after the
    probe).  Bytes are left uninitialized exactly like the original. */
 typedef struct cm_frame_00589880 {

@@ -36,7 +36,10 @@ u8 CM_STDCALL cm_fn_00849d60(u32 first, u32 second)
     }
     age = *(volatile s8 *)(first + 0x18);
     x = (long double)b / (long double)d;
-    if (x < CM_GLOBAL(volatile double, 0x967880))
+    /* Preferred-image VAs 00849e2d-00849e42: C0 selects the lower
+       reload for less-than OR unordered (CM0102 3.9.68, SHA-256
+       0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86). */
+    if (!(x >= CM_GLOBAL(volatile double, 0x967880)))
         x = CM_GLOBAL(volatile double, 0x967880);
     else if (x > CM_GLOBAL(volatile double, 0x968950))
         x = CM_GLOBAL(volatile double, 0x968950);

@@ -85,6 +85,7 @@ u32 CM_THISCALL cm_fn_00401ea0(u8 *param_1, int param_2)
   u32 *dst;
   u32 *arr1;
   u32 *arr2;
+  volatile u32 *selected_slot;
   u32 slotval;
   u16 a_p20;
   u16 a_p16;
@@ -188,11 +189,13 @@ u32 CM_THISCALL cm_fn_00401ea0(u8 *param_1, int param_2)
     cm_fn_009452ca(block10);
     cm_fn_009452ca(callret);
     arr2 = (u32 *)(*(volatile u32 *)(param_1 + 0x0c));
-    slotval = arr2[param_2];
+    selected_slot = (volatile u32 *)((u32)arr2 + (u32)param_2 * 4u);
+    slotval = *selected_slot;
     if (slotval != 0u) {
-      /* 0x0040205d..0x00402067 */
-      *(u32 *)(param_1 + 0x30) = (u32)param_2;
-      cm_fn_00684230(slotval);
+      /* 0x00401fe8 retains the slot address in EAX. 0x00402060 reloads
+         that slot after the potentially aliasing store at 0x0040205d. */
+      *(volatile u32 *)(param_1 + 0x30) = (u32)param_2;
+      cm_fn_00684230(*selected_slot);
       ExceptionList = frame.prev;
       return 1u;
     }

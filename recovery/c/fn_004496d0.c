@@ -45,10 +45,17 @@ u32 CM_THISCALL cm_fn_004496d0(u32 self, u32 *index, u32 which,
             } else {
                 record = cm_fn_004528d0(self, index, 0);
                 if ((u8)mode == 0x14 && record != 0) {
-                    /* 004497d0..004497e1 test C3: equal OR unordered.
-                       Long double retains the FLD m32 widening. This
-                       predicate deliberately includes NaNs, unlike ==.
-                       Native FP-status equivalence requires gate evidence. */
+                    /* Unresolved fidelity boundary (pinned hash above):
+                       preferred-image VA 004497d0 FLD m32, 004497d6
+                       FCOMP m64, 004497dc FNSTSW AX, 004497de TEST
+                       AH,40 leave native x87 C0/C2/C3 available at
+                       calls 004497e6 and 004497f8. The predicate below
+                       preserves equal-or-unordered branching only; long
+                       double does not establish status-word equivalence.
+                       Plain C has no contract for those condition bits.
+                       Resolving this requires an authorized native x87
+                       boundary, not a passing current semantic gate.
+                       Keep the existing predicate pending that boundary. */
                     long double value =
                         *(volatile float *)(record + 0x1f1u);
                     long double limit =

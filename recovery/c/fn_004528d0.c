@@ -43,8 +43,20 @@ u32 CM_THISCALL cm_fn_004528d0(u32 self, u32 *index, u32 create)
                 CM_GLOBAL(volatile u32, 0xb67a34) = 0;
                 cm_fn_005cc7d0();
                 cm_fn_005a8f60();
-                /* VA 00452a27 leaves the pushed word live if 00945934 returns;
-                   ordinary C cannot express the resulting shifted epilogue. */
+                /* UNRESOLVED fidelity boundary, not implemented by this call.
+                   CM0102 3.9.68 SHA-256:
+                   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+                   Preferred-image VAs 004528d4/dc/dd reserve 512 bytes and
+                   save ESI/EDI. 00452a27 pushes -1; 00452a29 calls 00945934;
+                   00452a2e continues without caller cleanup. If the callee
+                   returns without popping that argument, both epilogues
+                   (00452945..0045294f and 00452a6d..00452a89) pop -1 into
+                   EDI and saved EDI into ESI. After adding 512, RET reads
+                   entry ESP-4 (the last scratch DWORD), NOT saved ESI.
+                   00452a55/00452a5b balance only the 00452fe0 argument.
+                   Plain C cannot preserve this displaced machine return.
+                   Requires an authorized ABI recovery boundary; do not mark
+                   fixed on the strength of a passing semantic gate. */
                 cm_fn_00945934(0xffffffff);
             }
         }

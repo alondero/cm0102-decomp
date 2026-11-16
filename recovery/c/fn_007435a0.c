@@ -23,22 +23,20 @@
    0x1534 bytes (= the original frame size) with explicit offsets, so the two
    adjacent buffers keep their original adjacency.
 
-   Resolution of the held concern about 0x00945610: the original invokes the
-   probe with EAX = 0x1534 so that it touches (reads) the caller stack at
-   caller-ESP-0x1000 and caller-ESP-0x1534 and reallocates ESP by 0x1534
-   before the first formal read.  Plain C cannot set up EAX around a call, and
-   calling the original 0x00945610 from a compiled frame would subtract an
-   unrelated count from the live ESP; the probe's only effects are those page
-   reads plus the 0x1534-byte allocation itself.  The allocation is therefore
-   expressed as the compiler-allocated 0x1534-byte local object below (same
-   size as the original frame, so every offset from the frame base is
-   identical), and the probe call is not re-emitted: it stores no memory, and
-   its page-touch/fault ordering is a property of the original stack pointer at
-   entry, which a plain-C body cannot restate without inline assembly.  Nothing
-   else about the formal or receiver transport changes: arg1/arg3 are read from
-   the caller's homes and forwarded in ECX exactly where the listing does it,
-   all callee stack effects stay with the callees (thiscall receivers pop their
-   own arguments; cdecl sites keep their explicit `add esp`).
+   UNRESOLVED entry boundary; this source does not resolve the probe hold.
+   Evidence: CM0102 3.9.68 SHA-256
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86,
+   preferred-image VAs 0x007435a0 (EAX=0x1534), 0x007435a5 (CALL
+   0x00945610), 0x007435aa (first argument read), and 0x00743a3f /
+   0x00743a45 (release 0x1534 bytes; RET 0xc). The supplied target listing
+   establishes that boundary and its ordering, not the helper's individual
+   accesses. The scratch object preserves relative buffer adjacency only:
+   equal size does not establish placement relative to entry ESP or equivalent
+   probe/fault ordering. Do not infer either from a passing semantic gate.
+   Calling the helper with a normal C declaration does not express its
+   EAX input or stack-replacing return contract. An authorized entry-boundary
+   implementation and original-helper instruction evidence are required;
+   inline assembly and naked functions are outside this plain-C worker lane.
 
    Listing order is preserved: ten/thirteen cm_fn_00785830 calls, then the
    DAT_00ae23b4 record load (before cm_fn_0053e140, which may write it), the
@@ -74,8 +72,8 @@ extern char * CM_CDECL cm_fn_0066f4e0(void *dest, const char *fmt, ...);
 
 u32 CM_STDCALL cm_fn_007435a0(void *owner, u32 mode, void *target)
 {
-  /* One object for the whole original frame (B .. B+0x1534); see the header
-     comment for the offset map. */
+  /* Relative buffer offsets only, not a reconstruction of entry ESP or the
+     omitted probe operation; see the unresolved entry boundary above. */
   u8 scratch[0x1534];
   u8 *const out = scratch + 0x2c;   /* 0x190-byte record text, B+0x2c */
   u8 *const text = scratch + 0x1bc; /* message text, B+0x1bc */

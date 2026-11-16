@@ -24,9 +24,21 @@
    header reads at 006d993f/006d994e/006d995d and 006d99ff/006d9a0e/006d9a1d
    ignore 00945bfe's result (which can return short/EOF before its destination
    store), and 006d99aa/006d9aae read L+0x00 before the only initializing store
-   at 006d9b84.  The value is read and the +1 write-back performed at the exact
-   original sites (006d99aa, 006d9aae, 006d9c01..006d9c23) so truncated-header
-   behaviour is preserved rather than papered over. */
+   at 006d9b84.
+
+   UNRESOLVED FIDELITY DEFECT (confirmed against the preferred-image VAs
+   above in the pinned binary): the original count occupies entry ESP-0x218;
+   this automatic L allocation is not bound to those incoming bytes. Volatile
+   accesses preserve neither their identity nor their value. If a count read
+   leaves bytes unwritten with version 1, comparisons at 006d99aa/006d9aae
+   and the increment/write-back at 006d9c01..006d9c23 can therefore diverge.
+   Leaving L uninitialized is NOT a faithful implementation of that case.
+   A fix needs an entry-state binding that supplies/preserves the original
+   bytes before the rebuilt prologue overwrites them. The supplied plain-C
+   interface/header provides no such binding; changing initialization, using
+   a guessed compiled-frame offset, or adding a helper without a binding would
+   invent behaviour. Executable code is retained pending that boundary work;
+   a passing current gate must not be treated as resolution of this defect. */
 
 #include "cmre.h"
 
