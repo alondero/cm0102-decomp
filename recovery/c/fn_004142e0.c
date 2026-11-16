@@ -5,6 +5,14 @@
    004142ea-ec push the words and call, and 004142f1 returns with ret 8. */
 extern u32 CM_THISCALL cm_fn_0058f120(u32 *self, u32 arg1, u32 arg2);
 
+/* UNRESOLVED entry-stack alias boundary, same pinned binary as above:
+   preferred-image VA 004142e8 loads [ECX] before 004142ea first writes
+   entry ESP-4. If entry ECX == entry ESP-4, a compiler prologue can destroy
+   that receiver before this C load. Volatile does not constrain prologues.
+   Ordinary C cannot bind this read ahead of compiler-generated stack writes;
+   fixing it requires an authorized ABI entry bridge, not register-allocation
+   tuning or a fixture excluding the alias. A passing C gate does not resolve
+   this defect. */
 u32 CM_THISCALL cm_fn_004142e0(volatile u32 *self, u32 arg1, u32 arg2)
 {
     u32 receiver = *self;

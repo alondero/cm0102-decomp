@@ -41,7 +41,13 @@ u32 CM_THISCALL cm_fn_00797e80(u32 self) {
     result=cm_fn_0068b100(obj,self,4,mem,1,R32(self+4),b,*(u32 *)scratch,edx,arg8,arg9,arg10,arg11,arg13,0,a,arg16,2,0,arg19,~0u,0,2);
    }
   }
-  frame.state=~0u; R32(R32(self+12))=result;
+  /* Pinned CM0102 3.9.68 SHA-256
+     0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86:
+     preferred-image VA 00797f97 reads the destination before the SEH state
+     reset at 00797f9b; 00797fa6 stores through that captured pointer. */
+  ecx=R32(self+12);
+  frame.state=~0u;
+  R32(ecx)=result;
   cm_fn_009452ca(mem); cm_fn_009452ca(b);
   a=R32(self+12); ecx=R32(a);
   if(ecx) { R32(self+0x30)=0; cm_fn_00684230(R32(a)); CM_FS(u32,0)=frame.prev; return 1; }

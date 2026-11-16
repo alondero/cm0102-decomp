@@ -26,7 +26,13 @@ extern void cm_fn_005e8290(const char * param_1,const char * param_2,int param_3
 extern u32 CM_CDECL cm_fn_00600c90(u32 club, u32 skip_status, u8 flag);
 extern u32 CM_THISCALL cm_fn_0068d080(u32 self);
 extern unsigned long long CM_FASTCALL cm_fn_0068d0d0(volatile u8 *self, u32 edx_in, const u8 *src, s16 count);
-extern u32 CM_STDCALL cm_fn_00775790(u32 input);
+/* CM0102 3.9.68 SHA-256
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86,
+   preferred-image VAs 0x00484681/0x0048474f load ECX from [0x00b74318],
+   0x00484687/0x00484755 push EBP, then 0x00484688/0x00484756 call
+   0x00775790. Preserve that caller-side register input explicitly; this
+   boundary does not assert how the original callee uses ECX. */
+extern u32 CM_THISCALL cm_fn_00775790(u32 ecx_in, u32 input);
 extern u8 CM_THISCALL cm_fn_008972c0(u32 self, u32 club, u32 person, u32 flag);
 extern char * cm_fn_0090d130(void);
 extern void CM_THISCALL cm_fn_0090d4f0(u32 self, u32 club);
@@ -52,6 +58,7 @@ extern u32 CM_CDECL cm_fn_00945333(u32 base_arg, u32 count_arg, u32 width_arg, u
 #define G_B77C7A   CM_GLOBAL(volatile s16, 0x00b77c7a)
 /* Receiver sources loaded into ECX before each call; reloaded every time. */
 #define G_AE1050   CM_GLOBAL(volatile u32, 0x00ae1050)
+#define G_B74318   CM_GLOBAL(volatile u32, 0x00b74318)
 #define G_DE1D08   CM_GLOBAL(volatile u32, 0x00de1d08)
 #define G_DE2F70   CM_GLOBAL(volatile u32, 0x00de2f70)
 
@@ -321,8 +328,8 @@ next:                                                   /* 0048455a */
     table = 0x00485830u; grp = 3;
   }
   else if ((param_3 & 0x10u) != 0u) {
-    /* 00484681: ECX = [0xb74318] is the callee's own receiver boundary */
-    reg_eax = cm_fn_00775790((u32)param_1);
+    /* 00484681: reload the caller's ECX input before 00484688. */
+    reg_eax = cm_fn_00775790(G_B74318, (u32)param_1);
     if (reg_eax == 0u) {
       table = 0x00485a60u; grp = 1;                     /* 00484691 */
     }
@@ -361,8 +368,8 @@ next:                                                   /* 0048455a */
     table = 0x00486760u; grp = 3;
   }
   else if ((param_3 & 0x2000u) != 0u) {
-    /* 0048474f */
-    reg_eax = cm_fn_00775790((u32)param_1);
+    /* 0048474f: reload the caller's ECX input before 00484756. */
+    reg_eax = cm_fn_00775790(G_B74318, (u32)param_1);
     if (reg_eax == 0u) {
       table = 0x00486760u; grp = 1;                     /* 0048475f */
     }

@@ -37,7 +37,15 @@ u32 CM_THISCALL cm_fn_0040c3d0(u32 self)
         frame.state=0;
         if (obj) {
             t=M((u32)(scratch+4));
-            year=(obj & 0xffff0000u) | CM_GLOBAL(volatile u16,self+0x40);
+            /* CM0102 3.9.68 SHA-256
+               0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86,
+               preferred-image VAs: 00944cf1 PUSH 1; 00944cf3 PUSH
+               [ESP+8]; 00944cf7 CALL 00944e58; 00944cfc POP ECX;
+               00944cfd POP ECX; 00944cfe RET. Thus allocator return ECX
+               is 1, independently of EAX. 0040c494 calls this allocator;
+               0040c4b3 replaces CX, then 0040c4c9 pushes full ECX.
+               Its upper word is zero, not the allocation address's word. */
+            year=CM_GLOBAL(volatile u16,self+0x40);
             p=M(self+4);
             q=M((u32)scratch);
             result=cm_fn_00522e00(obj,self,4,edi,q,p,builder,year,3,2,t,0x14,0,0,0,0);

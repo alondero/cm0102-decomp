@@ -109,8 +109,17 @@ extern unsigned long long CM_CDECL cm_fn_0090cfc0(u32 bound);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Warray-bounds"
 
-void CM_THISCALL cm_fn_004cb250(u32 self, u8 *p1, u8 *p2, u8 *p3)
+/* Stack-home evidence: pinned CM0102 3.9.68 SHA-256
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86,
+   preferred-image VAs: 0x004cb250 reserves 8 bytes; 0x004cb253/254
+   save ESI/EDI; 0x004cb271 caches entry [ESP+4] in ESI.
+   0x004cb2ae/2af save EBX/EBP and 0x004cb4cf pushes ESI, so
+   0x004cb4d0 [ESP+0x20] is that caller-owned first argument home.
+   Keep its byte store separate from the cached ESI pointer; reload its byte
+   at 0x004cb543 and 0x004cb913, not across intervening aliasing accesses. */
+void CM_THISCALL cm_fn_004cb250(u32 self, u8 * volatile p1_home, u8 *p2, u8 *p3)
 {
+  u8 *p1;
   u8 *row = &CM_GLOBAL(u8, 0x00b63d8a);
   long double x;
   long long ft;
@@ -130,6 +139,7 @@ void CM_THISCALL cm_fn_004cb250(u32 self, u8 *p1, u8 *p2, u8 *p3)
   if (p2 == (u8 *)0) {
     return;
   }
+  p1 = p1_home; /* 0x004cb271: ESI retains this value after the home write. */
   if (p1 == (u8 *)0) {
     return;
   }
@@ -246,12 +256,13 @@ L45a:
     x = x + (long double)K_968968;
   }
   ft = (long long)x; /* 0x004cb4c4 call 0x00945640 (__ftol) */
-  /* 0x004cb4d0: the low byte is stored to the arg1 stack home */
-  cvar2 = (u8)(u32)ft;
-
-  /* 0x004cb4d4 */
-  if ((u8)cm_fn_0062c400(D_B63D28, (u32)p1) != 0) {
-    goto L8f1;
+  {
+    u32 receiver = D_B63D28; /* 0x004cb4c9, before the home store */
+    WR8(&p1_home, (u8)(u32)ft); /* 0x004cb4d0: BYTE, entry ESP+4 */
+    /* 0x004cb4d4: pushed ESI is the unmodified cached pointer. */
+    if ((u8)cm_fn_0062c400(receiver, (u32)p1) != 0) {
+      goto L8f1;
+    }
   }
 
   /* 0x004cb4e1 */
@@ -281,6 +292,7 @@ L45a:
   if (RD8((u32)p3 + 0x49) != 0) {
     goto L8f1;
   }
+  cvar2 = RD8(&p1_home); /* 0x004cb543 */
   if ((s8)cvar2 <= 5) {
     goto L90f;
   }
@@ -455,7 +467,7 @@ L6c2:
 
 L90f:
   /* 0x004cb90f */
-  clv = (u8)(0u - (u8)cvar2);
+  clv = (u8)(0u - RD8(&p1_home)); /* 0x004cb913 */
   b44 = RD8((u32)p3 + 0x44);
   sv = (s32)(s8)b44 + (s32)(s8)clv;
   if (sv > 0x64) {
