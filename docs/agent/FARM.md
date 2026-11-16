@@ -46,8 +46,10 @@ drained eight times in 19 hours and then sat idle for nine.
    parked and which candidates wait for inputs; a new directory dispatches the
    whole held queue again.
 6. **Validation budget.** `cmre_session.py check` runs once, at the handoff,
-   after the final `stop`. Full revalidation and composition runs need Adam's
-   request; they produced no recovery on 15–16 Nov (4 h 46 min plus 1 h 42 min).
+   after the final `stop`. A harness release's own full revalidation is
+   authorized (Adam, 2026-11-16) and runs at the release's batch boundary. Other
+   full revalidation and composition runs need Adam's request; they produced no
+   recovery on 15–16 Nov (4 h 46 min plus 1 h 42 min).
 7. **Write `docs/NEXT-SESSION-PROMPT.md` once**, at the handoff. It records
    state, not a live log.
 8. **Report byte movement per supply item.** A lane that moves no bytes into
@@ -506,20 +508,33 @@ moves; these are the byte pools, largest first:
 | Stack-probe fault address (`callee-stack-probe-address`, `*stack-probe*`) | 22 KB, ~7 fn | A harness rule for a stack-exhaustion fault at the same original instruction whose address differs only by frame layout (`fn_006146b0`: 598 of 600 cases equal) |
 | Virtual-entry inventory (`missing-real-virtual-entry`, `virtual-target-inventory-entry`) | 19 KB, 35 fn | Inventory entries for real vtable targets (the `fn_0051c020` seed flow of 15 Nov) |
 | Exit and post-fatal continuation (`exit-return-stack-continuation`, `returning-exit*`) | 12 KB, 23 fn | A harness rule for execution after a call that does not return in the game |
-| Unlifted | 1.98 MB, 1,060 fn | Captures from the running game (items 1 and 4); ask Adam before driving the desktop |
+| Unlifted | 1.98 MB, 1,060 fn | Captures from the running game (items 1 and 4) |
 
 The import, x87 live-stack, stack-probe, virtual-entry and exit pools are each
-one harness decision (ADR, [HARNESS.md](HARNESS.md), frozen revalidation) for
-Adam, not per-function work: retrying those functions on any model repeats the
-recorded failure. Expert sessions work this list in order while the farm runs,
-and never coordinate the farm:
+one harness release, not per-function work: retrying those functions on any
+model repeats the recorded failure. Sessions build these releases themselves
+(Adam, 2026-11-16): an ADR, the change in a worktree with failing regression
+tests first ([HARNESS.md](HARNESS.md), [ADR 0007](../adr/0007-harness-releases.md)),
+the release's full revalidation at a batch boundary, then `retry` of the
+family. Adam reviews the finished release before it merges to `main`; the
+session does not wait for him to start one. The fidelity rules still bound
+every release: plain C calls original code across the boundary, and nothing
+invents API results or engine behaviour. Expert sessions work this list in
+order while the farm runs, and never coordinate the farm:
 
 1. **Import-result recording** (authorized 2026-11-13). Extend the capture
    recorder ([CAPTURE.md](CAPTURE.md), ADR 0009) so a replay continues with
    the real results of `HeapAlloc`, `ReadFile` and other imports instead of
    seeded stub values. 181 captured functions (455 KB) stop below 0.6 coverage
    mostly on this. Recording needs the game running with the recorder attached.
-   Ask Adam before driving the desktop, or run unattended only with his approval.
+   Recording drives the desktop: ask Adam whether he is away from the computer.
+   When he is, run it unattended (approved 2026-11-16): attach at the main menu,
+   create a game, play past any match on day one, then send the manager on
+   holiday (manager menu; disabled on match days) so the assistant picks teams,
+   plays matches and handles transfers. A click during holiday asks "Return
+   from holiday?", so the driver acts only when the window stalls (the 16 Nov
+   run's `ui.py` and `overnight.py` are in `CM0102/Runtime/host-capture-20261116/`).
+   Posted clicks work; the first click after an Escape is often swallowed.
 2. **Harness families.** `py -3.13 -m cmre work families` and the `survey`
    blocker counts name families that block 10–45 functions each
    (`missing-real-virtual-entry`, `dtor-heapfree-divergence`,

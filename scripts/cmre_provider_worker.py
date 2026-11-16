@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -47,15 +48,17 @@ def write_json(path, value):
 
 def read_json(path):
     """Read a file write_json() may be replacing: Windows denies the open while the old
-    receipt is delete-pending, so retry those sharing errors for up to 2 s."""
+    receipt is delete-pending, so retry those sharing errors for up to 2 s. io.open goes
+    through the CRT, which reports the denial as errno EACCES with no winerror."""
     path = Path(path)
     deadline = time.monotonic() + 2
     while True:
         try:
             return json.loads(path.read_text(encoding='utf-8'))
         except PermissionError as error:
-            if (os.name != 'nt' or getattr(error, 'winerror', None) not in (5, 32, 33)
-                    or time.monotonic() >= deadline):
+            winerror = getattr(error, 'winerror', None)
+            sharing = winerror in (5, 32, 33) or (winerror is None and error.errno == errno.EACCES)
+            if os.name != 'nt' or not sharing or time.monotonic() >= deadline:
                 raise
             time.sleep(.01)
 
