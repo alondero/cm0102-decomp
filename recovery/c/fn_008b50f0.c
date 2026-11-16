@@ -2,7 +2,25 @@
    strings into a 0x64-byte stack scratch (base L, the post-`sub esp,0x64`
    esp), then clear the 12 bytes at [esi+9] and copy 0xb bytes of the scratch
    there.  code 8 returns before the clear/copy; codes > 8 reach the clear/copy
-   with the scratch untouched, as in the original. */
+    with the scratch untouched.
+
+    UNRESOLVED FIDELITY DEFECT (not repaired by a passing gate):
+    CM0102 3.9.68 SHA-256
+    0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86,
+    preferred-image VAs: 0x008b50f0 reserves 0x64 bytes; 0x008b50f3
+    saves ESI below them. For dispatch 9..254, 0x008b51f0..0x008b51f2
+    reaches the copy without initializing that area. After PUSH 0xb at
+    0x008b51fb, LEA ECX,[ESP+8] at 0x008b5205 therefore addresses
+    entry ESP-0x64. The copy at 0x008b520b observes eleven existing bytes
+    there, after the three destination DWORD clears.
+
+    The automatic array below does NOT preserve those entry-stack bytes.
+    A faithful repair needs an entry-stack preservation/binding contract
+    outside this plain-C routine. Merely addressing entry ESP-0x64 through
+    a compiler frame builtin cannot protect it against compiled prologue,
+    spills or outgoing calls. Matching a particular compiler frame or
+    initializing this array with guessed bytes would not repair fidelity.
+    Keep this candidate unvalidated for that path pending such a contract. */
 #include "cmre.h"
 
 extern char *CM_CDECL cm_fn_0066f4e0(char *destination,
