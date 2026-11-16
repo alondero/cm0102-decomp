@@ -10,24 +10,21 @@
    is the saved object on both paths (0040ea38), so u32 is the real width. Both
    callees stay original-code boundaries; neither result is used.
 
-   Held concern (0x40ea40 returns in only 1/600 sweep cases): that gap is in the
-   fixture corpus, not in this body. Nothing here depends on the destructor's
-   outcome. If 0x40ea40 does not return, the original's 0040ea28/0040ea2f/0040ea30
-   are never reached either, and the C body stops at the same boundary call. If it
-   returns, the tail is reproduced literally: the BYTE test of the flag home
-   happens after the call (so a callee that rewrote the home would be observed),
-   the delete is called only when bit 0 is set, and the saved object is returned.
-   Flag 0 and flag 1 are each expressed by the one branch at 0040ea2d; extra
-   fixtures reaching that branch with 0x40ea40 returning are needed as evidence. */
+   0040ea20 saves ESI, making [esp+8] at 0040ea28 the incoming
+   four-byte argument home. Keep a volatile, word-sized formal so the BYTE
+   lvalue below reads that home after 0040ea23, rather than a narrowed copy
+   or a value cached before the boundary call. Only its low byte is read;
+   the other three bytes are not examined by the original.
+   Callee non-return cases do not exercise this reload or the delete branch. */
 #include "cmre.h"
 
 extern void CM_THISCALL cm_fn_0040ea40(u32 self);
 extern unsigned long long CM_CDECL cm_fn_00944c94(void *arg4);
 
-u32 CM_THISCALL cm_fn_0040ea20(u32 self, u8 flags)
+u32 CM_THISCALL cm_fn_0040ea20(u32 self, volatile u32 flags)
 {
     cm_fn_0040ea40(self);
-    if (flags & 1u)
+    if (*(volatile u8 *)&flags & 1u)
         cm_fn_00944c94((void *)self);
     return self;
 }

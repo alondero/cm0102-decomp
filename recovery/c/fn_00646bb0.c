@@ -22,10 +22,13 @@
    listing's offsets keeps the bytes the routine itself owns in memory we own
    and never spill into, so both builds observe the same initialised scratch
    bytes plus the same record bytes the original has there at loop time.  The
-   unbounded pair table (A+0x20 + 4n, stores at 0x00646c7f/0x00646ca5) is
-   written through the same base, so it overruns into that same region exactly
-   as the original overruns into its own caller's stack.  Nothing in the region
-   is initialised beyond the listing's own stores.
+   unbounded pair table (A+0x20 + 4n, stores at 0x00646c7f/0x00646ca5) and
+   weight reads share the address mapping below: offsets at or above A+0x27c
+   refer to the caller's return slot and following bytes, not memory beyond
+   the allocated frame object.  In particular, table index 151 and weight
+   index 632 both address A+0x27c.  Nothing in the region is initialised beyond
+   the listing's own stores.  This address mapping does not establish callee
+   composition or runtime proof for a table spanning the frame boundary.
 
    Indices use wrapping 32-bit address arithmetic; no signed-overflow wrapping.
    No direct callers establish a narrower return; EAX is kept in full. */
@@ -63,6 +66,14 @@ extern u32 CM_CDECL cm_fn_005e8290(const char *, const char *, u32);
 #define D(a) (*(volatile u32 *)(u32)(a))
 #define W(a) (*(volatile u16 *)(u32)(a))
 #define B(a) (*(volatile u8 *)(u32)(a))
+
+/* Preferred-image VAs 0x00646bc5/0x00646bfd establish ESP=A-0x10.
+   0x00646c6d/0x00646c71 and 0x00646c7f/0x00646ca5 use that same base.
+   Both access families must cross the return-slot boundary together.
+   Binary identity is the pinned 3.9.68 SHA-256 stated above. */
+#define STACK_ADDRESS(off) \
+    ((s32)(u32)(off) < 0x27c ? work + (u32)(off) : \
+     (u32)__builtin_frame_address(0) + 4u + (u32)(off) - 0x27cu)
 
 u32 CM_THISCALL cm_fn_00646bb0(u32 self)
 {
@@ -109,20 +120,18 @@ next_row:
             /* The bytes beyond the SEH record belong to the caller, not
                to the compiler's frame adjoining our local scratch.  At
                0x00646bc5 A is entry ESP-0x27c; entry ESP is the return slot. */
-            value = B(row + 4u < 0x27cu ? work + row + 4u :
-                      (u32)__builtin_frame_address(0) + 4u + row + 4u - 0x27cu);
-            if (value != B(row + 5u < 0x27cu ? work + row + 5u :
-                           (u32)__builtin_frame_address(0) + 4u + row + 5u - 0x27cu)) {
+            value = B(STACK_ADDRESS(row + 4u));
+            if (value != B(STACK_ADDRESS(row + 5u))) {
                 /* 0x00646c77 */
                 list_index = (u32)(s32)(s16)(u16)D(work);
-                D(work + 32u + list_index * 4u) = D(base + offset);
+                D(STACK_ADDRESS(32u + list_index * 4u)) = D(base + offset);
                 value = D(work) + 1u;
                 row = row + 1u;
                 D(work) = value;
                 list_index = (u32)(s32)(s16)(u16)value;
                 other = D(base + row * 59u);
                 count = value + 1u;
-                D(work + 32u + list_index * 4u) = other;
+                D(STACK_ADDRESS(32u + list_index * 4u)) = other;
                 B(base + offset + 0x3au) = (u8)(index + 2u);
                 base = D(self + 0xb1u);
                 D(work) = count;
