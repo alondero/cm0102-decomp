@@ -486,30 +486,33 @@ The farm only drains supply that the gate can test. Bytes stuck outside it are
 the real limit (`py -3.13 -m cmre pipeline survey`): on 2026-11-13, 71 KB
 ready, 654 KB held, 2.03 MB unlifted.
 
-Measured 2026-11-16 after run `20261115T1250Z-sol-commandcode-supervised`: the C
-queue holds 412 functions / 453 KB and **2 functions / 2.3 KB are unheld**. That
-run took 158 of its 162 accepted functions (154 KB) from held functions whose
-holds were stale, then parked 300. Re-gating the 300 retained candidates
-(`cmre_farm.py reclassify RUN`) gave: 245 that fail the gate (227 / 344 KB on
-real mismatches, 12 / 25 KB that do not build: x87 placeholders, `sqrt` link),
-51 / 32.5 KB input-bound (20 / 13.4 KB already at coverage 0.5 or more), 1
-passing, 3 with no candidate.
-Unlifted: 1,060 functions / 1.98 MB. Translation capacity is idle until supply
+Measured 2026-11-16 22:00 at the end of run
+`20261115T1250Z-sol-commandcode-supervised` (194 functions / 227 KB accepted;
+supply empty from 19:58). `survey` bands: authored 195 fn / 158 KB (C written,
+not accepted), lifted 185 fn / 229 KB (no C yet), unlifted 1,060 fn / 1.98 MB.
+By work state: evidence-needed 207 fn / 216 KB, harness-blocker 158 fn / 150 KB,
+translation-defect 10 fn / 3 KB, ready 3 fn / 16 KB (parked by the farm after
+gate mismatches, so not dispatchable). Translation capacity is idle until supply
 moves; these are the byte pools, largest first:
 
-| Pool (work-state blockers) | Held bytes | What releases it |
+| Pool (work-state blockers) | Bytes | What releases it |
 | --- | --- | --- |
-| x87 `_CIpow` transport (holds naming `0x00945ff0`) | 97 KB, 18 fn (8 fn / 38 KB blocked by the transport alone) | ADR 0010 release, prepared on branch `release/x87-cipow-20261116`: the `cm_x87_CIpow` bridge plus `-mno-sse3`. Apply at a batch boundary with one full revalidation, then `retry` these functions. The other x87 holds call only `__ftol`, which ADR 0006 already allows; the 15 Nov run attempted them and they failed on translation mismatches, so they are ordinary retry work |
-| Import out-parameters (`native-directory-output`, `file-search-import-outparams`, `shutdown-uninitialized-find-output`, `unwritten-*-output`, `readfile-import-outparams`) | 85 KB, ~60 fn | Import stubs that write their output buffers (recorded results, item 1) |
-| Virtual-entry inventory (`missing-real-virtual-entry`, `virtual-target-inventory-entry`, `real-virtual-*`) | 27 KB, ~45 fn | Inventory entries for real vtable targets (the `fn_0051c020` seed flow of 15 Nov) |
-| Stack-probe fault address (`callee-stack-probe-address`, `*stack-probe*`) | 25 KB, ~15 fn | A harness rule for a stack-exhaustion fault at the same original instruction whose address differs only by frame layout (`fn_006146b0`: 598 of 600 cases equal) |
-| Exit and post-fatal continuation (`exit-return-stack-continuation`, `returning-exit*`, `original-post-fatal-*`) | 21 KB, ~35 fn | A harness rule for execution after a call that does not return in the game |
-| Input-bound candidates (`cmre_farm.py inputs RUN`) | 32.5 KB, 51 fn | Authored `c_hints` fixtures; the farm re-gates the retained candidate by itself |
+| Open audit defects on accepted sources (`cmre_farm.py defects RUN`) | 156 KB, 115 fn | The defect subagent or by-hand fixes, then `adopt`/`dismiss` (below). By cause: x87/float 34 KB, call order and reloads 33 KB, stack residue 19 KB, register ABI 18 KB, entry-stack alias 17 KB (11 fn; plain C cannot bind a read ahead of the prologue, so these need an ABI entry decision, not a fix attempt) |
+| Import out-parameters (`native-directory-output`, `file-search-import-outparams`, `shutdown-uninitialized-find-output`, `cleanup-file-enumeration-output`, `unwritten-*`) | 97 KB, 37 fn | Import stubs that write their output buffers (recorded results, item 1). Two accepted functions (fn_006be710, fn_0070d690) pass only by frame-size luck on this family |
+| x87 live stack across `__ftol` (`x87-live-stack`, `original-live-x87-argument`, `live-x87-call`) | 60 KB, 7 fn (fn_00808690 26 KB, fn_00846920 13 KB, fn_0085fc50 11 KB, fn_00695240 5 KB) | A bridge like ADR 0010 for calls to `0x00945640` that keep deeper x87 values live across the call. Plain-C `__ftol` (ADR 0006) covers only an empty stack |
+| `_CIpow` operand evidence (ADR 0010 condition 3; work blocker `x87-power-boundary`) | 12 accepted fn (10 kept local) | Applied 16 Nov. Breaking each operand left 10 of 12 farm accepts still passing (`diagnostics/x87-cipow-bridge-20261116/mutation-sweep/`), plus fn_004cda70 and fn_006eecb0 (bridged candidates staged). Needs evidenced `c_hints` fixtures until each mutant fails. fn_004d1600 and fn_007109f0 (24 KB) failed translation after the release |
+| Gate mismatches with no blocker (`(none)` family) | 34 KB, 48 fn | Parked after mismatches on every ladder model: hand translation (`cm-decompile`) from the first failing case |
+| Input-bound candidates (`cmre_farm.py inputs RUN`) | 34 KB, 53 fn (14 KB / 21 fn at coverage 0.5 or more) | Authored `c_hints` fixtures; the farm re-gates the retained candidate by itself |
+| Stack-probe fault address (`callee-stack-probe-address`, `*stack-probe*`) | 22 KB, ~7 fn | A harness rule for a stack-exhaustion fault at the same original instruction whose address differs only by frame layout (`fn_006146b0`: 598 of 600 cases equal) |
+| Virtual-entry inventory (`missing-real-virtual-entry`, `virtual-target-inventory-entry`) | 19 KB, 35 fn | Inventory entries for real vtable targets (the `fn_0051c020` seed flow of 15 Nov) |
+| Exit and post-fatal continuation (`exit-return-stack-continuation`, `returning-exit*`) | 12 KB, 23 fn | A harness rule for execution after a call that does not return in the game |
+| Unlifted | 1.98 MB, 1,060 fn | Captures from the running game (items 1 and 4); ask Adam before driving the desktop |
 
-Each of the first five is one harness decision (ADR, [HARNESS.md](HARNESS.md),
-frozen revalidation) for Adam, not per-function work: retrying those functions
-on any model repeats the recorded failure. Expert sessions work this list in
-order while the farm runs, and never coordinate the farm:
+The import, x87 live-stack, stack-probe, virtual-entry and exit pools are each
+one harness decision (ADR, [HARNESS.md](HARNESS.md), frozen revalidation) for
+Adam, not per-function work: retrying those functions on any model repeats the
+recorded failure. Expert sessions work this list in order while the farm runs,
+and never coordinate the farm:
 
 1. **Import-result recording** (authorized 2026-11-13). Extend the capture
    recorder ([CAPTURE.md](CAPTURE.md), ADR 0009) so a replay continues with
