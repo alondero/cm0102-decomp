@@ -22,14 +22,16 @@ ADDRESS_CONVENTION = "preferred-image VA, image base 0x00400000"
 
 ANALYSIS = ROOT / "CM0102/Analysis"
 RUNS = ANALYSIS / "cmre/runs"
-FUNCTIONS_TSV = ANALYSIS / "baseline-c/exports/functions.tsv"
-CALLS_TSV = ANALYSIS / "recovery-map-b/calls.tsv"
-MODULES_JSON = ANALYSIS / "recovery-map-b/module-candidates.json"
+# Select the reviewed f pair together; historical baseline-c/recovery-map-b remain intact.
+ENTRY_REVISION = ANALYSIS / "cmre/supply-sol-commandcode-20261115/parallel-virtual-entry"
+FUNCTIONS_TSV = ENTRY_REVISION / "current-identity-fresh-f/exports/functions.tsv"
+CALLS_TSV = ENTRY_REVISION / "current-identity-map-f/calls.tsv"
+MODULES_JSON = ENTRY_REVISION / "current-identity-map-f/module-candidates.json"
 # Accepted Ghidra exports; pinned so the work queue cannot silently change.
 INVENTORY_SHA256 = {
-    FUNCTIONS_TSV: "ecfe6c762c99ffd2058ea02698bfc9997f666937ff3a12171157da2676eca03a",
-    CALLS_TSV: "020ce9259cf4cad2148be3394d20eb38066ee68ea69d690fccd7d54b33f86cd6",
-    MODULES_JSON: "762212097945260d663742e9c8fd76d1d9e0b2cfe664500ed19a99d708a59d46",
+    FUNCTIONS_TSV: "6727ff30e8b301650223cce367dc477e4529a7da29e6991ce7f8da03b8b1d6a1",
+    CALLS_TSV: "b4d4c0fa39a8612ebed37c5aa20be8168cb4c751356b2f8b3c964e10f42d873e",
+    MODULES_JSON: "3bc01bd5092f0106a9c5416f9cd083697e884c7a44f0e3d1416ee59e56bd5704",
 }
 
 RECOVERY = ROOT / "recovery"

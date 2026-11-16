@@ -1,4 +1,6 @@
-/* WIP: five failed iterations; callee arities and stack-local translation remain unresolved. */
+/* Stack reconstruction: L+8 holds the 717410 result, L+12 the float;
+   the byte output at L+20 is the incoming argument home. The 6ea4e0
+   call has eight stack arguments, and 6d6f70 has seven. */
 /* Draft for preferred-image VA 0x006d1210, image base 0x00400000, converted from Ghidra 12.1.4
    pseudocode by `cmre draft`. Unvalidated: check names, widths and signedness against
    `cmre show --asm`; acceptance comes only from `cmre test --c` and `cmre accept --c`. */
@@ -19,19 +21,17 @@ extern void CM_THISCALL cm_fn_006cda20(char *param_1,char *param_2,char param_3)
 extern u32 CM_THISCALL cm_fn_006ce110(volatile u8 *self, s8 selector);
 extern void CM_THISCALL cm_fn_006d6f70(char *param_1,u16 param_2,char *param_3,char param_4,u8 param_5,char param_6, char param_7,u32 param_8);
 extern void CM_THISCALL cm_fn_006e1090(int param_1,char param_2);
-extern char CM_FASTCALL cm_fn_006e1a40(int param_1);
+extern char CM_THISCALL cm_fn_006e1a40(int param_1, int mode);
 extern void CM_FASTCALL cm_fn_006e1aa0(int param_1);
-extern void CM_THISCALL cm_fn_006ea4e0(int *param_1,int param_2,int param_3,char *param_4,u8 param_5,char param_6, char param_7,u32 *param_8,char param_9);
+extern void CM_THISCALL cm_fn_006ea4e0(int param_1,int param_2,int param_3,char *param_4,u8 param_5,char param_6, char param_7,float *param_8,char param_9);
 extern void CM_THISCALL cm_fn_00716450(int param_1,float param_2);
 extern u32 CM_THISCALL cm_fn_00716630(int param_1,char param_2);
 extern void CM_THISCALL cm_fn_00716e10(int param_1,u32 param_2);
 extern u32 CM_FASTCALL cm_fn_00717410(int param_1);
 extern u32 CM_THISCALL cm_fn_00897760(int param_1,int param_2,char param_3,u32 param_4);
 extern int cm_fn_0090cfc0(int param_1);
-/* NEEDS-REVIEW: ._1_3_ */
-/* WIP: callee argument and stack-local reconstruction remains incomplete. */
 
-void CM_THISCALL cm_fn_006d1210(int param_1,char param_2)
+void CM_THISCALL cm_fn_006d1210(int param_1,u32 param_2)
 
 {
   int *piVar1;
@@ -50,7 +50,7 @@ void CM_THISCALL cm_fn_006d1210(int param_1,char param_2)
   float local_4;
   
   if (*(char *)(param_1 + 0x8eb4) == '\0') {
-    cm_fn_00716630(0);
+    cm_fn_00716630((int)param_2, 0);
     if (*(char *)(param_1 + 0x1a3) != '\0') {
       *(u8 *)(param_1 + 0x8eb4) = 1;
       return;
@@ -61,10 +61,10 @@ void CM_THISCALL cm_fn_006d1210(int param_1,char param_2)
     if ('\0' < *(char *)(param_1 + 0x1a3)) {
       do {
         iVar10 = param_1 + (char)local_10 * 0xb;
-        sVar4 = cm_fn_00717410();
-        param_2 = '\x01';
+        sVar4 = cm_fn_00717410(*(int *)(iVar10 + 0xb1));
+        *(u8 *)&param_2 = 1;
         sVar9 = -1;
-        cm_fn_006ea4e0(*(u32 *)(iVar10 + 0xb1),*(u32 *)(iVar10 + 0xb5),&param_2,
+        cm_fn_006ea4e0(param_1 + 0xf5b2,*(u32 *)(iVar10 + 0xb1),*(u32 *)(iVar10 + 0xb5),(char *)&param_2,
                      *(u8 *)(param_1 + (char)local_10 * 0xb + 0xbb),
                      *(u8 *)(iVar10 + 0xb9),0,&local_4,0);
         if (param_2 == '\x02') {
@@ -73,13 +73,13 @@ LAB_006d132f:
           iVar5 = cm_fn_0090cfc0((int)*(char *)(iVar10 + 0xb9));
           iVar6 = cm_fn_0090cfc0(0x14);
           if (iVar6 < iVar5) {
-            cm_fn_006d6f70(0x20f5,param_1,0,*(char *)(*(int *)(iVar10 + 0xb1) + 0x27) == '\0',
-                         0xffffffff,0xffffffff,0);
+            cm_fn_006d6f70(*(char **)(param_1 + 0x8f7a),0x20f5,(char *)param_1,0,*(char *)(*(int *)(iVar10 + 0xb1) + 0x27) == '\0',
+                         -1,-1,0);
           }
-          cm_fn_006d6f70(0x2109,param_1,*(u8 *)(*(int *)(iVar10 + 0xb1) + 0x2e),
-                       *(u8 *)(*(int *)(iVar10 + 0xb1) + 0x27),0xffffffff,0xffffffff,0);
-          cm_fn_006d6f70(sVar9,param_1,*(u8 *)(*(int *)(iVar10 + 0xb1) + 0x2e),
-                       *(u8 *)(*(int *)(iVar10 + 0xb1) + 0x27),0xffffffff,0xffffffff,0);
+          cm_fn_006d6f70(*(char **)(param_1 + 0x8f7a),0x2109,(char *)param_1,*(u8 *)(*(int *)(iVar10 + 0xb1) + 0x2e),
+                       *(u8 *)(*(int *)(iVar10 + 0xb1) + 0x27),-1,-1,0);
+          cm_fn_006d6f70(*(char **)(param_1 + 0x8f7a),sVar9,(char *)param_1,*(u8 *)(*(int *)(iVar10 + 0xb1) + 0x2e),
+                       *(u8 *)(*(int *)(iVar10 + 0xb1) + 0x27),-1,-1,0);
         }
         else {
           if (param_2 == '\x03') {
@@ -116,27 +116,27 @@ switchD_006d13d1_caseD_25:
           if ((param_2 == '\x04') || (param_2 == '\x03')) {
             uVar7 = *(u32 *)(iVar10 + 0xb1);
 LAB_006d1565:
-            cm_fn_006cda20(uVar7,0);
+            cm_fn_006cda20((char *)param_1,(char *)uVar7,0);
           }
           break;
         default:
           if (sVar9 < 0) goto switchD_006d13d1_caseD_25;
           iVar5 = cm_fn_0090cfc0(9);
           if (iVar5 == 0) {
-            cm_fn_006d6f70(0x20df,param_1,0xffffffff,*(u8 *)(*(int *)(iVar10 + 0xb1) + 0x27),
-                         0xffffffff,0xffffffff,0);
+            cm_fn_006d6f70(*(char **)(param_1 + 0x8f7a),0x20df,(char *)param_1,-1,*(u8 *)(*(int *)(iVar10 + 0xb1) + 0x27),
+                         -1,-1,0);
             iVar5 = cm_fn_0090cfc0(3);
             if (iVar5 == 0) {
-              cm_fn_006d6f70(0x20e0,param_1,0xffffffff,*(u8 *)(*(int *)(iVar10 + 0xb1) + 0x27)
-                           ,0xffffffff,0xffffffff,0);
+              cm_fn_006d6f70(*(char **)(param_1 + 0x8f7a),0x20e0,(char *)param_1,-1,*(u8 *)(*(int *)(iVar10 + 0xb1) + 0x27)
+                           ,-1,-1,0);
             }
             if ((((param_2 == '\x06') || (param_2 == '\x03')) || (param_2 == '\x04')) ||
                (param_2 == '\x05')) {
               *(u8 *)(*(int *)(iVar10 + 0xb1) + 0x16) = 1;
               iVar5 = cm_fn_0090cfc0(7);
               if (iVar5 == 0) {
-                cm_fn_006d6f70(0x20d9,param_1,0xffffffff,
-                             *(u8 *)(*(int *)(iVar10 + 0xb1) + 0x27),0xffffffff,0xffffffff,0
+                cm_fn_006d6f70(*(char **)(param_1 + 0x8f7a),0x20d9,(char *)param_1,-1,
+                             *(u8 *)(*(int *)(iVar10 + 0xb1) + 0x27),-1,-1,0
                             );
               }
             }
@@ -150,26 +150,26 @@ LAB_006d1565:
               fVar11 = fVar2;
               if (iVar5 != iVar6) {
                 if (*(char *)(iVar5 + 0x19) < '\0') {
-                  fVar11 = fVar2 * 0.16666667 + 0.83;
+                  fVar11 = fVar2 * CM_GLOBAL(double,0x96a7a8) + CM_GLOBAL(double,0x96d0e8);
                 }
                 else {
-                  fVar11 = (fVar2 + 1.0) * 0.5;
+                  fVar11 = (fVar2 + CM_GLOBAL(double,0x967890)) * CM_GLOBAL(double,0x968968);
                 }
               }
-              cm_fn_00716450(fVar11);
+              cm_fn_00716450(iVar5,fVar11);
             }
             iVar5 = iVar5 + 0x1be;
             local_8 = local_8 + -1;
           } while (local_8 != 0);
           if ((param_2 == '\x04') || (param_2 == '\x03')) {
-            cm_fn_00716e10(1);
+            cm_fn_00716e10(*(int *)(iVar10 + 0xb1),1);
             uVar7 = *(u32 *)(iVar10 + 0xb1);
             goto LAB_006d1565;
           }
-          cm_fn_00716e10(0);
+          cm_fn_00716e10(*(int *)(iVar10 + 0xb1),0);
         }
         cVar3 = (char)local_10 + '\x01';
-        local_10 = CONCAT31(local_10._1_3_,cVar3);
+        local_10 = (u8)cVar3;
       } while (cVar3 < *(char *)(param_1 + 0x1a3));
     }
     cVar3 = '\0';
@@ -182,7 +182,7 @@ LAB_006d1565:
         piVar1 = *(int **)(iVar10 * 0xd0 + 0x904d + param_1);
         if ((((piVar1 == (int *)0x0) || (*piVar1 < DAT_00ae2364 + -0x10)) ||
             (DAT_00ae2364 <= *piVar1)) ||
-           ((*(char *)((int)piVar1 + 0x5f) == '\0' || (iVar6 = cm_fn_005fd210(piVar1), iVar6 != 0))))
+           ((*(char *)((int)piVar1 + 0x5f) == '\0' || (iVar6 = cm_fn_005fd210(CM_GLOBAL(void *,0xb63c98),(u32)piVar1), iVar6 != 0))))
         {
 LAB_006d163b:
           if (*(char *)(iVar5 + 0x9049) == '\0') {
@@ -197,7 +197,7 @@ LAB_006d163b:
               uVar7 = *(u32 *)(iVar5 + 0x20);
             }
             iVar5 = (int)(cVar3 == '\0');
-            uVar8 = cm_fn_006e1a40(iVar5);
+            uVar8 = cm_fn_006e1a40(param_1 + (int)(s8)local_10 * 0xd0 + 0x9032,iVar5);
             cm_fn_00897760(CM_GLOBAL(int, 0x00de1d08), uVar7, uVar8, iVar5);
             if ((char)local_10 == '\0') {
               *(u32 *)(param_1 + 0xf59e) = 0;

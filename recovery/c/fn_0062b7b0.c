@@ -2,7 +2,8 @@
    pseudocode by `cmre draft`. Unvalidated: check names, widths and signedness against
    `cmre show --asm`; acceptance comes only from `cmre test --c` and `cmre accept --c`. */
 #include "cmre.h"
-/* WIP: after five failed iterations, interior-call detail still differs (2 vs 4 stack bytes). */
+/* The original decrements two separate 16-bit fields; volatile word accesses
+   preserve their width and fault order at both optimization levels. */
 #ifndef NULL
 #define NULL ((void *)0)
 #endif
@@ -17,7 +18,7 @@
 #define DAT_00dd6ec8 CM_GLOBAL(volatile u32, 0x00dd6ec8)
 #define DAT_00dd6ecc CM_GLOBAL(volatile u32, 0x00dd6ecc)
 extern /* WARNING: Globals starting with '_' overlap smaller symbols at the same address */ u32 CM_THISCALL cm_fn_00418f60(int param_1,u32 *param_2,int param_3);
-extern u16 CM_THISCALL cm_fn_00456770(short *self,u32 param_1,u32 param_2);
+extern u32 CM_THISCALL cm_fn_00456770(short *self,u32 param_1,u32 param_2);
 extern u16 CM_FASTCALL cm_fn_0054a3f0(short *param_1);
 extern void CM_THISCALL cm_fn_0062c680(int *param_1,int *param_2);
 extern char CM_THISCALL cm_fn_0062d140(int *self,char param_1,int param_2,int param_3);
@@ -37,7 +38,7 @@ void CM_FASTCALL cm_fn_0062b7b0(int *param_1)
   u8 uVar3;
   char cVar4;
   short sVar5;
-  short *psVar6;
+  volatile u16 *psVar6;
   int iVar7;
   int iVar8;
   int iVar9;
@@ -53,18 +54,18 @@ void CM_FASTCALL cm_fn_0062b7b0(int *param_1)
     cm_fn_00944c94((void *)iVar10);
     param_1[10] = 0;
   }
+  psVar6 = (volatile u16 *)((u32)*(volatile u32 *)&param_1[1] + 0x2e);
   iVar10 = 0;
-  if (0 < param_1[2]) {
-    psVar6 = (short *)(param_1[1] + 0x2e);
+  if (0 < *(volatile s32 *)&param_1[2]) {
     do {
       psVar6[-1] = psVar6[-1] + -1;
       *psVar6 = *psVar6 + -1;
       iVar10 = iVar10 + 1;
       psVar6 = psVar6 + 0x18;
-    } while (iVar10 < param_1[2]);
+    } while (iVar10 < *(volatile s32 *)&param_1[2]);
   }
-  iVar10 = cm_fn_00456770((short *)0x00ae2c90,DAT_00dd6ecc,DAT_00dd6ec8);
-  if (((iVar10 != 0) && ((short)DAT_00ae2c90 == 0xb4)) &&
+  iVar10 = cm_fn_00456770((short *)0x00ae2c90,DAT_00dd6ec8,DAT_00dd6ecc);
+  if (((iVar10 != 0) && (CM_GLOBAL(volatile u16, 0x00ae2c90) == 0xb4)) &&
      (iVar11 = 0, iVar10 = DAT_00ae23bc, 0 < DAT_00ae2364)) {
     do {
       cm_fn_0062c680(param_1,(int *)iVar10);
@@ -92,7 +93,7 @@ void CM_FASTCALL cm_fn_0062b7b0(int *param_1)
         else {
           cVar2 = *(char *)(iVar10 + 0x3d);
           if ((((cVar2 == '\v') || (cVar2 == '\x0f')) || (cVar2 == '\r')) &&
-             (cVar2 = cm_fn_00418f60(0x00ad9c6c,(u32 *)iVar10,0), cVar2 == '\0')) {
+             (cVar2 = cm_fn_00418f60(CM_GLOBAL(volatile u32, 0x00ad9c6c),(u32 *)iVar10,0), cVar2 == '\0')) {
             if (*(char *)(*(int *)(iVar10 + 0x61) + 0xf) == '\x14') {
               iVar8 = cm_fn_0090cfc0(5);
               iVar9 = cm_fn_0090cfc0(2);

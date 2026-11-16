@@ -1,4 +1,11 @@
-/* WIP: void semantic test passes, but acceptance awaits the forwarded EAX
+/* HELD: this void boundary is not a proven recovery of the return contract.
+   A semantic test of it cannot establish that forwarded upper EAX is dead.
+   Declaring 007160e0 as returning u32 would capture its output, but would not
+   preserve its incoming EAX: plain C does not pass that register to a thiscall
+   callee. No arbitrary full return value or invented register input is used.
+   Acceptance requires original-instruction evidence of upper-EAX deadness or
+   an evidenced explicit boundary for every consumed incoming register.
+   Prior void semantic test passes, but acceptance awaits the forwarded EAX
    contract: caller006c54a0 returns it to006b9dd1. That outer caller overwrites
    AL, forwards EAX into byte arguments, and has further partial AX arithmetic.
    The last native007160e0 call clears AL only; upper EAX liveness is unproven.
@@ -14,12 +21,14 @@ extern void CM_THISCALL cm_fn_007160e0(u32 self, u32 zero);
 
 void CM_THISCALL cm_fn_006c50d0(u32 self)
 {
-    u8 work[4];
     u32 selected, argument, row, first, second, remaining;
     u8 side, mode, value;
     side = B(self + 0x8eaeu);
-    *(volatile u8 *)work = side;
-    argument = *(volatile u32 *)work;
+    /* 006c50d0 saves ECX in the local word. After four register saves
+       and two pushes, [ESP+18h] at 006c50e1 is that same word, not
+       uninitialized scratch: the byte store replaces only its low byte.
+       All instruction VAs here use the pinned image identified above. */
+    argument = (self & 0xffffff00u) | side;
     selected = cm_fn_006ceb90(self, (u8)argument, 5, 0);
     cm_fn_006f0630(selected);
     mode = side != 0 ? 1 : 10;

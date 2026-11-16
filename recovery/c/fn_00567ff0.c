@@ -1,59 +1,47 @@
 #include "cmre.h"
+extern void CM_CDECL cm_fn_005e8290(const char *, const char *, int);
+extern char * CM_CDECL cm_fn_0090d130(void);
+extern u32 CM_CDECL cm_fn_00944c9f(u32, u32, ...);
+extern u32 CM_CDECL cm_fn_00944cff(u32, u32, u32, void *, void *);
 
-/* Original frame: sub esp, 0x204; push ebx, esi, edi. Frame offset 0 (esp+0x30
-   after the error-path calls) holds the stack word whose low 16 bits become
-   the length on that path; no original instruction writes it before the read.
-   Scratch buffer A is [esp+0x10] (frame + 4). Scratch buffer B is [esp+0x110]
-   (frame + 0x104). */
-
-extern void cm_fn_005e8290(const char *message, const char *detail, int flags);
-extern u32 CM_CDECL cm_fn_0090d130(void);
-extern u32 CM_CDECL cm_fn_00944c9f(u32 destination, u32 format, ...);
-extern u32 CM_CDECL cm_fn_00944cff(u32 arg1, u32 arg2, u32 arg3, void *arg4,
-                                  void *arg5);
-
-u32 CM_THISCALL cm_fn_00567ff0(u32 self, u32 dest)
+void CM_THISCALL cm_fn_00567ff0(u32 *obj, u8 *dest)
 {
+    /* 0056805e reads frame+0, never written by this routine. The stale
+       caller stack word is not representable as a defined plain-C input.
+       Preferred-image VAs; SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86. */
     u8 frame[0x204];
-    u32 cur = *(volatile u32 *)(self + 4);
-    u32 limit = *(volatile u32 *)(self + 8);
-    u32 next = cur + 2;
-    s32 len;
-
-    if (next <= limit) {
-        u32 base = *(volatile u32 *)self;
-        len = (s16)*(volatile u16 *)(base + cur);
-        *(volatile u32 *)(self + 4) = next;
+    u32 pos = *(volatile u32 *)(obj + 1);
+    u32 end = *(volatile u32 *)(obj + 2);
+    u32 next = pos + 2;
+    s32 length;
+    u32 source, count, i;
+    if (next > end) {
+        char *text;
+        cm_fn_00944cff(0x9c3734, 0, 0, frame + 0x104, frame + 4);
+        text = cm_fn_0090d130();
+        cm_fn_00944c9f(0xae24d0, 0x9870e8, text, frame + 0x104, frame + 4, 0x90);
+        cm_fn_005e8290((const char *)0x9870e0, (const char *)0xae24d0, 0);
+        length = (s16)*(u16 *)frame;
+        CM_GLOBAL(u32, 0xb67a34) = 0;
     } else {
-        (void)cm_fn_00944cff(0x009c3734u, 0, 0, frame + 0x104, frame + 4);
-        /* Pushes 0x90, edx and eax are not consumed by cm_fn_0090d130 (void).
-           They are the varargs of the following cm_fn_00944c9f call. */
-        u32 ret_0090d130 = cm_fn_0090d130();
-        (void)cm_fn_00944c9f(0x00ae24d0u, 0x009870e8u, ret_0090d130,
-                             frame + 0x104, frame + 4, 0x90u);
-        cm_fn_005e8290((const char *)0x009870e0u, (const char *)0x00ae24d0u, 0);
-        CM_GLOBAL(volatile u32, 0x00b67a34u) = 0;
-        len = (s16)*(volatile u16 *)frame;
+        u32 base = *(volatile u32 *)obj;
+        length = (s16)*(volatile u16 *)(base + pos);
+        *(volatile u32 *)(obj + 1) = next;
     }
-
-    {
-        /* Copy len bytes from object base + this->+4 to dest: len >> 2 dwords
-           (rep movsd), then len & 3 bytes (rep movsb), forward in order. */
-        u32 count = (u32)len;
-        u32 dwords = count >> 2;
-        u32 i;
-        u32 src = *(volatile u32 *)self;
-        src += *(volatile u32 *)(self + 4);
-        for (i = 0; i < dwords; i++) {
-            *(volatile u32 *)(dest + i * 4u) = *(volatile u32 *)(src + i * 4u);
-        }
-        for (i = 0; i < (count & 3u); i++) {
-            *(volatile u8 *)(dest + dwords * 4u + i) =
-                *(volatile u8 *)(src + dwords * 4u + i);
-        }
-        *(volatile u32 *)(self + 4) = *(volatile u32 *)(self + 4) + count;
+    source = *(volatile u32 *)obj;
+    pos = *(volatile u32 *)(obj + 1);
+    source += pos;
+    count = (u32)length >> 2;
+    for (i = 0; i < count; ++i) {
+        *(volatile u32 *)dest = *(volatile u32 *)source;
+        dest += 4;
+        source += 4;
     }
-
-    /* EAX still holds the sign-extended length at the return. */
-    return (u32)len;
+    count = (u32)length & 3;
+    for (i = 0; i < count; ++i) {
+        *dest++ = *(volatile u8 *)source;
+        ++source;
+    }
+    pos = *(volatile u32 *)(obj + 1);
+    *(volatile u32 *)(obj + 1) = pos + (u32)length;
 }

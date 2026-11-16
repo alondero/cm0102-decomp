@@ -1,7 +1,9 @@
 #include "cmre.h"
 
-/* WIP: REPNE SCASB, REP MOVSD and REP MOVSB at 007ae7fa-007ae81b use the
-   incoming DF; plain C cannot observe/control DF, and the listing has no CLD. */
+/* Preferred-image VAs 007ae7fa-007ae81b, SHA-256
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86:
+   string instructions depend on DF. These forward loops require DF clear;
+   plain C cannot represent the incoming flag when it is set. */
 
 extern void cm_fn_005e8290(const char *message, const char *detail, int flags);
 extern u32 CM_THISCALL cm_fn_005fde40(u32 self, u32 value);
@@ -16,10 +18,10 @@ u32 CM_THISCALL cm_fn_007ae7d0(u32 self, u32 value)
     u32 result = cm_fn_005fde40(CM_GLOBAL(volatile u32, 0x00b63c98u), value);
     if (result == 0 || *(volatile u8 *)result == 0) {
         (void)cm_fn_00944cff(0x00a701b0u, 0, 0,
-                             (void *)(scratch + 0x104), (void *)(scratch + 4));
+                             (void *)(scratch + 0x100), (void *)scratch);
         u32 converted = cm_fn_0090d130();
         (void)cm_fn_00944c9f(0x00ae24d0u, 0x009870e8u, converted,
-                             (u32)(scratch + 4), (u32)(scratch + 0x104), 0x131u);
+                             (u32)(scratch + 0x100), (u32)scratch, 0x131u);
         cm_fn_005e8290((const char *)0x009870e0u,
                        (const char *)0x00ae24d0u, 0);
         CM_GLOBAL(volatile u32, 0x00b67a34u) = 0;

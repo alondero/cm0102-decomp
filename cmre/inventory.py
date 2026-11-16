@@ -45,14 +45,22 @@ def _check_pins() -> None:
             raise SystemExit(f"Pinned inventory hash differs: {env.rel(path)}")
 
 
-@cache
 def load() -> Inventory:
-    cache_key = "-".join(h[:12] for h in env.INVENTORY_SHA256.values())
-    cache_path = env.ANALYSIS / "cmre" / f"inventory-{cache_key}.json"
+    # Validate actual bytes on every call, including in-process cache hits.
+    _check_pins()
+    identity = (env.ANALYSIS, env.FUNCTIONS_TSV, env.CALLS_TSV, env.MODULES_JSON,
+                tuple(env.INVENTORY_SHA256.items()))
+    return _load_cached(identity)
+
+
+@cache
+def _load_cached(identity: tuple) -> Inventory:
+    # Full declared digests, not truncated prefixes, distinguish cache versions.
+    cache_key = env.digest_bytes(json.dumps(list(env.INVENTORY_SHA256.values())).encode())
+    cache_path = env.ANALYSIS / "cmre" / f"inventory-v2-{cache_key}.json"
     if cache_path.exists():
         raw = json.loads(cache_path.read_text(encoding="utf-8"))
     else:
-        _check_pins()
         functions = {}
         with env.FUNCTIONS_TSV.open(encoding="utf-8") as f:
             for r in csv.DictReader(f, delimiter="\t"):
@@ -84,3 +92,9 @@ def load() -> Inventory:
         modules={int(k, 16): v for k, v in raw["modules"].items()},
         entries_sorted=sorted(functions),
     )
+
+
+# Preserve the public functools cache controls used by callers and tests.
+load.cache_clear = _load_cached.cache_clear
+load.cache_info = _load_cached.cache_info
+load.cache_parameters = _load_cached.cache_parameters

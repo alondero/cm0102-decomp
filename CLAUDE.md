@@ -13,8 +13,9 @@
 - A PreToolUse guard (`cmre/guard.py`, wired in `.claude/settings.json`) blocks
   edits to protected or generated paths, redirection into them, bare `python`,
   pushes without a passing publication receipt, and name-based process kills.
-  Requested source-only pushes follow `docs/agent/PUBLICATION.md`; receipts bind
-  the exact commit and current push URL/visibility. A scan is not user authorization.
+  Source-only pushes (standing authorization in AGENTS.md: push reviewed batches
+  at each handoff) follow `docs/agent/PUBLICATION.md`; receipts bind the exact
+  commit and current push URL/visibility.
   It reads whole command text, so keep push syntax out of commit messages and
   heredocs (use `git commit -F <file>`). It asks before edits under `cmre/` and
   `tests/`; the user's authorization for a tooling task covers those prompts.

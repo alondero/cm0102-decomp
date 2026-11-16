@@ -53,6 +53,12 @@ drained eight times in 19 hours and then sat idle for nine.
 8. **Report byte movement per supply item.** A lane that moves no bytes into
    `ready` or `lifted` after two attempts is reported and replaced with the next
    item, not reviewed again.
+9. **Commit and push accepted work.** After the handoff check, commit the
+   accepted sources and reviewed tooling with explicit paths and push them
+   ([PUBLICATION.md](PUBLICATION.md)); during a run longer than a few hours,
+   do the same at a quiet point while the farm keeps running. Adam's standing
+   authorization covers this, so the session finishes with its work on
+   `origin/main`.
 
 ## OpenCode coordinator (default)
 

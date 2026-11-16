@@ -151,8 +151,9 @@ The legacy command without `--parent` still selects the latest successful start.
 Matching completed full pytest evidence may be reused; changed declared inputs
 invalidate it. Integrity always runs. Differential inventory evidence is separate.
 On failure report exact failures and
-whether they existed at preflight. Commit and push when requested, following
-[PUBLICATION.md](PUBLICATION.md) for reviewed source-only batches and exact-commit/remote
+whether they existed at preflight. After a green check, commit and push the
+reviewed source-only batch under the standing authorization in AGENTS.md,
+following [PUBLICATION.md](PUBLICATION.md) for scans and exact-commit/remote
 checks. Supplied content and raw evidence remain local. `cmre task publish` remains
 local acceptance, separate from Git publication.
 

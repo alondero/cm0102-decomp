@@ -1,9 +1,17 @@
 # Publish reconstructed source and retain local evidence
 
-Use for requested commits, Git pushes, release-content review, or a publication
-scanner finding. User authorization covers the specified batch; a scan receipt
-is a content prerequisite, not authorization to publish. Recovery acceptance via
+Use for commits, Git pushes, release-content review, or a publication scanner
+finding. Adam's standing authorization (AGENTS.md) covers committing and pushing
+reviewed source-only batches as work progresses: the parent session commits and
+pushes accepted sources and reviewed tooling at every handoff, and at batch
+boundaries of a long run, without waiting for a separate request. A scan receipt
+is the content prerequisite for each push. Recovery acceptance via
 `cmre task publish` is independent of Git publication.
+
+Paths that cannot be published yet stay in the working tree: unaccepted drafts
+stay untracked, and accepted sources awaiting a listing review or remediation
+are listed by exact path in `.git/info/exclude` with a dated comment. Report the
+count left local in the handoff.
 
 ## Eligible content and local inputs
 
@@ -73,8 +81,7 @@ approve a binary package.
    a tag or another namespace. Changed commits, destination URLs
    or visibility require a new scan. Force/mirror/all-ref pushes remain excluded.
    After a main push, run `py -3.13 -m cmre publication verify-remote
-   BRANCH` to check the remote main and the scanned destination. No push is needed
-   merely to finish an instruction or recovery change. For a same-name PR push,
+   BRANCH` to check the remote main and the scanned destination. For a same-name PR push,
    first obtain the single `git remote get-url --push --all origin` result and
    compare that push URL and visibility with the exact-commit receipt. Compare
    `git ls-remote PUSH_URL refs/heads/BRANCH` with `git rev-parse BRANCH`; the

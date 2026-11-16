@@ -1,65 +1,48 @@
-/* WIP: output memory mismatch, case 12, after five failed test iterations. */
 #include "cmre.h"
 
 void CM_CDECL cm_fn_00933fa0(void *arg1, void *arg2,
-                             s32 arg3, s32 arg4, s32 arg5, s32 arg6)
+                             s32 arg3, s32 arg4, s32 arg5, volatile s32 arg6)
 {
-    volatile u32 *array = *(volatile u32 * volatile *)((volatile u8 *)arg1 + 0x3c8);
-    volatile u32 *table = *(volatile u32 * volatile *)((volatile u8 *)arg2 + 0x18);
+    volatile u32 *A = *(volatile u32 * volatile *)((volatile u8 *)arg1 + 0x3c8);
+    volatile u32 *T = *(volatile u32 * volatile *)((volatile u8 *)arg2 + 0x18);
+    volatile u32 *home2 = (volatile u32 *)(void *)&arg2;
+    volatile u32 *home4 = (volatile u32 *)(void *)&arg4;
+    s32 index6 = arg6;
     u32 masked;
-    s32 difference_a;
-    s32 difference_b;
-    s32 table_delta;
-    s32 table_b;
-    s32 combined;
-    s32 bound;
-    s32 threshold;
-    u32 value;
-    u32 array4;
-    u32 array3;
-    u32 array6;
-    u32 array5;
-    u32 table3;
-    u32 table4;
-    u32 table5;
+    s32 dA, dB, t3, t4m3, m5, combined, threshold, bound, tmp;
 
-    masked = (table[arg6] + 0x20u) & 0xffffffc0u;
-    array4 = array[arg4];
-    table3 = table[arg3];
-    array3 = array[arg3];
-    difference_a = (s32)(array4 - array3);
-    array6 = array[arg6];
-    array5 = array[arg5];
-    difference_b = (s32)(array6 - array5);
-    if ((s32)(masked - table3) < 0xc0 ||
-        difference_a <= -8 || difference_b <= -8)
-        goto store_masked;
-
-    table4 = table[arg4];
-    table5 = table[arg5];
-    table_delta = (s32)(table4 - table3);
-    table_b = (s32)(masked - table5);
-    combined = (s32)((u32)table_b + (u32)table_delta);
-    threshold = (s32)((u32)difference_a + (u32)difference_b -
-                      ((table_b >= 0x20) ? 0x20u : 7u));
-    if (combined < threshold)
-        goto store_masked;
-
-    bound = (s32)((u32)difference_a + (u32)difference_b + 0x39u);
-    if (combined > bound) {
-        value = table[arg3] + 0x40u;
-        table[arg3] = value;
-        table[arg6] = masked;
-        return;
-    }
-
-    threshold = table_b >= 0x20 ? 25 : 0;
-    if (table_b > (s32)((u32)difference_b - (u32)threshold) ||
-        table_delta <= (s32)((u32)difference_a + 0x19u))
-        goto store_masked;
-
-    table[arg3] = table[arg3] + 0x40u;
-    masked += 0x40u;
+    masked = (T[index6] + 0x20u) & 0xffffffc0u;
+    dA = (s32)A[arg4];
+    t3 = (s32)T[arg3];
+    dA = (s32)((u32)dA - A[arg3]);
+    dB = (s32)A[index6];
+    *home2 = (u32)dA;
+    dB = (s32)((u32)dB - A[arg5]);
+    if ((s32)(masked - (u32)t3) < 0xc0) goto store_masked;
+    if (dA <= -8) goto store_masked;
+    if (dB <= -8) goto store_masked;
+    tmp = (s32)((u32)dB + (u32)dA);
+    t4m3 = (s32)((u32)T[arg4] - (u32)t3);
+    m5 = (s32)(masked - T[arg5]);
+    combined = (s32)((u32)m5 + (u32)t4m3);
+    *home4 = (u32)combined;
+    threshold = (s32)((u32)tmp + ((m5 >= 0x20) ? 0u : 0x19u) - 0x20u);
+    combined = (s32)*home4;
+    if (combined < threshold) goto add_40;
+    bound = (s32)((u32)*home2 + (u32)dB + 0x39u);
+    if (combined <= bound) goto middle;
+    T[arg3] = T[arg3] + 0x40u;
+    T[arg6] = masked;
+    return;
+middle:
+    tmp = (m5 >= 0x20) ? 0x19 : 0;
+    dB = (s32)((u32)dB - (u32)tmp);
+    if (m5 > dB) goto store_masked;
+    tmp = (s32)((u32)*home2 + 0x19u);
+    if (t4m3 <= tmp) goto store_masked;
+    T[arg3] = T[arg3] + 0x40u;
+add_40:
+    masked = masked + 0x40u;
 store_masked:
-    table[arg6] = masked;
+    T[arg6] = masked;
 }
