@@ -896,3 +896,23 @@ def test_inspect_retries_a_receipt_read_during_its_atomic_replace(tmp_path, monk
     monkeypatch.setattr(Path, 'read_text', denied_once)
     assert worker.read_json(receipt) == {'state': 'finished'}
     assert calls
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows delete-pending sharing denial')
+def test_receipt_read_retries_the_crt_open_denial_without_winerror(tmp_path, monkeypatch):
+    # CI 2026-11-16 (PR #45): io.open goes through the CRT, so a delete-pending
+    # receipt raises errno 13 with winerror None and read_json() gave up at once.
+    receipt = tmp_path / 'receipt.json'
+    receipt.write_text(json.dumps({'state': 'running'}), encoding='utf-8')
+    real = Path.read_text
+    calls = []
+
+    def denied_once(self, *args, **kwargs):
+        if self.name == 'receipt.json' and not calls:
+            calls.append(self)
+            raise PermissionError(13, 'Permission denied')
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'read_text', denied_once)
+    assert worker.read_json(receipt) == {'state': 'running'}
+    assert calls
