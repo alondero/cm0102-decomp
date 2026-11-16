@@ -91,7 +91,9 @@ def build(source: Path, entry_symbol: str, workdir: Path, opt: str = "-O0", extr
     if source.suffix == ".c":
         # The emulator maps the whole test stack; do not introduce GCC's external
         # __chkstk_ms dependency when allocating a frame larger than one page.
-        cc += [opt, "-mno-stack-arg-probe", "-fno-asynchronous-unwind-tables", "-ffreestanding", "-fno-builtin", f"-I{env.ROOT / 'recovery/include'}"]
+        # -mno-sse3: float-to-integer casts use FISTP under a chopping control word,
+        # as the original __ftol does; Unicorn mis-stores out-of-range FISTTP (ADR 0010).
+        cc += [opt, "-mno-sse3", "-mno-stack-arg-probe", "-fno-asynchronous-unwind-tables", "-ffreestanding", "-fno-builtin", f"-I{env.ROOT / 'recovery/include'}"]
     log = [cc]
     r = env.run_tool(cc)
     if r.returncode:
