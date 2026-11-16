@@ -25,9 +25,11 @@
        rec+0x20 (L+0x54) 79-byte payload 0x007dff52 rep movsd/movsw/movsb
    The two frame holes inside rec (rec+0x10..+0x13 = L+0x44..0x47 and
    rec+0x6f = L+0xa3) are never written by any instruction of 0x007dfdc0, so
-   they are left uninitialized here exactly as the original leaves them: no
-   zeroing, no shortened copy, and the 112-byte extent passed to
-   0x0068d0d0 is preserved.
+    this C allocation leaves them uninitialized, but does NOT transport the
+    original physical stack bytes. Fidelity of the 112-byte call boundary
+    remains UNKNOWN. Zeroing or shortening the copy would invent behavior.
+    Resolving this requires an authorized original-stack transport boundary
+    or original-instruction proof that every exposed stale byte is unobserved.
 
    Note on the cm_fn_00557280 call (0x007e009b): the listing loads ECX from
    0x00ae28f0, but the callee's recovered C signature is CM_STDCALL with
@@ -168,8 +170,13 @@ void CM_THISCALL cm_fn_007dfdc0(void *self, volatile void *param_1, const void *
 
   /* 0x007dff5b ECX = [self+7]; 0x007dff50 count = 0x70; 0x007dff5a src = &rec.
      The original's EDX at the call is the physical leftover of the
-     cm_fn_00417c10 call at 0x007dfebe; no instruction of 0x007dfdc0 produces
-     it, so no C value can be cited for that input. */
+      cm_fn_00417c10 call at 0x007dff27 (not 0x007dfebe). No instruction
+      between 0x007dff2c and 0x007dff5f writes EDX. The zero below is an
+      UNRESOLVED fidelity defect, not an evidenced register value.
+      Both blockers above refer to preferred-image VAs in CM0102 3.9.68,
+      SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+      Plain C here has no physical-stack or post-call EDX transport primitive;
+      do not treat a passing semantic gate as resolving either blocker. */
   cm_fn_0068d0d0((volatile u8 *)(unsigned long)
                    *(volatile u32 *)(void *)((u8 *)self + 7),
                  0u, (const u8 *)(void *)(L + 0x34), (s16)0x70);

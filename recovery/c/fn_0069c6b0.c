@@ -3,7 +3,18 @@
 /* Pinned SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86:
    VA 0069c6b0 loads EAX=0x1388 and VA 0069c6b5 calls 00945610.
    An ordinary C call cannot represent its caller-frame allocation and return
-   slot relocation. The local array below is not an equivalent boundary. */
+   slot relocation. The local array below is not an equivalent boundary.
+   Confirmed against original instructions at preferred-image VAs:
+   00945610 saves ECX; 00945616 derives the pre-CALL ESP; 0094561c-0094562e
+   descend in 0x1000 steps and read DWORDs at 00945627; 00945630-00945634
+   read the final allocation boundary. 00945636 changes ESP, 00945638
+   restores ECX, and 0094563a-0094563e relocate and consume the return word.
+   For this caller, allocation size 0x1388 gives probes at entry ESP-0x1000
+   and entry ESP-0x1388. 0069c7d2 releases 0x1388 before 0069c7d8 ret 0xc.
+   BLOCKED: plain C here has no evidenced caller-frame/helper equivalent.
+   An ordinary extern call or touches relative to scratch would not preserve
+   those addresses and return-slot behavior. Requires an authorized ABI
+   boundary outside this source-only repair; gate success cannot resolve it. */
 extern u32 CM_THISCALL cm_fn_00785830(void *, u32);
 extern char *cm_fn_0066f4e0(char *, const char *, ...);
 extern u32 CM_THISCALL cm_fn_004ae8a0(u32, const char *, u32, u32);

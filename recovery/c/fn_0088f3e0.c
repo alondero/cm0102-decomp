@@ -137,9 +137,13 @@ void CM_THISCALL cm_fn_0088f3e0(void *self)
             }
             else {
                 /* P2 = scratch+0x00 (arg2 of the slot call, `rounds`),
-                   P1 = scratch+0x04 (arg3, `round_flag`). */
+                   P1 = scratch+0x04 (arg3, `round_flag`).
+                   In the pinned binary identified above, preferred-image VA
+                   0x0088f536 pushes EBX (rec, saved at 0x0088f407) as the
+                   third stack argument; 0x0088f53a puts alloc in ECX for
+                   the constructor call at 0x0088f53c. */
                 made = cm_fn_00522e00((u32)(u32)alloc, (u32)self, 2,
-                                      (u32)(u32)alloc,
+                                      (u32)(u32)rec,
                                       (s16)*(u32 *)(scratch + 0x00),
                                       *(u32 *)((u8 *)self + 4),
                                       result,

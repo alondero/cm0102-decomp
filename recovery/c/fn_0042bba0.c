@@ -17,8 +17,18 @@
    (0x0042bcc1..0x0042bcf5). The tail then reads all twelve ID slots and the
    ratios of groups 4..10 unconditionally (0x0042bd2d..0x0042be19), so a group
    with no qualifying candidate contributes whatever stale bytes those stack
-   slots already held. They are therefore declared here with no initializer and
-   are never clamped or filled in. */
+   slots already held.
+
+   UNRESOLVED FIDELITY DEFECT: the uninitialized C arrays below do NOT model
+   those original stack bytes. 0x0042bba0 reserves but does not clear the frame;
+   0x0042bca5 can bypass both selection stores (0x0042bce5/0x0042bcf5), yet
+   0x0042bd37 and 0x0042bd2d/0x0042bd3b still read their slots. C indeterminate
+   values are not a faithful substitute. A single scratch array or volatile
+   qualification cannot recover the incoming original stack contents either.
+   Correcting this requires an authorized original-stack execution/input
+   boundary, unavailable through the current plain-C entry/header contract.
+   Do not accept this candidate as repaired on the strength of a gate pass.
+   No default initialization or compiler-frame-layout workaround is justified. */
 #include "cmre.h"
 
 #ifndef NULL

@@ -20,6 +20,18 @@ u32 CM_CDECL cm_fn_009064a0(u32 person,u32 type)
     CM_FS(u32,0) = (u32)&frame;
     eax = cm_fn_0077bbe0(scratch,0,0);
     frame.state = 0;
+    /* CM0102 3.9.68, SHA-256
+       0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+       Preferred-image VAs 009064a0/009064a2/009064ad push 12 bytes,
+       009064b5 reserves 0x2e0, and 009064bb..009064c1 make constructor
+       ECX = entry ESP - 0x2ec.  0077bbfa saves that ECX in ESI;
+       0077bc63 returns ESI in EAX (0077bc72: ret 8).
+       The null branch 009064de -> 009065f6 returns it unchanged.
+       Translate the escaping scratch address to the original stack address,
+       not the compiler's scratch placement. On i386 the frame builtin is
+       the saved EBP slot, four bytes below entry ESP. */
+    if (!person)
+        eax = (u32)__builtin_frame_address(0) + 4u - 0x2ecu;
     if (person) {
         eax = *(volatile u32 *)(person + 0x39);
         if (eax) {

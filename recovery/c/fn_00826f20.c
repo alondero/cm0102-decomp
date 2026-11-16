@@ -74,16 +74,22 @@ u32 cm_fn_00826f20(u32 param_1, u32 param_2)
 
   /* 0x00826fdb: signed 16-bit field, /10 by 0x66666667 magic then +3000, stored
      as a 16-bit word at +0xa. The listing performs the whole sequence twice
-     with a fresh load of the field each time. */
+     with a fresh load of the field each time.
+     Pointer DWORD reloads at preferred-image VAs 0x00826fe9, 0x0082700d
+     and 0x00827043 must survive overlapping WORD stores at 0x00826ffb
+     and 0x0082701f (binary SHA-256 as above). Volatile accesses retain
+     these widths and their order even if a destination aliases +0x69. */
   {
-    s16 v = *(s16 *)(void *)(param_2 + 0x80u);
+    s16 v = *(volatile s16 *)(void *)(param_2 + 0x80u);
     s32 q = (s32)v / 10;
-    *(u16 *)(void *)(*(u32 *)(void *)(param_1 + 0x69u) + 0xau) = (u16)(q + 3000);
+    u32 destination = *(volatile u32 *)(void *)(param_1 + 0x69u);
+    *(volatile u16 *)(void *)(destination + 0xau) = (u16)(q + 3000);
   }
   {
-    s16 v = *(s16 *)(void *)(param_2 + 0x80u);
+    s16 v = *(volatile s16 *)(void *)(param_2 + 0x80u);
     s32 q = (s32)v / 10;
-    *(u16 *)(void *)(*(u32 *)(void *)(param_1 + 0x69u) + 0x8u) = (u16)(q + 3000);
+    u32 destination = *(volatile u32 *)(void *)(param_1 + 0x69u);
+    *(volatile u16 *)(void *)(destination + 0x8u) = (u16)(q + 3000);
   }
 
   /* 0x00827023: movsx word [esi+0x80] -> dword temp [esp+0xc];
@@ -92,12 +98,16 @@ u32 cm_fn_00826f20(u32 param_1, u32 param_2)
      The live ST0 is exactly the MSVC lowering of a long-double expression whose
      value is converted to 64-bit and then narrowed to AX at 0x00827047. */
   {
-    s32 iv = (s32)*(s16 *)(void *)(param_2 + 0x80u);
+    s32 iv = (s32)*(volatile s16 *)(void *)(param_2 + 0x80u);
     long double t;
+    long long converted;
+    u32 destination;
     *(s32 *)(void *)(scratch + 0x000) = iv;
     t = (long double)*(s32 *)(void *)(scratch + 0x000) * CM_GLOBAL(double, 0x00968e00)
         + CM_GLOBAL(double, 0x0096a5f0);
-    *(u16 *)(void *)(*(u32 *)(void *)(param_1 + 0x69u) + 0xcu) = (u16)(long long)t;
+    converted = (long long)t;
+    destination = *(volatile u32 *)(void *)(param_1 + 0x69u);
+    *(volatile u16 *)(void *)(destination + 0xcu) = (u16)converted;
   }
 
   *(u8 *)(void *)(param_1 + 0x59u) = 0x14;

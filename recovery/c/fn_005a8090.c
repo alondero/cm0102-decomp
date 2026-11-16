@@ -30,7 +30,11 @@ extern u32 CM_CDECL cm_fn_0053e990(u32 person, u32 first, u32 second, u32 third,
 extern char *CM_CDECL cm_fn_0066f4e0(char *buffer, char *format, ...);
 extern unsigned long long CM_THISCALL cm_fn_00785830(void *self, u32 index);
 
-void CM_STDCALL cm_fn_005a8090(u32 arg1, u32 arg2, u32 arg3)
+/* Return transport in the pinned image named above: preferred-image VAs
+   0x005a820e/0x005a8210 and 0x005a834c/0x005a834e send zero EAX to
+   0x005a836f; otherwise 0x005a836a supplies EAX. The epilogue at
+   0x005a836f-0x005a8379 leaves EAX unchanged. */
+u32 CM_STDCALL cm_fn_005a8090(u32 arg1, u32 arg2, u32 arg3)
 {
     u32 frame[0x16c0 / 4];
     u8 *const base = (u8 *)frame;
@@ -85,7 +89,7 @@ void CM_STDCALL cm_fn_005a8090(u32 arg1, u32 arg2, u32 arg3)
             u32 g2;
 
             g2 = CM_GLOBAL(volatile u32, 0x00ae23bc);
-            (void)cm_fn_004ae8a0((int)arg3, (u8 *)(base + 0x18), 0x7da,
+            return cm_fn_004ae8a0((int)arg3, (u8 *)(base + 0x18), 0x7da,
                                  (int)(110u * v0 + g2));
         }
     } else {
@@ -128,8 +132,9 @@ void CM_STDCALL cm_fn_005a8090(u32 arg1, u32 arg2, u32 arg3)
             u32 g2;
 
             g2 = CM_GLOBAL(volatile u32, 0x00ae23bc);
-            (void)cm_fn_004ae8a0((int)arg3, (u8 *)(base + 0x18), 0x7da,
+            return cm_fn_004ae8a0((int)arg3, (u8 *)(base + 0x18), 0x7da,
                                  (int)(110u * v0 + g2));
         }
     }
+    return 0;
 }

@@ -36,7 +36,12 @@ extern u32 CM_THISCALL cm_fn_005acbe0(u32 self, u32 first_day, u32 first_year,
                                       u32 last_day, u32 last_year, u32 club_arg,
                                       u32 output_arg, u32 key_arg, u32 filter_arg,
                                       u32 side_arg);
-extern void cm_fn_005e8290(const char *param_1, const char *param_2, int param_3);
+/* Opaque EAX boundary: 005c82df's EAX reaches ret 8 via 005c82ed /
+   005c85b2 without an EAX write, just as 005c85ac's EAX does on the
+   non-null path. Evidence: preferred-image VAs in the pinned binary
+   SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+   No meaning or constant return value is assumed for either callee. */
+extern u32 cm_fn_005e8290(const char *param_1, const char *param_2, int param_3);
 extern u32 CM_THISCALL cm_fn_0068d020(u32 self);
 extern u32 CM_THISCALL cm_fn_0068d040(u32 self);
 extern u32 CM_THISCALL cm_fn_0068d1b0(u32 self);
@@ -48,7 +53,7 @@ extern char *cm_fn_0090d130(void *a, void *b, u32 c);
 extern u32 CM_CDECL cm_fn_00944c9f(u32 destination, u32 format, ...);
 extern u32 CM_CDECL cm_fn_00944cff(u32 a1, u32 a2, u32 a3, void *a4, void *a5);
 
-void CM_THISCALL cm_fn_005c8260(void *this_arg, u8 *rec, u32 flag)
+u32 CM_THISCALL cm_fn_005c8260(void *this_arg, u8 *rec, u32 flag)
 {
     /* One scratch allocation for the whole original frame (L+0 .. L+0x237) with the
        SEH registration record (L+0x238 prev, L+0x23c handler, L+0x240 state) directly
@@ -62,6 +67,7 @@ void CM_THISCALL cm_fn_005c8260(void *this_arg, u8 *rec, u32 flag)
 
     u8 *L = fr.scratch;
     u8 *ctx = (u8 *)this_arg;
+    u32 result;
 
     /* SEH prologue: push -1; push 0x95a277; push fs:[0]; fs:[0] = esp  */
     fr.seh_state = 0xffffffffu;
@@ -89,7 +95,7 @@ void CM_THISCALL cm_fn_005c8260(void *this_arg, u8 *rec, u32 flag)
                            (u32)(L + 0x138), (u32)(L + 0x38), 0x10adu);
         }
         /* 005c82d4..005c82df: 5e8290(0x009870e0, 0x00ae24d0, 0) */
-        cm_fn_005e8290((const char *)0x009870e0, (const char *)0x00ae24d0, 0);
+        result = cm_fn_005e8290((const char *)0x009870e0, (const char *)0x00ae24d0, 0);
         CM_GLOBAL(u32, 0x00b67a34) = 0;
         /* 005c82ed: jmp 0x5c85b2 (skips push esi / pop esi) */
     }
@@ -250,7 +256,8 @@ void CM_THISCALL cm_fn_005c8260(void *this_arg, u8 *rec, u32 flag)
             obj = *(u32 *)(rec + 0x65);
             if (obj != 0) {
                 u32 vt = *(u32 *)(u32)obj;               /* 005c8573 */
-                ((void (CM_THISCALL *)(void *, u32))(u32)vt)((void *)(u32)obj, 1u);
+                u32 target = *(u32 *)(u32)vt;           /* 005c8577: [edx], slot 0 */
+                ((void (CM_THISCALL *)(void *, u32))target)((void *)(u32)obj, 1u);
             }
             *(u32 *)(rec + 0x65) = 0;                    /* 005c8579 */
         }
@@ -265,10 +272,11 @@ void CM_THISCALL cm_fn_005c8260(void *this_arg, u8 *rec, u32 flag)
             *(volatile u8 *)&fr.seh_state = 2;           /* 005c8597 (byte) */
             *(u32 *)(u32)(base + slot * 4u) = 0;         /* 005c859f */
             *(u32 *)rec = 0;                             /* 005c85a6 */
-            cm_fn_0068d040((u32)(L + 0x10));             /* 005c85ac */
+            result = cm_fn_0068d040((u32)(L + 0x10));    /* 005c85ac */
         }
     }
 
     /* 005c85b2..005c85c9: restore fs:[0] and return */
     CM_FS(void *, 0) = (void *)fr.seh_prev;
+    return result; /* 005c85b1..005c85c9 do not write EAX. */
 }

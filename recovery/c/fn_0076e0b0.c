@@ -15,8 +15,9 @@
      only the byte is computed; they are handed to the callee as the 32-bit slot word.
    - L+0x10 (WORDL10) is written only at 0x0076e0f7 (entry arg6 != 0) and at 0x0076e19f
      (the 0x0076d560 lookup).  It is read unconditionally at 0x0076e268 and 0x0076e279, so
-     the local below stays uninitialized exactly like the original stack home; no witness
-     value is invented for it.
+      the local below is NOT bound to the original entry-ESP-0x108 home. This remains
+      an unresolved fidelity defect: an independent uninitialized C automatic cannot
+      reproduce the incoming word. No witness value or default is invented.
    - EAX at the RET is live (dword): 0 when the scan ran out with ebp == 0, otherwise the
      arg6 dword, or the low dword of cm_fn_00944c94's 64-bit result. */
 #include "cmre.h"
@@ -32,6 +33,13 @@ typedef struct {
 
 extern u32 CM_THISCALL cm_fn_0068d040(u32 self);
 extern u32 CM_THISCALL cm_fn_0068d1b0(u32 self);
+/* Bound-target instruction review only (not composition/runtime proof):
+   CM0102 3.9.68 SHA-256
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86,
+   preferred-image VAs 0x0068d1b0..0x0068d1c2: loads/stores use ECX as base;
+   only EAX, EDX and flags are written, on both RET paths. Thus ECX after the
+   calls at 0x0076e28f/0x0076e2ad equals their receiver, cur. The CL write
+   at 0x0076e29a preserves its high 24 bits before PUSH ECX at 0x0076e2a1. */
 /* 0x0076e186 loads ECX (the entry receiver) and 0x0076e193 leaves ESP where it was before
    the two argument pushes, so this callee takes ECX and pops its 8 argument bytes. */
 extern u32 CM_THISCALL cm_fn_0076d560(u32 self, u32 *param_1, u32 param_2);
@@ -61,7 +69,7 @@ u32 CM_THISCALL cm_fn_0076e0b0(u32 self, u32 *param_1, u32 param_2, u32 param_3,
     u32 grp[3];                    /* L+0x20..L+0x2b matched objects of this group */
     u8 obj[0xe0];                  /* L+0x2c..L+0x10b emitted object (built by 0x0077bbe0) */
     s16 w10;                       /* L+0x10 WORDL10, only ever touched as a word home */
-#define W10 (*(volatile s16 *)&w10) /* the original reads/writes the stack word itself */
+#define W10 (*(volatile s16 *)&w10) /* unresolved: not the original physical home */
     u32 result;
     u32 ent;                       /* esi: scanned object */
     u32 emit;
@@ -122,6 +130,7 @@ u32 CM_THISCALL cm_fn_0076e0b0(u32 self, u32 *param_1, u32 param_2, u32 param_3,
                             }
                         }
                         if (emit) {
+                            u32 eax_word;
                             /* 0x0076e1e3: (re)initialise the emitted object. */
                             cm_fn_0077bbe0(obj, 0x1d, 0);
                             frame.state = 0;                    /* 0x0076e1f7 */
@@ -131,7 +140,7 @@ u32 CM_THISCALL cm_fn_0076e0b0(u32 self, u32 *param_1, u32 param_2, u32 param_3,
                             cm_fn_00785790(obj, 3, param_4);
                             cm_fn_00785790(obj, 4, (u32)(s32)(s8)n);
                             cm_fn_00785790(obj, 5, param_2);
-                            cm_fn_00785790(obj, 6, (u32)(s32)W10);
+                            eax_word = (u32)cm_fn_00785790(obj, 6, (u32)(s32)W10);
                             /* 0x0076e279: signed word compare of WORDL10 with 4. */
                             if ((W10 < 4) && (cur != 0)) {
                                 u32 f = *(volatile u32 *)(cur + 2);
@@ -142,10 +151,13 @@ u32 CM_THISCALL cm_fn_0076e0b0(u32 self, u32 *param_1, u32 param_2, u32 param_3,
                                     while ((node = cm_fn_0068d1b0(cur)) != 0) {
                                         u32 q = *(volatile u32 *)node;      /* 0x0076e298 */
                                         u32 v = *(volatile u32 *)q;         /* 0x0076e29e */
-                                        cm_fn_00785790(obj, slot, v);
+                                        cm_fn_00785790(obj, (cur & 0xffffff00u) | slot, v);
                                         slot = (u8)(slot + 1);              /* inc bl */
                                     }
                                 }
+                                /* Final 0x0068d1b0 return was zero; TEST at
+                                   0x0076e2b2 does not change EAX. */
+                                eax_word = 0;
                                 /* 0x0076e2b6 restores bl from L+3. */
                             }
                             if ((s8)n <= 3) {                   /* 0x0076e2be */
@@ -156,16 +168,21 @@ u32 CM_THISCALL cm_fn_0076e0b0(u32 self, u32 *param_1, u32 param_2, u32 param_3,
                                     do {
                                         u32 e = *pe;            /* 0x0076e2ce */
                                         u32 f;
-                                        cm_fn_00785790(obj, slot, *(volatile u32 *)e);
+                                        /* Original 3.9.68, hash above, preferred-image
+                                           VAs 0x0076e2ba/0x0076e2d0 and
+                                           0x0076e2e4/0x0076e2f9/0x0076e30e:
+                                           byte writes preserve the current EAX high
+                                           bits; each CALL supplies the next EAX. */
+                                        eax_word = (u32)cm_fn_00785790(obj, (eax_word & 0xffffff00u) | slot, *(volatile u32 *)e);
                                         slot = (u8)(slot + 1);
                                         f = *(volatile u32 *)(e + 4);
-                                        cm_fn_00785790(obj, slot, *(volatile u32 *)(f + 0x33));
+                                        eax_word = (u32)cm_fn_00785790(obj, (eax_word & 0xffffff00u) | slot, *(volatile u32 *)(f + 0x33));
                                         slot = (u8)(slot + 1);
                                         f = *(volatile u32 *)(e + 8);
-                                        cm_fn_00785790(obj, slot, *(volatile u32 *)(f + 0x33));
+                                        eax_word = (u32)cm_fn_00785790(obj, (eax_word & 0xffffff00u) | slot, *(volatile u32 *)(f + 0x33));
                                         slot = (u8)(slot + 1);
                                         f = *(volatile u32 *)(e + 0xc);
-                                        cm_fn_00785790(obj, slot, *(volatile u32 *)(f + 0x33));
+                                        eax_word = (u32)cm_fn_00785790(obj, (eax_word & 0xffffff00u) | slot, *(volatile u32 *)(f + 0x33));
                                         slot = (u8)(slot + 1);
                                         pe = pe + 1;
                                     } while (--cnt != 0);

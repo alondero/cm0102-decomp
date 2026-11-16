@@ -31,10 +31,20 @@
    The first copy loop at 0x008fcd39..0x008fcd60 runs exactly 26 times (edx =
    0x1a at 0x008fcd34, `dec edx; jne`) and walks L+0x6c downwards to L+0x08,
    i.e. first-array slots 25..0, regardless of how many entries the scan
-   actually wrote.  The slots the scan did not write keep whatever the original
-   left on the stack: this translation therefore leaves the frame object
-   uninitialized and copies all 26 slots, reversing them, with no padding, no
-   zeroing and no clamp to the live counters. */
+   actually wrote.
+
+   UNRESOLVED FIDELITY BOUNDARY (same pinned binary and preferred-image VAs):
+   0x008fcc4b/0x008fcc4d permit skipping the scan entirely; 0x008fcba4 and
+   0x008fcba8 initialize only the counters.  Thus 0x008fcd3f can export the
+   preexisting DWORDs at entry_esp-0x340 through entry_esp-0x2dc.
+   An uninitialized C automatic object does NOT bind those bytes to that
+   original entry stack range, and its indeterminate values are not a faithful
+   substitute.  The object below preserves adjacency only, not entry contents.
+   Resolving this requires an authorized entry-stack capture/binding boundary
+   before a compiler prologue can overwrite those bytes.  The supplied plain-C
+   interface has no such input.  Zeroing, clamping the copy, guessing a frame
+   offset, or manufacturing a stack argument would change original behaviour.
+   No behavioural repair is claimed here, even if the current gate passes. */
 
 #include "cmre.h"
 
@@ -76,7 +86,7 @@ struct frame_008fcb90 {
 
 u32 CM_THISCALL cm_fn_008fcb90(u32 self)
 {
-  struct frame_008fcb90 L; /* uninitialized: original stale stack slots */
+  struct frame_008fcb90 L; /* unresolved entry-stack binding; see above */
   u32 idx;
   u32 off;
   u32 h;

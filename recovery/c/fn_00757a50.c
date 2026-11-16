@@ -66,10 +66,19 @@ void CM_THISCALL cm_fn_00757a50(u32 *self, u32 *arg1, u32 *arg2, u32 arg3,
       DAT_00b67a34 = 0;
       cm_fn_005cc7d0();
       cm_fn_005a8f60();
-      /* 0x00757ae2 push -1 / 0x00757ae4 call 0x00945934.  The callee is a plain
-         cdecl boundary, not declared noreturn and given no invented cleanup, so
-         a returning callee keeps the original returning stack effect.  The
-         listing falls through to 0x00757ae9, which the code below does. */
+      /* UNRESOLVED returning-boundary fidelity defect.
+         Evidence: pinned binary SHA-256 stated above, preferred-image VAs
+         0x00757ae2 PUSH -1; 0x00757ae4 CALL 0x00945934; 0x00757ae9
+         continues without caller cleanup. A returning cdecl boundary leaves
+         ESP = E-4; this ordinary C call does NOT preserve that stack effect.
+         Consequently 0x00757b93 reads the original return address, not arg1.
+         If the later realloc failure also returns, ESP becomes E-8 and that
+         load instead reads the final scratch DWORD at E+0x208.
+         The shifted scratch addresses, subsequent argument reads, POP ESI
+         (0x00757c5e), and RET 0x14 (0x00757c65) all need an owned stack/
+         continuation boundary. Plain C formal substitution cannot reproduce
+         the corrupted return. Do not treat a passing gate as resolving this
+         hold or invent noreturn, a trap, or cleanup to hide it. */
       cm_fn_00945934(0xffffffffu);
     }
     self[1] = 0x14;
@@ -92,7 +101,11 @@ void CM_THISCALL cm_fn_00757a50(u32 *self, u32 *arg1, u32 *arg2, u32 arg3,
       DAT_00b67a34 = 0;
       cm_fn_005cc7d0();
       cm_fn_005a8f60();
-      /* 0x00757b88 push -1 / 0x00757b8a call 0x00945934; same contract. */
+      /* UNRESOLVED: same pinned-image evidence at preferred-image VAs
+         0x00757b88 PUSH -1; 0x00757b8a CALL 0x00945934; 0x00757b8f
+         continues without cleanup. This independently leaves one extra DWORD
+         (two if the earlier exit returned). See the returning-boundary hold
+         above; this ordinary C call does not implement that continuation. */
       cm_fn_00945934(0xffffffffu);
     }
     self[1] = self[1] + 0x14;

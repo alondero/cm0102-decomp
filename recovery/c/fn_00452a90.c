@@ -5,14 +5,17 @@
 
    x87 / __ftol representation (the held concern at 0x00452be4..0x00452c42):
    - 0x00452be4 and 0x00452c1d call 0x007c2150, whose result is delivered live in
-     ST0.  It is declared `long double` here, so the plain-C call keeps the x87
-     value (ST0), its 80-bit precision and the FPU depth of the original.
+      ST0.  It is declared `long double` here to represent that result.
    - 0x00452be9 calls 0x00945640 (MSVC __ftol) with that ST0 argument still live;
      the listing narrows the 64-bit EDX:EAX result with `mov bl, al`.  Per
      docs/agent/C.md that lowering is written as a `(long long)` conversion of a
      long double at the original call site, and the 64-bit result is then
      narrowed to the byte the listing actually uses (AL).  The ST0 value is dead
-     after that conversion in the original, so nothing is reordered there.
+      after that conversion in the original.
+      UNRESOLVED AUDIT GAP: this required plain-C lowering is not an explicit
+      call to the original helper and is not proof of its FPU/control-word
+      behavior. The listing establishes the call and AL use, not equivalence
+      of compiler-emitted conversion instructions. Gate success is insufficient.
    - the second call's ST0 result (0x00452c1d) is kept as a `long double` local
      and stays live across the faultable F32 load at 0x00452c22, the FCOMP at
      0x00452c28 against the original qword constant at 0x00968948, the FCOM at
@@ -63,6 +66,7 @@ u32 CM_THISCALL cm_fn_00452a90(int param_1, int *param_2)
   u32 v;
   u32 h;
   u32 obj;
+  u32 stats;                    /* EDI; distinct from the record saved in ESI */
   u32 r;
   u8 b;
   long double f;
@@ -121,10 +125,11 @@ u32 CM_THISCALL cm_fn_00452a90(int param_1, int *param_2)
           }
           if (hit) {
             /* 0x00452bbe: receiver [0xb74350] in ECX */
-            obj = cm_fn_007c3920(DAT_00b74350, h, 6);
-            if (obj != 0) {
+            /* 0x00452bcc saves EAX in EDI, not ESI (obj, 0x00452b42). */
+            stats = cm_fn_007c3920(DAT_00b74350, h, 6);
+            if (stats != 0) {
               /* 0x00452be4: ST0 = long double result */
-              f = cm_fn_007c2150(obj, 1, 6.5f /* 0x40d00000 */);
+              f = cm_fn_007c2150(stats, 1, 6.5f /* 0x40d00000 */);
               /* 0x00452be9 call 0x00945640 (__ftol); 0x00452bf2 mov bl, al.
                  The byte scratch at [esp+0x20] is read back as a dword and
                  masked with 0xff, i.e. only the low byte of the 64-bit
@@ -133,7 +138,7 @@ u32 CM_THISCALL cm_fn_00452a90(int param_1, int *param_2)
               /* 0x00452bf8..0x00452c0d: signed byte field / 2 */
               if ((int)(u32)b >= (int)*(s8 *)(rec + 0x10) / 2) {
                 /* 0x00452c1d: ST0 = long double result, kept live */
-                f = cm_fn_007c2150(obj, 0x11, 6.5f /* 0x40d00000 */);
+                f = cm_fn_007c2150(stats, 0x11, 6.5f /* 0x40d00000 */);
                 /* 0x00452c22 fld dword [esi+0x1f1] / 0x00452c28 fcomp qword
                    [0x968948].  C3 (ah & 0x40) is set for equal *and*
                    unordered, so both take the store path; `m != m` carries the

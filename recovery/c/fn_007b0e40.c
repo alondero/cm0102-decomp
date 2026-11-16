@@ -1,6 +1,6 @@
 /* fn_007b0e40 - player_search.cpp, preferred image VA 0x007b0e40, image base 0x00400000.
    Pinned binary: CM0102 3.9.68 cm0102.exe, SHA-256
-   0c78e7da6d0bcb4603fa179449bbe6d1c627a22c445d14d489bd9bff86d14d489b (see AGENTS.md pin).
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
 
    Frame map. L = esp immediately after `sub esp,0x320` at 0x007b0e55 (the four saved
    registers pushed at 0x007b0e5b..0x007b0e5e occupy L-16..L-4). Every `lea/mov [esp+d]`
@@ -22,8 +22,12 @@
    +0x05, byte 0 at +0x09, byte 0 at +0x0a, byte 0xff-or-[eax+0x113] at +0x0c.
    Comparator byte +0x0b (L+0x33) has no store anywhere in this body; the original
    reads that uninitialised stack byte at 0x007b10d6 (`mov dl, byte [esp+0x47]`, esp=L-20)
-   and copies it to the stored row at +0x2b (0x007b10da). It is left uninitialised here
-   on purpose: zero-padding it would fabricate initialisation the original never does. */
+    and copies it to the stored row at +0x2b (0x007b10da).
+    UNRESOLVED FIDELITY BLOCKER: leaving a new C allocation uninitialised does not
+    bind it to that original preexisting stack byte. The supplied plain-C boundary
+    provides neither the incoming original ESP nor its frame storage. Do not zero
+    this byte or claim that passing the gate proves its provenance. Intervening
+    callee write extents remain separate boundaries. */
 
 #include "cmre.h"
 
@@ -127,9 +131,10 @@ u32 CM_FASTCALL cm_fn_007b0e40(u32 *param_1)
   cm_fn_0054a110((u16 *)(L + 0x18));          /* 0x007b0e61 */
   frame.state = 0;                            /* 0x007b0e70 */
   cm_fn_0054a110((u16 *)(L + 0x20));          /* 0x007b0e77 */
+  uFlags = T32(0x1fe);                        /* 0x007b0e7c, while SEH state is 0 */
   frame.state = 1;                            /* 0x007b0e8a */
 
-  if ((T32(0x1fe) & 0x4000000u) != 0) {       /* 0x007b0e7c..0x007b0e9b */
+  if ((uFlags & 0x4000000u) != 0) {           /* 0x007b0e84..0x007b0e9b */
     uVar2 = 0;
     goto done;
   }
@@ -216,9 +221,14 @@ u32 CM_FASTCALL cm_fn_007b0e40(u32 *param_1)
           cm_fn_005cc7d0();                                       /* 0x007b1197 */
           cm_fn_005a8f60();                                       /* 0x007b119c */
           cm_fn_00945934(0xffffffffu);                            /* 0x007b11a1..0x007b11a3 */
-          /* If 0x00945934 ever returned, the original would resume at 0x007b11b0,
-             outside this 872-byte body (0x007b0e40..0x007b11a7); that continuation is
-             not part of the recovered range, so no value is claimed for it. */
+          /* UNRESOLVED FIDELITY BLOCKER: CALL at preferred-image VA 0x007b11a3
+             returns to 0x007b11a8, not 0x007b11b0. The supplied pinned listing
+             ends before that continuation and does not prove nonreturn.
+             The inherited return below is NOT faithful: it fabricates EAX=0
+             and leaves fs:[0] linked to this C frame. Neither goto done,
+             a noreturn annotation, a trap nor a loop is an evidenced repair.
+             Requires original continuation/nonreturn evidence and, if returning,
+             an authorized original-frame/continuation binding. */
           return 0;
         }
       }
@@ -232,7 +242,7 @@ u32 CM_FASTCALL cm_fn_007b0e40(u32 *param_1)
                      (u16 *)(L + 0x18));      /* 0x007b1087..0x007b1097 */
       cm_fn_00417c10((u32 *)(pRec + 0x18), (u32 *)(L + 0x48),
                      (u16 *)(L + 0x20));      /* 0x007b109c..0x007b10a9 */
-      pRec[0x20] = L8(0x24);                  /* 0x007b10ae..0x007b10b7 */
+      pRec[0x20] = L8(0x28);                  /* 0x007b10ae: ESP=L-0x10, +0x38 */
       uEdx = L32(0x29);                       /* 0x007b10ba */
       *(u32 *)(pRec + 0x21) = uEdx;           /* 0x007b10be */
       uEdx = L32(0x2d);                       /* 0x007b10c1 */

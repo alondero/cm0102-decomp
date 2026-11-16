@@ -7,7 +7,15 @@
      L+0x100  second byte buffer
      L+0x200  100 DWORD slots; only the first `bl` entries are written by the
               first scan, yet 0x005e9b7b copies 16 of them unconditionally.
-              They stay uninitialized here exactly as in the original frame. */
+               FIDELITY BLOCKER: the uninitialized C array below does not
+               represent the concrete incoming stack bytes. At 0x005e9a80
+               the frame is reserved without initialization; 0x005e9b2b can
+               skip all slot stores, while 0x005e9b7b-0x005e9b89 still copies
+               sixteen slots after the explicit selection boundary.
+               A faithful replacement needs an authorized original-frame
+               input/binding, not zeros, invented initialization, or reliance
+               on the compiler's local-frame placement. This candidate remains
+               unresolved even if the current differential gate passes. */
 #include "cmre.h"
 
 /* Callees stay explicit boundaries.  cm_fn_004afbd0 takes three stack arguments

@@ -4,7 +4,13 @@
 
    ABI evidence from the original instructions:
      * 0x0057fd85 `mov esi, ecx` -- the object arrives in ECX before any write
-       to it, so the routine is thiscall with the object first.
+        to it, so the object is the first register input.
+      * 0x0057fd96 `mov dx, [esi+0xb8]` and 0x0057fda4
+        `add dx, [esi+0x40]` replace only the low half of incoming EDX;
+        0x0057fdb5 `push edx` passes its preserved upper half to
+        0x0057fdb7 `call 0x00549ef0`. No preceding instruction writes EDX.
+        Use fastcall to expose that second register input explicitly while
+        retaining ECX and the original two stack arguments (ret 8).
      * 0x0057ffc9 `ret 8` -- two 4-byte stack arguments, read at 0x0057fd7d
        ([esp+0x230] == esp0+4) and 0x0057fe26 / 0x0057ffa1 ([esp+0x23c]).
      * Result width: the 0x0057ff1f exit is `xor al, al`, i.e. only AL is
@@ -68,7 +74,7 @@ extern unsigned long long CM_CDECL cm_fn_009452ca(u32 arg4);
 /* SEH handler installed at 0x0057fd62 (push 0x9589a6) */
 #define CM_SEH_HANDLER_009589a6 ((void *)0x009589a6)
 
-u8 CM_THISCALL cm_fn_0057fd60(u8 *self, u32 *param_2, int param_3)
+u8 CM_FASTCALL cm_fn_0057fd60(u8 *self, u32 incoming_edx, u32 *param_2, int param_3)
 {
   volatile struct {
     void *prev;
@@ -110,7 +116,7 @@ u8 CM_THISCALL cm_fn_0057fd60(u8 *self, u32 *param_2, int param_3)
     frame.state = 0;                                 /* 0x0057fdae [esp+0x230] */
     (void)cm_fn_00549ef0(res,                          /* ecx = lea [esp+0x20] */
                          ((u32)p2lo & 0xffff0000u) | (u32)ax_word,
-                         (u32)(s32)(s16)wordsum);      /* 0x0057fdb7 */
+                         (incoming_edx & 0xffff0000u) | (u32)wordsum); /* 0x0057fdb7 */
   }
 
   /* 0x0057fdbc..0x0057fdcf */

@@ -28,15 +28,20 @@
 #include "cmre.h"
 
 extern u32 CM_THISCALL cm_fn_0051c800(u32 self, volatile u32 round_arg);
-extern u32 CM_THISCALL cm_fn_00522e00(u32 self, u32 owner, s16 count, u32 clubs, s16 rounds,
-                                       u32 competition, u32 schedule, u16 year, u8 flag_a,
-                                       u8 flag_b, u16 round_flag, u8 flag_c, u32 builder,
+/* Caller-side DWORD carriers: 0x00423aca/0x00423add push the full output
+   slots; 0x00423abf replaces only DX before 0x00423ad2 pushes EDX.
+   Evidence: preferred-image VAs in the pinned binary identified above.
+   This does not establish the virtual target's output-write widths. */
+extern u32 CM_THISCALL cm_fn_00522e00(u32 self, u32 owner, s16 count, u32 clubs, u32 rounds,
+                                       u32 competition, u32 schedule, u32 year, u8 flag_a,
+                                       u8 flag_b, u32 round_flag, u8 flag_c, u32 builder,
                                        u32 numbered, u32 value_38, u32 club_flags);
 extern void cm_fn_005e8290(const char *param_1, const char *param_2, int param_3);
-/* Legacy boundary (original code only).  The three pushes at 0x00423b2f,
-   0x00423b34, 0x00423b35 are its arguments: they are removed by the single
-   `add esp,0x24` at 0x00423b5b together with 0x00423b46 (3 dwords) and
-   0x00423b56 (3 dwords), so it is a caller-cleanup three argument callee. */
+/* Legacy boundary (original code only). The stack words pushed at
+   0x00423b2f/0x00423b34/0x00423b35 remain live across 0x00423b36 and are
+   also formatting arguments at 0x00423b46: no intervening cleanup.
+   0x00423b5b removes six formatting words plus three error-report words.
+   Evidence: preferred-image VAs in the pinned binary identified above. */
 extern char *cm_fn_0090d130(u32 arg1, u32 arg2, u32 arg3);
 extern u32 CM_CDECL cm_fn_00944c9f(u32 destination, u32 format, ...);
 extern unsigned long long CM_CDECL cm_fn_00944cf1(u32 size);
@@ -91,6 +96,8 @@ void CM_THISCALL cm_fn_00423880(u8 *self)
   u32 vt3c;
   u32 sel;             /* edi : virtual slot +0x3c result */
   u32 alloc;
+  unsigned long long alloc_regs; /* EDX:EAX boundary carrier */
+  u32 out_a, out_b, year_bits, competition;
   u32 res;
   u32 rec;
   u32 now;
@@ -244,20 +251,26 @@ void CM_THISCALL cm_fn_00423880(u8 *self)
   sel = ((cm_vt3c)(*(u32 volatile *)(vt3c + 0x3c)))
             ((u32)self, 8, (u32)(scratch + L_OUT_A), (u32)(scratch + L_OUT_B), 0);
 
-  alloc = (u32)cm_fn_00944cf1(0xb2);                 /* push 0xb2; call 0x944cf1 */
+  alloc_regs = cm_fn_00944cf1(0xb2);                /* 0x00423aa2: retain EDX:EAX */
+  alloc = (u32)alloc_regs;
   WR32(scratch + L_COUNT, alloc);                    /* mov [esp+0x10],eax */
   frame.state = 0;                                   /* mov [esp+0x240],ebx (ebx=0) */
   if (alloc == 0) {
     res = 0;                                         /* xor eax,eax */
   }
   else {
+    out_b = RD32(scratch + L_OUT_B);                 /* 0x00423abb */
+    year_bits = ((u32)(alloc_regs >> 32) & 0xffff0000u)
+                | RD16(self + 0x40);                /* 0x00423abf: mov dx */
+    competition = RD32(self + 4);                  /* 0x00423acb */
+    out_a = RD32(scratch + L_OUT_A);                 /* 0x00423ad3 */
     res = cm_fn_00522e00(alloc, (u32)self, 7, (u32)(scratch + L_RANK),
-                         (s16)RD32(scratch + L_OUT_A),
-                         RD32(self + 4),
+                         out_a,
+                         competition,
                          sel,
-                         RD16(self + 0x40),
+                         year_bits,
                          8, 1,
-                         (u16)RD32(scratch + L_OUT_B),
+                         out_b,
                          0x14, 1, 0, 0, 0);
   }
   rec = RD32(self + 0xc);                            /* mov edx,[esi+0xc] */
@@ -268,7 +281,8 @@ void CM_THISCALL cm_fn_00423880(u8 *self)
     cm_fn_00944cff(0x00989d04u, 0, 0,
                    (void *)(u32)(scratch + L_BUF2), (void *)(u32)(scratch + L_BUF1));
     str = cm_fn_0090d130((u32)(scratch + L_BUF2), (u32)(scratch + L_BUF1), 0x611);
-    cm_fn_00944c9f(0x00ae24d0u, 0x009870e8u, (u32)str);
+    cm_fn_00944c9f(0x00ae24d0u, 0x009870e8u, (u32)str,
+                   (u32)(scratch + L_BUF2), (u32)(scratch + L_BUF1), 0x611);
     cm_fn_005e8290((const char *)0x009870e0u, (const char *)0x00ae24d0u, 0);
     CM_GLOBAL(u32, 0x00b67a34) = 0;
   }

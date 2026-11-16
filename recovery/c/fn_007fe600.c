@@ -1,18 +1,14 @@
 /* fn_007fe600 -- scrman.cpp, preferred-image VA 0x007fe600, 1307 bytes, `ret 0x14`
    (5 stack arguments, receiver in ECX; image base 0x00400000).
 
-   HELD obligation resolved -- "incoming DF controls the original REP direction;
-   plain C has no DF transport":
-   The body contains no CLD and no STD (checked over the complete listing
-   0x007fe600..0x007feb18).  Its only string/block primitives are
-   `rep stosd` (0x007fe88c), `repne scasb` (0x007fe8c2) and
-   `rep movsd`/`rep movsb` (0x007fe8dd/0x007fe8e4).  Under the Win32/x86 calling
-   convention the direction flag is clear on function entry and must be clear on
-   return, and this routine neither sets nor restores it, so no caller can
-   transport a DF value through this boundary: every REP above runs forward
-   (EDI/ESI increasing).  The plain-C equivalents used below (a forward dword of
-   zero stores, a forward NUL scan, a forward byte copy) therefore produce exactly
-   the original transport; there is no residual direction state to model.
+   Direction evidence: CM0102 3.9.68, SHA-256
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+   Preferred-image VA 0x007fe872 calls 0x00944cf1; no subsequent instruction
+   clears DF before REP STOSD at 0x007fe88c. Sample architectural flags after
+   that call, not on entry. No call or DF write separates that REP from
+   REPNE SCASB (0x007fe8c2), REP MOVSD (0x007fe8dd), REP MOVSB (0x007fe8e4).
+   All four therefore use the same sampled direction. This is target-level
+   state transport, not a claim about any callee's implementation or ABI.
 
    Slot record: base = self + 0x300 * (s16)self[0x382a] (0x007fe60c..0x007fe61f).
    Node records are 0x300-byte heap blocks (0x007fe86d/0x007fe872), zeroed by
@@ -85,7 +81,7 @@ u32 CM_THISCALL cm_fn_007fe600(u32 self, u32 arg1, u32 arg2, u32 arg3,
   u32 cur;                    /* edx from 0x007fe6a2 */
   u32 head, next, old, node, p;
   u32 i, n;
-  u32 pri;
+  u32 pri, step, src, dst, remaining;
 
   flag = 0;                   /* 0x007fe618 */
   /* 0x007fe62d..0x007fe684 */
@@ -211,26 +207,44 @@ u32 CM_THISCALL cm_fn_007fe600(u32 self, u32 arg1, u32 arg2, u32 arg3,
 
   /* 0x007fe86d/0x007fe872: malloc(0x300) */
   node = (u32)cm_fn_00944cf1(0x300);
+  step = (__builtin_ia32_readeflags_u32() & 0x400u) ? 0xffffffffu : 1u;
   /* 0x007fe882: [esp+0x228] with ESP one dword low == the third argument's home */
   pri = arg3;
-  /* 0x007fe879..0x007fe88c: REP STOSD, 0xc0 dwords of zero (forward, DF=0) */
+  /* 0x007fe879..0x007fe88c: REP STOSD, including DF=1. */
   p = node;
   for (i = 0xc0; i != 0; i--) {
     ST32(p, 0, 0);
-    p += 4;
+    p += step * 4u;
   }
   ST32(node, 0x00, arg1);                 /* 0x007fe89c */
   ST32(node, 0x04, arg4);                 /* 0x007fe8a5 */
   ST32(node, 0x0c, arg5);                 /* 0x007fe8af */
   ST32(node, 0x08, arg2);                 /* 0x007fe8b2 */
   ST32(node, 0x10, pri);                  /* 0x007fe8bf */
-  /* 0x007fe8b5..0x007fe8e4: strlen(0x009c3730)+1 bytes to node+0x1fc
-     (REPNE SCASB then REP MOVSD/REP MOVSB, both forward with DF=0) */
-  n = 0;
+  /* 0x007fe8c2: REPNE SCASB with ECX initially 0xffffffff. */
+  p = ADDR_009C3730;
+  remaining = 0xffffffffu;
   do {
-    n++;
-  } while (LD8(ADDR_009C3730, n - 1) != 0);
-  for (i = 0; i < n; i++) ST8(node, 0x1fc + i, LD8(ADDR_009C3730, i));
+    u8 b = LD8(p, 0);
+    p += step;
+    remaining--;
+    if (b == 0) break;
+  } while (remaining != 0);
+  n = ~remaining;                         /* 0x007fe8c4 */
+  src = p - n;                           /* 0x007fe8cc, even when DF=1 */
+  dst = node + 0x1fc;
+  for (i = n >> 2; i != 0; i--) {         /* 0x007fe8dd */
+    u32 value = LD32(src, 0);
+    ST32(dst, 0, value);
+    src += step * 4u;
+    dst += step * 4u;
+  }
+  for (i = n & 3u; i != 0; i--) {         /* 0x007fe8e4 */
+    u8 value = LD8(src, 0);
+    ST8(dst, 0, value);
+    src += step;
+    dst += step;
+  }
 
   /* 0x007fe8e8 */
   if (pri != 0) {

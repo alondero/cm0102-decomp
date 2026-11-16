@@ -10,7 +10,10 @@ extern unsigned long long CM_CDECL cm_fn_0090cfc0(u32 entry_eax, u32 entry_edx, 
    ordinary no-argument C calls. Emitted precision/fault order still needs
    inspection. 006f9fd2/006fa128/006fa131 change AL only: preserve the
    other EAX bits explicitly, including when wrappers forward all of EAX. */
-u32 CM_THISCALL cm_fn_006f9f90(u32 self, u32 x, u32 y, u32 mode,
+/* 006f9fd8 reads the BYTE at the caller-owned mode home; 006fa000/
+   006fa01f and 006fa06b overwrite its DWORD. Keep that home observable
+   through self aliases, including the heading reload at 006fa0bb. */
+u32 CM_THISCALL cm_fn_006f9f90(u32 self, u32 x, u32 y, volatile u32 mode,
                                  float a, float b, u8 *out)
 {
     u8 ox = *(volatile u8 *)(self + 0x102);
@@ -21,24 +24,28 @@ u32 CM_THISCALL cm_fn_006f9f90(u32 self, u32 x, u32 y, u32 mode,
     s32 limit;
     if (*(volatile s16 *)(self + 0x19a) == target)
         return (y & 0xffffff00u) | 1u;
-    if ((u8)mode) {
+    if (*(volatile u8 *)&mode) {
         u32 receiver = *(volatile u32 *)(self + 0x19e);
         u32 r = cm_fn_006cb9b0(receiver, self, x, y);
         s32 skill = *(volatile s8 *)(self + 0x10b);
         long double t;
         s32 first, second, dx, dy;
-        if ((u8)r)
-            t = (long double)(skill * 4) + (long double)a * CM_GLOBAL(float, 0x968a78) + CM_GLOBAL(float, 0x96d7b0);
-        else
-            t = (long double)(skill * 5) + (long double)a * CM_GLOBAL(float, 0x968a78) + CM_GLOBAL(float, 0x96d664);
+        if ((u8)r) {
+            mode = (u32)(skill * 4);
+            t = (long double)(s32)mode + (long double)a * CM_GLOBAL(float, 0x968a78) + CM_GLOBAL(float, 0x96d7b0);
+        } else {
+            mode = (u32)(skill * 5);
+            t = (long double)(s32)mode + (long double)a * CM_GLOBAL(float, 0x968a78) + CM_GLOBAL(float, 0x96d664);
+        }
         first = (s32)(long long)t;
         oy = *(volatile u8 *)(self + 0x103);
         dy = (s8)oy - (s8)y;
         if (dy < 0) dy = -dy;
         ox = *(volatile u8 *)(self + 0x102);
         dx = (s8)ox - (s8)x;
+        mode = (u32)((s8)dy * 9);
         if (dx < 0) dx = -dx;
-        index = (s8)dy * 9 + (s8)dx;
+        index = (s32)mode + (s8)dx;
         t = ((long double)*(volatile float *)(0xa15e44u + (u32)(index * 4)) - (long double)b) * CM_GLOBAL(float, 0x96afb0) - CM_GLOBAL(float, 0x969560);
         second = (s32)(long long)t;
         limit = (s32)((u32)first - (u32)second);
