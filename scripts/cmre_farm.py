@@ -50,9 +50,17 @@ COORDINATOR_MODEL = 'minimax-coding-plan/MiniMax-M3.1-Flash'
 # Runtime-library x87 helpers: 7 of 10 production audit defects (control word, ST0, caller
 # slots the gate cannot see), 99 functions / 18 KB of supply (2026-11-13).
 DEFAULT_SKIP_RANGES = ((0x00940000, 0x00953000),)
-# Events that wake a waiting coordinator (`wait`).
-NOTABLE_EVENTS = ('farm-exit', 'open-defect', 'model-unavailable', 'model-limited', 'supply-empty',
+# Events that wake a waiting coordinator (`wait`). Supply events are absent on purpose: a
+# continuous farm idles and rescans by itself, and waking a coordinator on supply-empty led it
+# to stop the farm with 20 workers still running (2026-11-15 21:27, then nine idle hours).
+NOTABLE_EVENTS = ('farm-exit', 'open-defect', 'model-unavailable', 'model-limited', 'farm-crash-loop',
                   'request-failed', 'acceptance-quarantined', 'hint-evidence-needed', 'fix-evidence-needed')
+# Settings `set` may change on a running farm (RUN/control.json), applied on the next tick.
+CONTROL_KEYS = ('workers', 'audit_workers', 'min_bytes', 'max_bytes', 'ladder', 'audit_model',
+                'confirm_model', 'include_held', 'skip_ranges', 'attempt_minutes', 'stall_minutes')
+SUPPLY_KEYS = ('min_bytes', 'max_bytes', 'include_held', 'skip_ranges')   # changes that reselect the frontier
+RESTART_SECONDS = 30         # supervisor pause before relaunching a farm that died
+MAX_RESTARTS_PER_HOUR = 5    # more than this is a crash loop: stop and wake the coordinator
 # OpenCode Go has a 5-hour usage limit per account (HTTP 429, hit 2026-11-13 evening); it pauses
 # every model of that provider until it resets. Without a reset time, retry after this long.
 DEFAULT_LIMIT_SECONDS = 900
@@ -102,6 +110,8 @@ class FarmConfig:
     stall_minutes: float = 15   # DEFAULT_STALL_MINUTES
     confirm_model: str | None = None
     skip_ranges: tuple = ()
+    continuous: bool = False       # idle and rescan on empty supply; only STOP or the deadline ends the run
+    rescan_seconds: float = 120    # how often an empty frontier is fetched again
 
 
 def parse_ranges(text):
@@ -530,15 +540,50 @@ def _validate_worker_hints(before, after):
     difftest.validate_hints({**dimensions, 'c_hints': new.get('c_hints', {})}, worker=True)
 
 
+def _gate_summary(diff):
+    """What a failed differential run says: counts, coverage and the first mismatch."""
+    mismatches = diff.get('mismatches') or []
+    text = (f"{len(mismatches)} mismatches, coverage {diff.get('coverage')}, "
+            f"inconclusive {diff.get('inconclusive')}/{diff.get('cases')}")
+    if mismatches:
+        text += '; first: ' + json.dumps(mismatches[0], default=str)[:500]
+    elif diff.get('uncovered'):
+        text += f"; {len(diff['uncovered'])} uncovered instructions from {diff['uncovered'][0]}"
+    return text
+
+
 def report_detail(report):
     parts = [str(report.get('status'))]
     parts += [str(p) for p in report.get('problems') or []]
     for opt, build in (report.get('builds') or {}).items():
         if isinstance(build, dict) and build.get('status') not in (None, 'pass'):
-            parts.append(f"{opt} {build.get('status')}: {build.get('detail', '')}")
+            diff = build.get('difftest')
+            detail = _gate_summary(diff) if isinstance(diff, dict) else build.get('detail', '')
+            parts.append(f"{opt} {build.get('status')}: {detail}")
             if build.get('stderr'):
                 parts.append(str(build['stderr'])[:800])
     return ' | '.join(parts)[:2500]
+
+
+def input_bound(report):
+    """The lowest coverage when the candidate failed on test inputs alone, else None.
+
+    Every build compiled and ran with no mismatch, without the budget exhaustion that hides
+    non-terminating C, and with no code-as-data cases: coverage is the only failing condition.
+    Coverage counts original instructions the inputs reach, so no translation can change it."""
+    builds = list((report.get('builds') or {}).values())
+    if report.get('status') != 'fail' or report.get('problems') or not builds:
+        return None
+    lowest = None
+    for build in builds:
+        diff = build.get('difftest') if isinstance(build, dict) else None
+        if build.get('status') != 'fail' or not isinstance(diff, dict) or diff.get('mismatches'):
+            return None
+        cases, coverage = diff.get('cases') or 0, diff.get('coverage')
+        if coverage is None or diff.get('code_as_data_cases') or (diff.get('inconclusive') or 0) * 2 >= cases:
+            return None
+        lowest = coverage if lowest is None else min(lowest, coverage)
+    return lowest
 
 
 class InlineExecutor:
@@ -584,6 +629,10 @@ class Farm:
         self.audit_queue = [fn for fn in self.state['accepted']
                             if config.audit_workers and self._needs_audit(self.state['audits'].get(fn, {}))]
         self.frontier = None
+        self.last_scan = None      # clock() of the last frontier fetch
+        self.last_input_check = None
+        self.retried = {}          # fn -> parked record of a function returned to the queue
+        self.state['deadline_at'] = None if config.hours is None else time.time() + config.hours * 3600
         self.seen = set(self.state['accepted']) | set(self.state['parked']) | set(self.state['skipped'])
         self.counter = sum(len(v) for v in self.state['attempts'].values())
         events, _ = _read_events(self.run_dir / 'events.jsonl', 0)
@@ -845,6 +894,53 @@ class Farm:
     def finished(self):
         return self.stopping() and not self.running and not self.accept_queue and not self.verifying
 
+    def drained(self):
+        """The run is over. A continuous farm ends only on STOP or its deadline: with no supply
+        it idles and rescans, so work that arrives later starts without a restart."""
+        if self.finished():
+            return True
+        if self.config.continuous:
+            return False
+        supply_done = self.frontier == [] or self.config.workers == 0
+        return (not self.running and not self.pending and not self.accept_queue
+                and not self.verifying and not self.audit_queue and supply_done)
+
+    # -- live control
+    def _control(self):
+        """Apply RUN/control.json (written by `set`): no drain or restart for a setting change."""
+        try:
+            control = json.loads((self.run_dir / 'control.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return
+        changes = {}
+        for key in CONTROL_KEYS:
+            if key not in control:
+                continue
+            value = control[key]
+            if key == 'skip_ranges':
+                value = tuple(tuple(pair) for pair in value)
+            if value != getattr(self.config, key):
+                changes[key] = [getattr(self.config, key), value]
+                setattr(self.config, key, value)
+        if any(key in changes for key in SUPPLY_KEYS):
+            self.frontier, self.last_scan = None, None
+        if 'include_held' in changes and hasattr(self.cmre, 'include_held'):
+            self.cmre.include_held = self.config.include_held   # the adapter claims with it
+        if 'ladder' in changes:
+            for job in self.pending:    # rungs index the ladder: keep requeued jobs on a real rung
+                job['rung'] = min(job['rung'], len(self.config.ladder) - 1)
+        applied = self.state.setdefault('control_applied', [])
+        for extension in control.get('add_hours', []):
+            if extension['id'] in applied:
+                continue
+            applied.append(extension['id'])
+            if self.deadline is not None:
+                self.deadline += extension['hours'] * 3600
+                self.state['deadline_at'] = (self.state.get('deadline_at') or time.time()) + extension['hours'] * 3600
+                changes['deadline_hours'] = [None, extension['hours']]
+        if changes:
+            self._event('config-changed', changes=changes)
+
     def summary(self):
         accepted = self.state['accepted']
         by_model = {}
@@ -863,6 +959,9 @@ class Farm:
                 'running': [f"{j['fn']}:{j['kind']}:{j['model']}" for j, _, _ in self.running],
                 'pending': len(self.pending), 'parked': len(self.state['parked']),
                 'skipped': len(self.state['skipped']),
+                'queue': self.state.get('queue', 0), 'idle': self.state.get('idle_slots', 0),
+                'supply_empty_since': self.state.get('supply_empty_since'),
+                'input_needed': len(self.state.get('input_needed', {})),
                 'audits_ok': audits.count('ok'),
                 'audits_defect': audits.count('defect'),
                 'audit_errors': audits.count('error'),
@@ -877,8 +976,19 @@ class Farm:
                 'stopping': self.stopping()}
 
     # -- supply
+    def _scan_due(self):
+        """Fetch the frontier at start, when it ran out (at most every rescan_seconds), and in a
+        continuous run every five intervals so newly lifted larger functions jump the queue."""
+        if self.frontier is None or self.last_scan is None:
+            return True
+        age = self.clock() - self.last_scan
+        if not self.frontier:
+            return age >= self.config.rescan_seconds
+        return self.config.continuous and age >= 5 * self.config.rescan_seconds
+
     def _next_item(self):
-        if self.frontier is None or not self.frontier:
+        if self._scan_due():
+            self.last_scan = self.clock()
             items = self.cmre.frontier(FRONTIER_LIMIT, self.config.min_bytes, self.config.max_bytes,
                                        self.config.include_held, self.config.owner)
             items = [i for i in items if i.fn not in self.seen and not _skipped(i.fn, self.config.skip_ranges)]
@@ -891,7 +1001,7 @@ class Farm:
                 continue
             self.seen.add(item.fn)
             try:
-                self.cmre.claim(item.fn, self.config.owner, max(self.config.hours or 1, 1))
+                self.cmre.claim(item.fn, self.config.owner, max(self.config.hours or 24, 1))
             except ValueError as exc:
                 self.state['skipped'][item.fn] = str(exc)[:300]
                 self._event('skipped', fn=item.fn, reason=str(exc)[:300])
@@ -1101,12 +1211,37 @@ class Farm:
                 if item is None:
                     if not self.supply_empty and not self.pending:
                         self.supply_empty = True
-                        self._event('supply-empty', running=len(translators))
+                        self.state['supply_empty_since'] = time.time()
+                        self._event('supply-empty', running=len(translators),
+                                    idle=self.config.workers - len(translators))
                     break
+                if self.supply_empty:
+                    self.supply_empty = False
+                    since = self.state.pop('supply_empty_since', None)
+                    self._event('supply-resumed', fn=item.fn,
+                                dry_minutes=round((time.time() - since) / 60, 1) if since else None)
                 hold = self.cmre.hold(item.fn) if self.config.include_held else None
                 model, rung = self._rung_model(0)
                 job = self._new_job('translate', item.fn, model, rung, bytes=item.bytes,
                                     module=item.module, hold=hold)
+                retained = self.state.get('input_needed', {}).get(item.fn)
+                if retained and Path(retained['source']) == Path(job['source']) and Path(job['source']).exists():
+                    # Its inputs changed since it parked: gate the candidate the farm already
+                    # paid for before spending another model attempt on the function.
+                    job.update(model=retained['model'], _recheck=True)
+                    job['_snap'] = {
+                        'c': _read(self.root / 'recovery/c' / f'{item.fn}.c'),
+                        'hint': _read(self.root / 'recovery/hints' / f'{item.fn}.json')}
+                    self._event('recheck', fn=item.fn, n=job['n'], coverage_was=retained.get('coverage'))
+                    self.save()
+                    self._verify(job, False)
+                    translators.append(job)
+                    continue
+                previous, candidate = self.retried.pop(item.fn, None), _read(Path(job['source']))
+                if previous and candidate is not None:
+                    job['prior'] = {'model': (previous.get('models') or ['unknown'])[-1],
+                                    'detail': previous.get('detail', '')}
+                    job['_seed'] = candidate
                 seed = self._resume_seed(item.fn, collect=True)
                 if seed is not None:
                     # The operator must quiesce old sessions and retain hash-bound
@@ -1125,6 +1260,8 @@ class Farm:
                     continue
             if self._launch(job):
                 translators.append(job)
+        self.state['idle_slots'] = max(0, self.config.workers - len(translators))
+        self.state['queue'] = len(self.frontier or [])
         audits = [j for j, _, _ in self.running if j['kind'] == 'audit']
         while len(audits) < self.config.audit_workers and self.audit_queue and self.config.audit_model:
             index = next((i for i, fn in enumerate(self.audit_queue)
@@ -1187,6 +1324,17 @@ class Farm:
         if job['kind'] == 'adopt':   # a coordinator hand fix: the accepted source stays
             self._event('request-failed', fn=fn, kind='adopt', detail=detail[:300])
             return
+        if job.get('_input_bound') is not None:
+            # The candidate ran without a mismatch; the test inputs do not reach enough of the
+            # function. A stronger model cannot change that, so the next rung is not spent: the
+            # candidate stays in RUN/src and the supply lane owns the missing inputs.
+            self.state.setdefault('input_needed', {})[fn] = {
+                'bytes': job.get('bytes', 0), 'coverage': job['_input_bound'], 'source': job['source'],
+                'model': job['model'], 'at': time.time(),
+                'hints_sha256': _identity(self._inputs(fn))['hint']}
+            self._event('input-needed', fn=fn, coverage=job['_input_bound'], bytes=job.get('bytes', 0), n=job['n'])
+            self._park(fn, detail)
+            return
         model, rung = self._rung_model(job['rung'] + 1)
         if model is not None and not self.stopping():
             source = Path(job['source'])
@@ -1198,6 +1346,29 @@ class Farm:
             self.pending.append(nxt)
         else:
             self._park(fn, detail)
+
+    def _unpark(self, fn, event_name, **data):
+        """Return a parked function to the queue: the next frontier scan may dispatch it again."""
+        record = self.state['parked'].pop(fn, None)
+        if record:
+            self.retried[fn] = record   # its next job starts from the last candidate and failure
+        self.seen.discard(fn)
+        self.frontier, self.last_scan = None, None
+        self._event(event_name, fn=fn, **data)
+
+    def _input_arrivals(self):
+        """A parked candidate that failed on inputs alone goes back in the queue when its canonical
+        hints change, so supply work reaches acceptance without an operator or a restart."""
+        now = self.clock()
+        if self.last_input_check is not None and now - self.last_input_check < self.config.rescan_seconds:
+            return
+        self.last_input_check = now
+        for fn, row in self.state.get('input_needed', {}).items():
+            if fn not in self.state['parked']:
+                continue
+            current = _identity(self._inputs(fn))['hint']
+            if current != row.get('hints_sha256'):
+                self._unpark(fn, 'input-arrived', hints_sha256=current)
 
     def _park(self, fn, detail):
         self.seen.add(fn)
@@ -1298,6 +1469,10 @@ class Farm:
             return f'worker hints rejected: {exc}'
         report = self.cmre.test(fn, str(source))
         if report.get('status') != 'pass':
+            coverage = input_bound(report)
+            if coverage is not None and job['kind'] == 'translate':
+                job['_input_bound'] = coverage
+                return 'input-bound: ' + report_detail(report)
             return report_detail(report)
         target = self.root / 'recovery/c' / f'{fn}.c'
         data = self._transaction(job)
@@ -1548,6 +1723,7 @@ class Farm:
                                           'at': time.time(), 'was_held': was_held, 'hold': job.get('hold'),
                                           'identity': self._transaction(job)['identity'], 'transaction_n': job['n']}
             self._event('accepted', fn=fn, bytes=job['bytes'], model=job['model'], kind=job['kind'])
+            self.state.get('input_needed', {}).pop(fn, None)
             self._reset_audit(fn)
             if job['kind'] == 'adopt':
                 self.state['audits'][fn]['adopted'] = job.get('note', '')
@@ -1582,6 +1758,12 @@ class Farm:
                 continue   # still being written; next tick
             fn = request.get('fn', '')
             if self._writer_busy(fn):
+                continue
+            if request.get('kind') == 'retry':
+                if fn in self.state['parked'] and fn not in self.state.get('quarantined', {}):
+                    self._unpark(fn, 'retry', reason=request.get('reason', '')[:300])
+                    self.save()
+                path.unlink(missing_ok=True)
                 continue
             if request.get('kind') in ('adopt', 'dismiss'):
                 try:
@@ -1623,6 +1805,8 @@ class Farm:
                 self._verify(job, False)
 
     def tick(self):
+        self._control()
+        self._input_arrivals()
         self._reap()
         self._requests()
         self._collect()
@@ -1634,13 +1818,12 @@ class Farm:
     def run(self, poll=10.0):
         self.save()
         self._event('farm-start', pid=os.getpid(), workers=self.config.workers,
-                    audit_workers=self.config.audit_workers, ladder=self.config.ladder)
+                    audit_workers=self.config.audit_workers, ladder=self.config.ladder,
+                    continuous=self.config.continuous)
         try:
             while True:
                 self.tick()
-                supply_done = self.frontier == [] or self.config.workers == 0
-                if self.finished() or (not self.running and not self.pending and not self.accept_queue
-                                       and not self.verifying and not self.audit_queue and supply_done):
+                if self.drained():
                     break
                 time.sleep(poll)
         finally:
@@ -1729,9 +1912,15 @@ def coordinator_agent():
     rules += [('subagent', 'cm-defect', 'allow')]
     body = """
 You coordinate CM0102 decompilation from OpenCode. Read AGENTS.md, then follow
-docs/agent/FARM.md section "OpenCode coordinator" exactly. The Python farm does all
-per-function dispatch, testing and acceptance; you start it, wait on it, act on its
-events, and send each open defect to one cm-defect subagent.
+docs/agent/FARM.md sections "Session rules" and "OpenCode coordinator" exactly. The
+Python farm does all per-function dispatch, testing and acceptance; you start it once,
+wait on it, act on its events, and send each open defect to one cm-defect subagent.
+
+The farm stays up for the whole session: it idles and rescans when supply is empty and
+a supervisor restarts it if it dies. Stop it only at the end. Change workers, size
+bounds or models with `cmre_farm.py set RUN ...`, never with a restart. When status
+shows SUPPLY EMPTY or idle slots, report the first supply-lane item to Adam in that
+turn and keep waiting on the same run.
 
 Your information comes from the output of `cmre_farm.py` status, wait and defects,
 and from subagent result lines. Those outputs are complete: act on them directly and
@@ -1742,8 +1931,9 @@ acceptance requires manual/current cmre ledger review, not another adoption.
 The defect worker explicitly claims its actual reviewed inputs with
 `review RUN fn_X --claim NAME`. Pass its immutable review_receipt on every
 adopt/dismiss as --review-receipt PATH. Never mint a new claim to rebase an older
-hand fix. A hint-evidence-needed event belongs to the parent input lane at an
-authorized boundary; workers have no canonical hint-write permission.
+hand fix. A hint-evidence-needed event belongs to the parent input lane, which
+validates and applies it while the farm runs; workers have no canonical hint-write
+permission.
 Direct cmre auto-grants are read-only status/survey/work-show/family/show/job-status
 commands. Acceptance, retraction, work retry/block and source mutations are not
 automatically allowed; do not bypass the farm's checked protocol.
@@ -2007,6 +2197,59 @@ def apply_requests_now(run_dir):
     return farm
 
 
+def reclassify(run_dir, root=ROOT, cmre=None, threads=8):
+    """Re-gate the candidates a stopped run retains for its parked functions: counts by class.
+
+    An input-bound candidate is registered so the farm re-gates it when its hints change; one
+    that passes now is registered with no hints identity, so the next farm tick re-gates and
+    accepts it through the normal transaction. Nothing is unparked, installed or accepted here."""
+    from concurrent.futures import ThreadPoolExecutor
+    run_dir, root = Path(run_dir), Path(root)
+    cmre = cmre or CmreAdapter(root, include_held=True)
+    with RunLock(run_dir):
+        state = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))
+        known = state.setdefault('input_needed', {})
+        sizes = {i.fn: i.bytes for i in cmre.frontier(FRONTIER_LIMIT, 0, None, True, state.get('owner', ''))}
+        counts = {'input-bound': 0, 'passes-now': 0, 'failed': 0, 'no-candidate': 0}
+        todo = []
+        for fn in sorted(state['parked']):
+            if fn in known:
+                continue
+            source = run_dir / 'src' / f'{fn}.c'
+            if source.exists():
+                todo.append((fn, source))
+            else:
+                counts['no-candidate'] += 1
+
+        def gate(entry):
+            try:
+                return cmre.test(entry[0], str(entry[1]))
+            except Exception as exc:   # one slow or broken candidate must not lose the others
+                return {'status': 'error', 'problems': [str(exc)[:200]]}
+
+        with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
+            reports = list(pool.map(gate, todo))
+        for (fn, source), report in zip(todo, reports):
+            coverage = input_bound(report)
+            passes = report.get('status') == 'pass'
+            if coverage is None and not passes:
+                counts['failed'] += 1
+                state['parked'][fn]['detail'] = report_detail(report)[:600]   # replaces an empty reason
+                continue
+            counts['passes-now' if passes else 'input-bound'] += 1
+            models = state['parked'][fn].get('models') or ['hand']
+            hints = _read(root / 'recovery/hints' / f'{fn}.json')
+            known[fn] = {'bytes': sizes.get(fn, 0), 'coverage': coverage, 'source': str(source),
+                         'model': models[-1], 'at': time.time(),
+                         'hints_sha256': 'regate-requested' if passes else _identity({'hint': hints})['hint']}
+        tmp = (run_dir / 'state.json').with_suffix('.tmp')
+        tmp.write_text(json.dumps(state, indent=1), encoding='utf-8')
+        tmp.replace(run_dir / 'state.json')
+        with (run_dir / 'events.jsonl').open('a', encoding='utf-8') as out:
+            out.write(json.dumps({'at': time.time(), 'event': 'reclassified', **counts}) + '\n')
+    return counts
+
+
 def _request(run_dir, fn, kind, **data):
     directory = Path(run_dir) / 'requests'
     directory.mkdir(parents=True, exist_ok=True)
@@ -2031,8 +2274,10 @@ def _request(run_dir, fn, kind, **data):
 def status_line(s):
     models = ', '.join(f"{m} {v['passes']}/{v['attempts']}" for m, v in s['by_model'].items())
     return (f"accepted {s['accepted_functions']} fn / {s['accepted_bytes']} B in {s['hours']} h "
-            f"({s['bytes_per_hour']} B/h) | running {len(s['running'])} | pending {s['pending']} | "
-            f"parked {s['parked']} skipped {s['skipped']} | audits ok {s['audits_ok']} defect {s['audits_defect']} "
+            f"({s['bytes_per_hour']} B/h) | running {len(s['running'])} | queue {s.get('queue', 0)} "
+            f"idle {s.get('idle', 0)} | pending {s['pending']} | "
+            f"parked {s['parked']} (input-needed {s.get('input_needed', 0)}) skipped {s['skipped']} | "
+            f"audits ok {s['audits_ok']} defect {s['audits_defect']} "
             f"error {s.get('audit_errors', 0)} unconfirmed {s.get('audits_unconfirmed', 0)} "
             f"disputed {s.get('audits_disputed', 0)} "
             f"open {len(s['open_defects'])} | models {models}"
@@ -2040,6 +2285,8 @@ def status_line(s):
              + ''.join(f" | LIMITED {p} until {time.strftime('%H:%M', time.localtime(until))}"
                        for p, until in s.get('limited', {}).items())
              + (f" | QUARANTINED {','.join(sorted(s['quarantined']))}" if s.get('quarantined') else '')
+            + (f" | SUPPLY EMPTY {round((time.time() - s['supply_empty_since']) / 60)} min: work the supply lane"
+               if s.get('supply_empty_since') and not s['stopping'] else '')
             + (' | STOPPING' if s['stopping'] else ''))
 
 
@@ -2416,9 +2663,35 @@ def main(argv=None):
     r.add_argument('--skip-ranges', default=','.join(f'0x{lo:08x}-0x{hi:08x}' for lo, hi in DEFAULT_SKIP_RANGES),
                    help="VA ranges never dispatched (default: x87 runtime helpers); '' disables")
     r.add_argument('--verify-threads', type=int, default=8, help='parallel gate re-tests')
-    st = sub.add_parser('start', help='run the farm detached (hidden console, logs in RUN); args as for run')
+    r.add_argument('--exit-when-empty', action='store_true',
+                   help='end the run when supply is exhausted (default: idle, rescan and take new supply)')
+    r.add_argument('--rescan-minutes', type=float, default=2, help='how often an empty queue is fetched again')
+    st = sub.add_parser('start', help='run the farm detached under a restart supervisor; args as for run')
     st.add_argument('run_dir')
     st.add_argument('run_args', nargs=argparse.REMAINDER)
+    sv = sub.add_parser('supervise', help='run the farm in this process tree and relaunch it if it dies')
+    sv.add_argument('run_dir')
+    sv.add_argument('run_args', nargs=argparse.REMAINDER)
+    se = sub.add_parser('set', help='change a running farm without a drain or restart (applies on its next tick)')
+    se.add_argument('run_dir')
+    se.add_argument('--workers', type=int)
+    se.add_argument('--audit-workers', type=int)
+    se.add_argument('--min-bytes', type=int)
+    se.add_argument('--max-bytes', type=int, help='0 removes the ceiling')
+    se.add_argument('--ladder')
+    se.add_argument('--audit-model')
+    se.add_argument('--confirm-model', help="'' disables the second auditor")
+    se.add_argument('--include-held', action=argparse.BooleanOptionalAction, default=None)
+    se.add_argument('--skip-ranges')
+    se.add_argument('--attempt-minutes', type=float)
+    se.add_argument('--stall-minutes', type=float)
+    se.add_argument('--add-hours', type=float, help='extend the deadline')
+    ip = sub.add_parser('inputs', help='parked functions whose candidate ran clean but needs more test inputs')
+    ip.add_argument('run_dir')
+    rt = sub.add_parser('retry', help='return parked functions to the running farm after something changed')
+    rt.add_argument('run_dir')
+    rt.add_argument('fns', nargs='+', metavar='fn_XXXXXXXX')
+    rt.add_argument('--reason', required=True, help='what changed since they parked (harness release, new inputs)')
     w = sub.add_parser('wait', help='block until a notable event, a dead farm, or --minutes')
     w.add_argument('run_dir')
     w.add_argument('--minutes', type=float, default=60)
@@ -2446,6 +2719,10 @@ def main(argv=None):
     pr = sub.add_parser('probe', help='check every ladder/audit model answers before a run')
     pr.add_argument('--ladder', default=','.join(DEFAULT_LADDER + (DEFAULT_AUDIT_MODEL, DEFAULT_CONFIRM_MODEL)))
     pr.add_argument('--opencode', choices=('v2', 'v1'), default='v2')
+    rc = sub.add_parser('reclassify', help='re-gate the retained candidates of a stopped run and register '
+                                          'the input-bound and now-passing ones')
+    rc.add_argument('run_dir')
+    rc.add_argument('--threads', type=int, default=8)
     for name in ('status', 'stop', 'defects'):
         s = sub.add_parser(name)
         s.add_argument('run_dir')
@@ -2465,6 +2742,38 @@ def main(argv=None):
     run_dir = Path(a.run_dir)
     if a.action == 'start':
         return start(run_dir, a.run_args)
+    if a.action == 'supervise':
+        try:
+            return supervise(run_dir, a.run_args)
+        except Exception:   # the detached supervisor has no console: leave its failure in the run
+            import traceback
+            (run_dir / 'supervisor.err').write_text(traceback.format_exc(), encoding='utf-8')
+            raise
+    if a.action == 'set':
+        return set_control(run_dir, a)
+    if a.action == 'reclassify':
+        try:
+            print(json.dumps(reclassify(run_dir, threads=a.threads)))
+        except RuntimeError as exc:
+            print(f'reclassify needs a stopped run: {exc}', file=sys.stderr)
+            return 2
+        return 0
+    if a.action == 'retry':
+        parked = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))['parked']
+        for fn in a.fns:
+            if fn in parked:
+                _request(run_dir, fn, 'retry', reason=a.reason)
+                print(f'{fn}: queued; a running farm takes it on its next scan')
+            else:
+                print(f'{fn}: not parked in this run; nothing queued')
+        return 0
+    if a.action == 'inputs':
+        state = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))
+        rows = sorted(state.get('input_needed', {}).items(), key=lambda kv: -kv[1].get('bytes', 0))
+        for fn, row in rows:
+            if fn in state['parked']:
+                print(f"{fn} {row.get('bytes', 0)}B coverage {row.get('coverage')} candidate {row.get('source')}")
+        return 0
     if a.action == 'review':
         try:
             view = claim_review(run_dir, ROOT, a.fn, a.claim) if a.claim else review_paths(run_dir, ROOT, a.fn)
@@ -2555,10 +2864,11 @@ def main(argv=None):
         return 0
     config = FarmConfig(workers=a.workers, ladder=[m.strip() for m in a.ladder.split(',') if m.strip()],
                         audit_workers=a.audit_workers, audit_model=a.audit_model,
-                        attempt_minutes=a.attempt_minutes, hours=a.hours, min_bytes=a.min_bytes,
+                        attempt_minutes=a.attempt_minutes, hours=a.hours or None, min_bytes=a.min_bytes,
                         max_bytes=a.max_bytes, include_held=a.include_held,
                         owner=a.owner or f'farm-{run_dir.name}', stall_minutes=a.stall_minutes,
-                        confirm_model=a.confirm_model or None, skip_ranges=tuple(parse_ranges(a.skip_ranges)))
+                        confirm_model=a.confirm_model or None, skip_ranges=tuple(parse_ranges(a.skip_ranges)),
+                        continuous=not a.exit_when_empty, rescan_seconds=a.rescan_minutes * 60)
     from concurrent.futures import ThreadPoolExecutor
     with RunLock(run_dir), ThreadPoolExecutor(max_workers=max(1, a.verify_threads)) as verifier:
         (run_dir / 'STOP').unlink(missing_ok=True)
@@ -2570,25 +2880,131 @@ def main(argv=None):
     return 0
 
 
-def start(run_dir, run_args):
-    """Launch `run` detached from the caller's shell, with a hidden console that its
-    `py -m cmre` children share (a fully detached farm opens a console window per child)."""
+def set_control(run_dir, a):
+    """Merge the given settings into RUN/control.json; the farm applies them on its next tick
+    and again after any restart, so no setting change needs a drain."""
+    values = {key: getattr(a, key) for key in CONTROL_KEYS if getattr(a, key, None) is not None}
+    if 'ladder' in values:
+        values['ladder'] = [m.strip() for m in values['ladder'].split(',') if m.strip()]
+        if not values['ladder']:
+            print('set: --ladder needs at least one model', file=sys.stderr)
+            return 2
+    if 'max_bytes' in values:
+        values['max_bytes'] = values['max_bytes'] or None
+    if 'confirm_model' in values:
+        values['confirm_model'] = values['confirm_model'] or None
+    if 'skip_ranges' in values:
+        values['skip_ranges'] = parse_ranges(values['skip_ranges'])
+    if not values and a.add_hours is None:
+        print('set: nothing to change', file=sys.stderr)
+        return 2
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
-    command = [sys.executable, str(Path(__file__).resolve()), 'run', str(run_dir), *run_args]
-    flags = 0
-    if os.name == 'nt':
+    path = run_dir / 'control.json'
+    try:
+        control = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        control = {}
+    control.update(values)
+    if a.add_hours is not None:
+        control.setdefault('add_hours', []).append({'id': str(time.time_ns()), 'hours': a.add_hours})
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(control, indent=1), encoding='utf-8')
+    tmp.replace(path)
+    print(json.dumps({'control': str(path), **values,
+                      **({'add_hours': a.add_hours} if a.add_hours is not None else {}),
+                      'applies': 'next farm tick' if farm_live(run_dir) else 'when a farm runs this directory'}))
+    return 0
+
+
+def _run_command(run_dir, run_args):
+    return [sys.executable, '-u', str(Path(__file__).resolve()), 'run', str(run_dir), *run_args]
+
+
+def _launch_farm(run_dir):
+    def launch(command):
+        with (run_dir / 'farm.out').open('ab') as out, (run_dir / 'farm.err').open('ab') as err:
+            return subprocess.call(command, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+    return launch
+
+
+def supervise(run_dir, run_args, launch=None, sleep=time.sleep, clock=time.monotonic,
+              max_restarts=MAX_RESTARTS_PER_HOUR):
+    """Run the farm and relaunch it when it dies before STOP or its deadline.
+
+    A farm process vanished without a traceback five times on 14-15 Nov and each time nothing
+    ran until an agent or Adam noticed (up to 47 minutes). Restart resumes from state.json; the
+    transaction journals decide what an interrupted job may keep."""
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    launch = launch or _launch_farm(run_dir)
+    (run_dir / 'supervisor.pid').write_text(f'{os.getpid()}\n', encoding='utf-8')
+    args, restarts = list(run_args), []
+
+    def event(name, **data):
+        with (run_dir / 'events.jsonl').open('a', encoding='utf-8') as out:
+            out.write(json.dumps({'at': time.time(), 'event': name, **data}) + '\n')
+
+    while True:
+        code = launch(_run_command(run_dir, args))
+        try:
+            deadline_at = json.loads((run_dir / 'state.json').read_text(encoding='utf-8')).get('deadline_at')
+        except (OSError, ValueError):
+            deadline_at = None
+        # The farm times its deadline on a monotonic clock: allow for skew against wall time.
+        expired = deadline_at is not None and time.time() >= deadline_at - 120
+        if (run_dir / 'STOP').exists() or expired or (code == 0 and '--exit-when-empty' in run_args):
+            return 0
+        now = clock()
+        restarts = [at for at in restarts if now - at < 3600]
+        if len(restarts) >= max_restarts:
+            event('farm-crash-loop', code=code, restarts=len(restarts),
+                  detail=f'farm exited {len(restarts) + 1} times within an hour; see farm.err')
+            return 1
+        restarts.append(now)
+        event('farm-restart', code=code, restart=len(restarts))
+        if deadline_at is not None:   # keep the original deadline, not a fresh --hours window
+            args = [*run_args, '--hours', f'{max(deadline_at - time.time(), 60) / 3600:.4f}']
+        sleep(RESTART_SECONDS)
+
+
+def _wmi_launch(command, cwd):
+    """Create the process through WMI: its parent is the WMI host, outside the caller's job
+    object, so it survives the shell, agent session or OpenCode server that asked for it."""
+    quoted = subprocess.list2cmdline(command).replace("'", "''")
+    script = ("$s = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ShowWindow=[uint16]0}; "
+              f"$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments "
+              f"@{{CommandLine='{quoted}'; CurrentDirectory='{str(cwd)}'; ProcessStartupInformation=$s}}; "
+              "if ($r.ReturnValue -ne 0) { exit 1 }; $r.ProcessId")
+    result = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', script],
+                            capture_output=True, text=True, timeout=60)
+    if result.returncode != 0 or not result.stdout.strip().isdigit():
+        raise OSError(f'WMI process creation failed: {(result.stderr or result.stdout)[-300:]}')
+    return int(result.stdout.strip())
+
+
+def start(run_dir, run_args):
+    """Launch the supervised farm detached from the caller, with a hidden console that its
+    `py -m cmre` children share (a fully detached farm opens a console window per child).
+
+    The farm must outlive the caller's job object. When the job forbids breakaway, a plain
+    child dies silently with the shell or session that started it, so the fallback is WMI."""
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, '-u', str(Path(__file__).resolve()), 'supervise', str(run_dir), *run_args]
+    if os.name != 'nt':
+        pid, how = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True).pid, 'new session'
+    else:
         flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-    with (run_dir / 'farm.out').open('ab') as out, (run_dir / 'farm.err').open('ab') as err:
-        try:   # leave the caller's job object so closing that shell or session cannot kill the farm
-            process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                                       creationflags=flags | getattr(subprocess, 'CREATE_BREAKAWAY_FROM_JOB', 0),
-                                       close_fds=True)
+        try:
+            pid, how = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL, close_fds=True,
+                                        creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB).pid, 'job breakaway'
         except OSError:   # the job forbids breakaway
-            process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                                       creationflags=flags, close_fds=True)
-    (run_dir / 'farm.pid').write_text(f'{process.pid}\n', encoding='utf-8')
-    print(f'farm started: pid {process.pid}, logs {run_dir}/farm.out and farm.err')
+            pid, how = _wmi_launch(command, ROOT), 'WMI'
+    print(f'farm started under supervisor pid {pid} ({how}); it restarts the farm if it dies. '
+          f'Logs {run_dir}/farm.out and farm.err; farm pid in farm.pid')
     return 0
 
 

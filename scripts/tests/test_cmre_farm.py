@@ -2626,7 +2626,7 @@ def test_wait_times_out_and_detects_a_dead_farm(root):
     assert reason == 'farm not running'
 
 
-def test_start_detaches_the_farm_and_records_its_pid(root, monkeypatch):
+def test_start_detaches_a_supervised_farm(root, monkeypatch, capsys):
     seen = {}
 
     class Proc:
@@ -2640,11 +2640,27 @@ def test_start_detaches_the_farm_and_records_its_pid(root, monkeypatch):
     run = root / 'run'
     assert farm.main(['start', str(run), '--workers', '3', '--include-held']) == 0
     command = seen['command']
-    assert command[command.index('run') + 1:] == [str(run), '--workers', '3', '--include-held']
-    assert (run / 'farm.pid').read_text().strip() == '4242'
+    assert command[command.index('supervise') + 1:] == [str(run), '--workers', '3', '--include-held']
+    assert '4242' in capsys.readouterr().out
     assert seen['kw']['stdin'] is farm.subprocess.DEVNULL
     if os.name == 'nt':
         assert seen["kw"]["creationflags"] & farm.subprocess.CREATE_NO_WINDOW  # a detached farm pops a console per child
+        assert seen["kw"]["creationflags"] & farm.subprocess.CREATE_BREAKAWAY_FROM_JOB
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='job objects are a Windows mechanism')
+def test_start_leaves_a_job_that_forbids_breakaway_through_wmi(root, monkeypatch, capsys):
+    # A plain child of such a job died silently with the shell or session that started it.
+    def popen(command, **kw):
+        raise OSError('access denied')
+
+    launched = {}
+    monkeypatch.setattr(farm.subprocess, 'Popen', popen)
+    monkeypatch.setattr(farm, '_wmi_launch', lambda command, cwd: launched.update(command=command) or 777)
+    run = root / 'run'
+    assert farm.main(['start', str(run), '--workers', '3']) == 0
+    assert launched['command'][launched['command'].index('supervise') + 1:] == [str(run), '--workers', '3']
+    assert '777' in capsys.readouterr().out and 'WMI' not in str(launched['command'])
 
 
 def test_adopt_request_accepts_a_hand_fix_and_reaudits_it(root):
@@ -2990,3 +3006,274 @@ def test_every_default_deepseek_model_is_v4_1_flash():
     deepseek = [m for m in models if 'deepseek' in m]
     allowed = {'opencode-go/deepseek-v4.1-flash', 'commandcode/deepseek/deepseek-v4.1-flash'}
     assert deepseek and all(m.split('#')[0] in allowed for m in deepseek), deepseek
+
+
+# --- continuous operation (2026-11-16) -----------------------------------------
+# Review of the 14-16 Nov orchestrator sessions: the farm was stopped and drained eight times in
+# one 19-hour session (floor change, model switch, hint/fix application, parent checks) and
+# exited for good on supply-empty at 21:27, after which nothing ran for nine hours.
+
+def passing(job):
+    return GOOD.replace('fn_00401000', job['fn']) + '// PASS fake gate\n'
+
+
+def test_continuous_farm_idles_on_empty_supply_and_takes_work_that_arrives_later(root):
+    f, cmre, launcher = make(root, [item('fn_00401000')], writes(passing), workers=1,
+                             continuous=True, rescan_seconds=0)
+    drain(f)
+    assert cmre.accepted == ['fn_00401000']
+    assert not f.drained()                      # idle, not finished: only STOP or the deadline ends it
+    cmre.items.append(item('fn_00401100'))
+    drain(f)
+    assert cmre.accepted == ['fn_00401000', 'fn_00401100']
+    names = [e['event'] for e in events(f.run_dir)]
+    assert names.count('supply-empty') == 2     # one per dry spell, re-armed by new supply
+    assert names.count('supply-resumed') == 1
+    (f.run_dir / 'STOP').write_text('')
+    assert f.drained()
+
+
+def test_run_once_farm_still_exits_when_supply_is_exhausted(root):
+    f, cmre, _ = make(root, [item('fn_00401000')], writes(GOOD), workers=1)
+    drain(f)
+    assert f.drained()
+
+
+def test_empty_supply_rescans_are_throttled(root):
+    now = [0.0]
+    cmre = FakeCmre([])
+    cmre.root = root
+    calls = []
+    original = cmre.frontier
+    cmre.frontier = lambda *args: calls.append(now[0]) or original(*args)
+    cfg = farm.FarmConfig(workers=2, ladder=['m/cheap'], audit_workers=0, audit_model=None, attempt_minutes=30,
+                          hours=None, min_bytes=0, max_bytes=None, include_held=False, owner='farm-t',
+                          continuous=True, rescan_seconds=120)
+    f = farm.Farm(root / 'run', root, cmre, FakeLauncher(root, writes(GOOD)), cfg, clock=lambda: now[0])
+    for second in (0, 10, 20, 119, 120, 130):
+        now[0] = float(second)
+        f.tick()
+    assert calls == [0.0, 120.0]
+
+
+def test_control_file_changes_the_size_floor_and_slots_without_a_restart(root):
+    f, cmre, launcher = make(root, [item('fn_00401000', 200), item('fn_00401100', 700)], writes(passing),
+                             workers=1, min_bytes=600, continuous=True, rescan_seconds=0)
+    drain(f)
+    assert cmre.accepted == ['fn_00401100']
+    assert farm.main(['set', str(f.run_dir), '--min-bytes', '100', '--workers', '3']) == 0
+    drain(f)
+    assert cmre.accepted == ['fn_00401100', 'fn_00401000']
+    assert f.config.min_bytes == 100 and f.config.workers == 3
+    changed = [e for e in events(f.run_dir) if e['event'] == 'config-changed']
+    assert changed and changed[0]['changes']['min_bytes'] == [600, 100]
+
+
+def test_control_file_switches_models_for_new_jobs(root):
+    f, cmre, launcher = make(root, [item('fn_00401000')], writes(GOOD), workers=1, continuous=True)
+    assert farm.main(['set', str(f.run_dir), '--ladder', 'm/new,m/strong', '--audit-model', 'm/judge']) == 0
+    drain(f)
+    assert launcher.started[0][0]['model'] == 'm/new'
+    assert f.config.audit_model == 'm/judge'
+
+
+def test_control_survives_a_farm_restart(root):
+    f, cmre, _ = make(root, [], writes(GOOD), workers=1, min_bytes=600)
+    assert farm.main(['set', str(f.run_dir), '--min-bytes', '100']) == 0
+    f2, _, _ = make(root, [], writes(GOOD), workers=1, min_bytes=600)
+    f2.tick()
+    assert f2.config.min_bytes == 100
+
+
+def test_set_extends_the_deadline_of_a_running_farm(root):
+    now = [0.0]
+    f, cmre, _ = make(root, [], writes(GOOD), workers=1, hours=1, continuous=True)
+    f.clock = lambda: now[0]
+    f.deadline = 3600.0
+    now[0] = 3500.0
+    assert farm.main(['set', str(f.run_dir), '--add-hours', '2']) == 0
+    f.tick()
+    now[0] = 3700.0
+    assert not f.stopping()
+    f.tick()                                    # an applied extension is not applied twice
+    assert f.deadline == 3600.0 + 7200.0
+
+
+def test_set_rejects_an_empty_change(root, capsys):
+    assert farm.main(['set', str(root / 'run')]) == 2
+
+
+def input_bound_report():
+    diff = {'cases': 600, 'inconclusive': 0, 'mismatches': [], 'coverage': 0.3669, 'code_as_data_cases': 0,
+            'uncovered': ['0x004ae359', '0x004ae35b']}
+    return {'status': 'fail', 'problems': [],
+            'builds': {'-O0': {'status': 'fail', 'difftest': dict(diff)},
+                       '-O2': {'status': 'fail', 'difftest': dict(diff)}}}
+
+
+def test_failure_detail_reports_coverage_and_the_first_mismatch():
+    # 254 of 300 parked functions (run 20261115T1250Z) carried 'fail | -O0 fail:  | -O2 fail: '.
+    assert 'coverage 0.3669' in farm.report_detail(input_bound_report())
+    report = input_bound_report()
+    report['builds']['-O2']['difftest'] = {'cases': 600, 'inconclusive': 3, 'coverage': 0.81,
+                                           'mismatches': [{'case': 17, 'field': 'eax', 'original': 1, 'recovered': 2},
+                                                          {'case': 40, 'field': 'mem'}]}
+    detail = farm.report_detail(report)
+    assert '2 mismatches' in detail and '"case": 17' in detail and 'inconclusive 3/600' in detail
+
+
+def test_input_bound_failure_is_recognised_only_without_mismatches_or_budget_exhaustion():
+    assert farm.input_bound(input_bound_report())
+    mismatch = input_bound_report()
+    mismatch['builds']['-O2']['difftest']['mismatches'] = [{'case': 1}]
+    assert not farm.input_bound(mismatch)
+    looping = input_bound_report()               # C that never terminates shows only as inconclusive
+    looping['builds']['-O0']['difftest']['inconclusive'] = 300
+    assert not farm.input_bound(looping)
+    broken = input_bound_report()
+    broken['builds']['-O0'] = {'status': 'build-failed', 'detail': 'x'}
+    assert not farm.input_bound(broken)
+    assert not farm.input_bound({'status': 'fail', 'problems': ['contract'], 'builds': input_bound_report()['builds']})
+
+
+def test_input_bound_failure_parks_without_spending_the_stronger_model(root):
+    f, cmre, launcher = make(root, [item('fn_00401000')], writes('u32 cm_fn_00401000(u32 a) { return a; }\n'),
+                             workers=1)
+    cmre.test = lambda fn, source=None: input_bound_report()
+    drain(f)
+    assert [j['model'] for j, _, _ in launcher.started] == ['m/cheap']
+    assert f.state['parked']['fn_00401000']['detail'].startswith('input-bound')
+    needed = [e for e in events(f.run_dir) if e['event'] == 'input-needed']
+    assert needed and needed[0]['fn'] == 'fn_00401000' and needed[0]['coverage'] == 0.3669
+
+
+def park_input_bound(root):
+    f, cmre, launcher = make(root, [item('fn_00401000')], writes(passing), workers=1,
+                             continuous=True, rescan_seconds=0)
+    (root / 'recovery/hints/fn_00401000.json').write_text('{"arg_count": 1}')
+    cmre.test = lambda fn, source=None: input_bound_report()
+    drain(f)
+    assert 'fn_00401000' in f.state['parked'] and len(launcher.started) == 1
+    del cmre.test                                   # the gate now passes a PASS-marked source
+    return f, cmre, launcher
+
+
+def test_new_inputs_regate_the_retained_candidate_without_a_model(root):
+    f, cmre, launcher = park_input_bound(root)
+    (root / 'recovery/hints/fn_00401000.json').write_text('{"arg_count": 1, "fixtures": [{}]}')
+    drain(f)
+    assert cmre.accepted == ['fn_00401000']
+    assert len(launcher.started) == 1               # the supply lane's inputs were the only missing piece
+    names = [e['event'] for e in events(f.run_dir)]
+    assert 'input-arrived' in names and 'recheck' in names
+    assert 'fn_00401000' not in f.state['input_needed']
+
+
+def test_unchanged_inputs_leave_an_input_bound_candidate_parked(root):
+    f, cmre, launcher = park_input_bound(root)
+    tests = len(cmre.tests)
+    drain(f)
+    assert cmre.accepted == [] and len(cmre.tests) == tests and len(launcher.started) == 1
+
+
+def test_new_inputs_that_still_fall_short_park_again_without_looping(root):
+    f, cmre, launcher = park_input_bound(root)
+    cmre.test = lambda fn, source=None: input_bound_report()
+    (root / 'recovery/hints/fn_00401000.json').write_text('{"arg_count": 1, "fixtures": [{}]}')
+    drain(f)
+    rechecks = [e for e in events(f.run_dir) if e['event'] == 'recheck']
+    assert len(rechecks) == 1 and 'fn_00401000' in f.state['parked'] and len(launcher.started) == 1
+
+
+def test_retry_request_returns_a_parked_function_to_the_running_farm(root):
+    wrong = writes(lambda job: f"u32 cm_fn_00401000(u32 a) {{ return a * {job['n']} + 7; }}\n")
+    f, cmre, launcher = make(root, [item('fn_00401000')], wrong, workers=1, continuous=True, rescan_seconds=0)
+    drain(f)
+    assert 'fn_00401000' in f.state['parked'] and len(launcher.started) == 2   # both rungs failed
+    assert farm.main(['retry', str(f.run_dir), 'fn_00401000', '--reason', 'harness release cleared its family']) == 0
+    launcher.behaviour = writes(passing)
+    drain(f)
+    assert cmre.accepted == ['fn_00401000']
+    retried = [e for e in events(f.run_dir) if e['event'] == 'retry']
+    assert retried and retried[0]['reason'] == 'harness release cleared its family'
+    again = launcher.started[2][0]                  # the retry starts from the last candidate and its failure
+    assert 'case 7 eax' in again['prior']['detail'] and again['prior']['model'] == 'm/strong'
+
+
+def test_reclassify_registers_old_parked_candidates_for_the_input_lane(root):
+    # Runs before 2026-11-16 parked 254 of 300 functions with an empty reason and no input record.
+    names = ['fn_00401000', 'fn_00401100', 'fn_00401200', 'fn_00401300']
+    f, cmre, launcher = make(root, [item(fn, 300) for fn in names], writes(passing), workers=0)
+    reports = {'fn_00401000': input_bound_report(), 'fn_00401100': {'status': 'pass', 'builds': {}},
+               'fn_00401200': {'status': 'fail', 'problems': ['mismatch'], 'builds': {}}}
+    for fn in names:
+        f.state['parked'][fn] = {'detail': 'fail | -O0 fail:  | -O2 fail: ', 'models': ['m/cheap']}
+        f.state['attempts'][fn] = [{'model': 'm/cheap', 'kind': 'translate', 'outcome': 'fail', 'detail': '', 'at': 0}]
+    for fn in names[:3]:                             # the fourth has no retained candidate
+        (f.run_dir / 'src').mkdir(exist_ok=True)
+        (f.run_dir / 'src' / f'{fn}.c').write_text(passing({'fn': fn}))
+        (root / f'recovery/hints/{fn}.json').write_text('{"arg_count": 1}')
+    f.save()
+    cmre.test = lambda fn, source=None: reports[fn]
+    counts = farm.reclassify(f.run_dir, root, cmre)
+    assert counts == {'input-bound': 1, 'passes-now': 1, 'failed': 1, 'no-candidate': 1}
+    state = json.loads(f.state_path.read_text())
+    assert state['input_needed']['fn_00401000']['coverage'] == 0.3669
+    assert state['input_needed']['fn_00401000']['bytes'] == 300
+    assert set(state['parked']) == set(names)        # nothing is unparked or accepted here
+
+    del cmre.test
+    f2, cmre2, launcher2 = make(root, [item(fn, 300) for fn in names], writes(passing), workers=1,
+                                continuous=True, rescan_seconds=0)
+    drain(f2)
+    assert cmre2.accepted == ['fn_00401100']         # the candidate that passes now is re-gated by the farm
+    assert launcher2.started == []                   # and no parked function costs a model attempt
+
+
+def test_wait_ignores_supply_events_when_the_farm_keeps_running(root):
+    # supply-empty used to wake the coordinator, which then stopped the farm (2026-11-15 21:27).
+    assert 'supply-empty' not in farm.NOTABLE_EVENTS and 'supply-resumed' not in farm.NOTABLE_EVENTS
+
+
+def test_status_line_shows_idle_slots_and_the_dry_spell(root):
+    f, cmre, _ = make(root, [], writes(GOOD), workers=4, continuous=True)
+    f.tick()
+    line = farm.status_line(f.summary())
+    assert 'SUPPLY EMPTY' in line and 'idle 4' in line
+
+
+def test_supervisor_restarts_a_farm_that_dies_and_stops_on_request(root):
+    run = root / 'run'
+    run.mkdir()
+    codes, launched = [1, 1, 0], []
+
+    def launch(command):
+        launched.append(command)
+        if len(launched) == 3:
+            (run / 'STOP').write_text('')
+        return codes[len(launched) - 1]
+
+    assert farm.supervise(run, ['--workers', '2'], launch=launch, sleep=lambda s: None, clock=lambda: 0.0) == 0
+    assert len(launched) == 3 and all(c[-2:] == ['--workers', '2'] for c in launched)
+    names = [e['event'] for e in events(run)]
+    assert names.count('farm-restart') == 2
+
+
+def test_supervisor_gives_up_on_a_crash_loop(root):
+    run = root / 'run'
+    run.mkdir()
+    launched = []
+    code = farm.supervise(run, [], launch=lambda command: launched.append(command) or 1,
+                          sleep=lambda s: None, clock=lambda: 0.0, max_restarts=3)
+    assert code == 1 and len(launched) == 4
+    assert [e['event'] for e in events(run)][-1] == 'farm-crash-loop'
+
+
+def test_supervisor_does_not_restart_after_the_deadline(root):
+    run = root / 'run'
+    run.mkdir()
+    (run / 'state.json').write_text(json.dumps({'deadline_at': time.time() - 5}))
+    launched = []
+    assert farm.supervise(run, [], launch=lambda command: launched.append(command) or 0,
+                          sleep=lambda s: None, clock=lambda: 0.0) == 0
+    assert len(launched) == 1
