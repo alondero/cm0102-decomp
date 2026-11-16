@@ -1,12 +1,29 @@
 #include "cmre.h"
 
-/* WIP: O0 events mismatch, case 2/index20: original CRT consumes unwritten
-   Find-output FILETIMEs (read 00946985); O2 passes. One failed invocation.
-   Keep inputs unchanged; require original-derived import-output evidence. */
-/* Preferred-image VA0079BF60/base00400000; CM0102 3.9.68 SHA256
+/* Preferred-image VA 0079BF60 / image base 00400000 / CM0102 3.9.68, SHA-256
    0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
-   THIS0/RET0/void: both direct callers overwrite EAX immediately.
-   L is the original 20C-byte scratch base, excluding four saved registers. */
+
+   THIS0 / RET0 / void: ECX is read at entry (0x0079bf6a `mov esi, ecx`) and both
+   direct callers overwrite EAX immediately after the call.
+
+   L is the original 0x20c-byte scratch base created by `sub esp, 0x20c` at
+   0x0079bf60, before the four saved registers, i.e. esp+0x10 at the loop bodies:
+     [L+0x0]  kept counter, later reused as the interpolation slot cursor
+     [L+0x4]  compact pointer, later reused as the outer loop counter
+     [L+0x8]  flags array
+     [L+0xc]  buffer A (0x100 bytes)    [L+0x10c] buffer B (0x100 bytes)
+
+   Error paths (0x0079c0a0..0x0079c108 and 0x0079c4a2..0x0079c511): the original
+   pushes three arguments for cm_fn_0090d130 (the two buffer addresses and the
+   source line) and leaves them on the stack; the single `add esp, 0x24` at
+   0x0079c0f3/0x0079c4f8 covers all nine pushes of the three calls. The buffers
+   are handed to cm_fn_0090d130 exactly as the callee that fills them at
+   0x0079c0b4/0x0079c4b8 receives them, and the three stack values the CRT
+   varargs of cm_fn_00944c9f would observe are passed explicitly in the same
+   order, so nothing in the CRT observation depends on where this compiler put
+   its frame. No scratch byte is zero-filled; unwritten bytes stay unwritten.
+   cm_fn_0090d130 then reads its own original arguments rather than whatever
+   happens to sit above our call. */
 #define D(a) CM_GLOBAL(volatile u32, (u32)(a))
 #define W(a) CM_GLOBAL(volatile u16, (u32)(a))
 #define B(a) CM_GLOBAL(volatile u8, (u32)(a))
@@ -17,7 +34,13 @@ extern u32 CM_THISCALL cm_fn_0079c530(u32, u32);
 extern void CM_CDECL cm_fn_009452ca(u32);
 extern u32 CM_CDECL cm_fn_00944e46(u32);
 extern u32 CM_CDECL cm_fn_00944cff(u32, u32, u32, void *, void *);
-extern u32 CM_CDECL cm_fn_0090d130(void);
+/* Legacy callee: the listing pushes three arguments for it at 0x0079c0c7 and
+   0x0079c4cb (buffer A, buffer B, 0x1ff / 0x2dd) and returns its EAX as the
+   third argument of cm_fn_00944c9f. */
+extern u32 CM_CDECL cm_fn_0090d130(u32, u32, u32);
+/* Varargs are only reached through the format; the three words the original
+   leaves above them are the cm_fn_0090d130 arguments, so they are the three
+   additional values the original hands over (see the header comment). */
 extern u32 CM_CDECL cm_fn_00944c9f(u32, u32, ...);
 extern void CM_CDECL cm_fn_005e8290(u32, u32, u32);
 extern void CM_CDECL cm_fn_005cc7d0(void);
@@ -28,13 +51,13 @@ extern u32 CM_THISCALL cm_fn_005c6710(u32, u32);
 /* Native 79C5C0 reads two stack arguments, overwrites ECX before use, RET8. */
 extern void CM_STDCALL cm_fn_0079c5c0(u32, u32);
 
-static void allocation_error(u8 *name, u8 *extension, u32 line)
+static void allocation_error(u8 *first, u8 *second, u32 line)
 {
     u32 text;
-    cm_fn_00944cff(0x00a6a22cu, 0, 0, name, extension);
-    text = cm_fn_0090d130();
-    cm_fn_00944c9f(0x00ae24d0u, 0x009870e8u, text, (u32)name,
-                  (u32)extension, line);
+    cm_fn_00944cff(0x00a6a22cu, 0, 0, first, second);
+    text = cm_fn_0090d130((u32)first, (u32)second, line);
+    cm_fn_00944c9f(0x00ae24d0u, 0x009870e8u, text, (u32)first, (u32)second,
+                  line);
     cm_fn_005e8290(0x009870e0u, 0x00ae24d0u, 0);
     D(0x00b67a34u) = 0;
     cm_fn_005cc7d0();
@@ -46,7 +69,7 @@ void CM_THISCALL cm_fn_0079bf60(u32 self)
 {
     u8 scratch[0x20c];
     u32 flags, compact, kept, group, group_count, cursor, i, off, dst;
-    u32 count, base, p, q, country, nation_off, slot, value, other, nation;
+    u32 count, base, p, q, nation_off, slot, value, other, nation;
     u32 nation_record_off, j, slot_cursor, row;
     s32 n, divisor, quotient;
 
@@ -68,14 +91,14 @@ void CM_THISCALL cm_fn_0079bf60(u32 self)
     if ((s32)count > 0) {
         D((u32)scratch) = cursor;
         do {
-            country = D(cursor);
-            if (country != group) {
+            nation = D(cursor);
+            if (nation != group) {
                 group_count = 0;
-                group = country;
-            } else if (country == 0) {
+                group = nation;
+            } else if (nation == 0) {
                 B(flags + i) = 0;
             } else {
-                value = B(country + 0x11cu);
+                value = B(nation + 0x11cu);
                 if ((s32)group_count <= (value == 0 ? 5 : 60)) {
                     ++kept;
                     B(flags + i) = 1;
@@ -169,9 +192,9 @@ void CM_THISCALL cm_fn_0079bf60(u32 self)
                 p = D(0x00ae2c74u);
                 if (cm_fn_005c6710(p, base + off) == 0) {
                     base = D(0x00ae23d0u);
-                    country = D(base + off + 0x5du);
-                    if (country != 0) {
-                        nation = D(country);
+                    nation = D(base + off + 0x5du);
+                    if (nation != 0) {
+                        nation = D(nation);
                         base = D(self + 0xcu);
                         nation_off = nation * 0x102u;
                         n = (s16)W(base + nation_off + 0x10u);
@@ -204,9 +227,9 @@ void CM_THISCALL cm_fn_0079bf60(u32 self)
     if ((s32)count > 0) {
         cursor = D(0x00ae23e8u) + 0x16u;
         do {
-            country = D(cursor);
+            nation = D(cursor);
             cursor += 0x2bu;
-            nation = D(country);
+            nation = D(nation);
             base = D(self + 0xcu);
             p = base + nation * 0x102u + 4u;
             value = D(p);
@@ -277,8 +300,8 @@ void CM_THISCALL cm_fn_0079bf60(u32 self)
     i = 0;
     if ((s32)count > 0) {
         do {
-            country = D(cursor + 0x16u);
-            nation = D(country);
+            nation = D(cursor + 0x16u);
+            nation = D(nation);
             base = D(self + 0xcu);
             p = base + nation * 0x102u + 8u;
             value = D(p);

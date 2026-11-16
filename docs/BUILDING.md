@@ -45,6 +45,38 @@ also require original media/inspection manifests. They do not yet provide a
 general installation selector. A source-only clone alone cannot run the full
 recovery acceptance suite; report absent prerequisites rather than inventing them.
 
+## Local inventory entry revision (recovery contributors only)
+
+The current recovery inventory selects one coherent seeded analysis/map pair
+under `CM0102/Analysis/cmre/supply-sol-commandcode-20261115/parallel-virtual-entry/`.
+Keep the historical `baseline-c` and `recovery-map-b` inputs and receipts intact.
+These generated files, the copied executable, projects and pseudocode remain
+local; do not publish them. The selected exports are not game build inputs.
+
+After the reviewed seed-tool bundle and pinned Ghidra/Java prerequisites are
+installed, a clean workspace with the user-supplied 3.9.68 executable can
+attempt to regenerate the selected pair as follows (the output directories must
+not exist; preserve any failed run, and use a fresh workspace or restore the
+verified originals rather than overwriting existing evidence):
+
+```powershell
+$rev = "CM0102/Analysis/cmre/supply-sol-commandcode-20261115/parallel-virtual-entry"
+py -3.13 scripts/analyze_seed_prototype.py --target CM0102/Game/cm0102.exe --ghidra tools/ghidra/ghidra_12.1.4_PUBLIC --output "$rev/current-identity-fresh-f"
+py -3.13 scripts/map_seed_prototype.py --baseline "$rev/current-identity-fresh-f" --target CM0102/Game/cm0102.exe --ghidra tools/ghidra/ghidra_12.1.4_PUBLIC --output "$rev/current-identity-map-f" --functions 0051a150 0051c020
+```
+
+The map wrapper currently requires Java 21.0.10 at its documented Windows host
+path; fresh analysis may require the same observed host symbol/environment
+inputs. Both commands check the pinned executable; the seeded analysis also rejects
+an unexpected seed result. Run them only when their reviewed scripts are present; neither a
+source-only clone nor the commands themselves recreate acceptance evidence.
+Before running recovery, verify all three selected hashes in `cmre/env.py`;
+matching outputs on this host do not prove cross-host reproducibility. If any
+required data, tool or hash is unavailable, report the check unavailable or
+failed; do not change pins, fetch game files, or substitute another map. After
+an authorized inventory revision use fresh processes, because inventory data
+is cached in-process. Release revalidation remains a separate requirement.
+
 ## Retaining and restoring withdrawn local C evidence
 
 `py -3.13 -m cmre retract-c fn_X --reason "..." --witness PATH` previews withdrawal

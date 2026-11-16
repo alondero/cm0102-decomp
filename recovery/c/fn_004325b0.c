@@ -7,7 +7,16 @@
    L+0x110/L+0x310, respectively. The original DWORD pushes from L+4/L+8
    contain unknown upper halves, but 0x00522e00 observes only their low WORDs
    at VAs 0x00522e5e/0x00522e6c. Its seventh stack argument is likewise read
-   only as a WORD at 0x00522e31; the caller's scratch-pointer high half is dead. */
+   only as a WORD at 0x00522e31; the caller's scratch-pointer high half is dead.
+
+   Unresolved gate boundary: the true constructor vtable slot 0x3c names
+   preferred-image VA 0x00431ac0, reportedly absent from the pinned inventory.
+   The original instructions at 0x0043265f and 0x0043266a load the object's
+   vtable and call its slot 0x3c with ECX=self and four stack arguments.
+   Preserve that dispatch below; substituting an inventoried target or a stub
+   would not resolve the missing original-entry contract. Parent inventory /
+   contract evidence and unchanged-source revalidation are still required.
+   All addresses in this comment refer to the SHA-256 pinned above. */
 #include "cmre.h"
 
 extern unsigned long long cm_fn_00944e46(u32 size);
@@ -36,8 +45,8 @@ u32 CM_FASTCALL cm_fn_004325b0(u32 self)
     u32 virtual_result;
     u32 allocation;
     u16 word40;
-    u16 out4;
-    u16 out8;
+    u32 out4;
+    u32 out8;
     u32 field4;
     u32 slot;
     u32 object;
@@ -83,10 +92,12 @@ u32 CM_FASTCALL cm_fn_004325b0(u32 self)
     *(volatile u32 *)(scratch + 12) = allocation;
     frame.state = 0;
     if (allocation != 0) {
-        out4 = *(volatile u16 *)(scratch + 4);
+        /* 0x0043268b reads the entire DWORD, even though the boundary
+           consumes the low WORD. Retain the original access width. */
+        out4 = *(volatile u32 *)(scratch + 4);
         word40 = *(volatile u16 *)(self + 0x40u);
         field4 = *(volatile u32 *)(self + 4u);
-        out8 = *(volatile u16 *)(scratch + 8);
+        out8 = *(volatile u32 *)(scratch + 8);
         object = cm_fn_00522e00(allocation, self, 4, members, out8,
             field4, virtual_result, word40, 0, 1, out4, 0x14, 0, 1,
             0, (u32)scratch);

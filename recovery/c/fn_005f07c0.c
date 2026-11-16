@@ -1,4 +1,4 @@
-/* WIP: semantic mismatch remains in the invalid-byte error path (case 7: original returns, C faults at VA 0x009480d0 reading 0x6c6c6168; other current cases show memory page 0x00ae2000). Tried explicit signed byte and shared scratch buffers; five failed invocations exhausted. */
+/* The error formatter receives the deferred buffer and line pushes, not d130. */
 /* Draft for preferred-image VA 0x005f07c0, image base 0x00400000, converted from Ghidra 12.1.4
    pseudocode by `cmre draft`. Unvalidated: check names, widths and signedness against
    `cmre show --asm`; acceptance comes only from `cmre test --c` and `cmre accept --c`. */
@@ -72,7 +72,7 @@
 #define s_v_s__s__s__d_009870e8 ((u32)0x009870e8)
 extern void cm_fn_005e8290(const char * param_1,const char * param_2,int param_3);
 extern char * CM_CDECL cm_fn_0066f4e0(u32 destination,u32 format,...);
-extern char * cm_fn_0090d130(...);  /* NEEDS-REVIEW: callee draft says (void); these are usually arguments MSVC pushed for the next call (right-to-left evaluation, deferred cleanup) */
+extern char * cm_fn_0090d130(void);
 extern u32 CM_CDECL cm_fn_00944c9f(u32 destination, u32 format, ...);
 extern u32 CM_CDECL cm_fn_00944cff(u32 arg1, u32 arg2, u32 arg3, void *arg4, void *arg5);
 
@@ -298,8 +298,8 @@ u32 CM_CDECL cm_fn_005f07c0(s8 param_1,int param_2,int param_3,int param_4)
       uVar3 = 0x496;
     }
   }
-  uVar3 = (u32)cm_fn_0090d130(puVar1,puVar2,uVar3);
-  cm_fn_00944c9f((u32)&DAT_00ae24d0,(u32)0x009870e8,uVar3);
+  cm_fn_00944c9f((u32)&DAT_00ae24d0,(u32)0x009870e8,
+                 cm_fn_0090d130(),puVar1,puVar2,uVar3);
   cm_fn_005e8290(s_Error_009870e0,(const char *)(u32)&DAT_00ae24d0,0);
   DAT_00b67a34 = 0;
   return 0;

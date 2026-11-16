@@ -1,4 +1,5 @@
-/* WIP: cases 81/193/243 still differ on page 0xae2000. The latest source models the deferred printf arguments from the live pushes, but the local-buffer order/output mismatch remains unresolved. Six failed test invocations were used; stop here pending review. */
+/* Allocation-failure scratch buffers share the original L and L+0x100 layout;
+   the deferred printf arguments are L+0x100, L, 0xa8. */
 /* Draft for preferred-image VA 0x0084d220, image base 0x00400000, converted from Ghidra 12.1.4
    pseudocode by `cmre draft`. Unvalidated: check names, widths and signedness against
    `cmre show --asm`; acceptance comes only from `cmre test --c` and `cmre accept --c`. */
@@ -27,8 +28,7 @@ cm_fn_0084d220(u32 param_1,s8 param_2,u16 *param_3,u16 *param_4,u32 *param_5)
 {
   void *pvVar1;
   u32 uVar2;
-  u8 local_200 [256];
-  u8 local_100 [256];
+  u8 scratch[0x200];
   
   if (param_2 == -1) {
     if (param_5 != (u32 *)0x0) {
@@ -166,9 +166,9 @@ cm_fn_0084d220(u32 param_1,s8 param_2,u16 *param_3,u16 *param_4,u32 *param_5)
       *(u32 *)((int)pvVar1 + 0x2d4) = 0;
       return pvVar1;
     }
-    cm_fn_00944cff((u32)s_E__dev_CM3_cm3_00_01_cm3_code_co_00a82810,0,0,local_100,local_200);
+    cm_fn_00944cff((u32)s_E__dev_CM3_cm3_00_01_cm3_code_co_00a82810,0,0,scratch+0x100,scratch);
     uVar2 = (u32)cm_fn_0090d130();
-    cm_fn_00944c9f((u32)&DAT_00ae24d0,(u32)s_v_s__s__s__d_009870e8,uVar2,(u32)local_200,(u32)local_100,0xa8);
+    cm_fn_00944c9f((u32)&DAT_00ae24d0,(u32)s_v_s__s__s__d_009870e8,uVar2,(u32)(scratch+0x100),(u32)scratch,0xa8);
     cm_fn_005e8290(s_Error_009870e0,(const char *)&DAT_00ae24d0,0);
     DAT_00b67a34 = 0;
   }

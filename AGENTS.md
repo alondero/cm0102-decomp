@@ -79,8 +79,9 @@ integration separately. Reuse unchanged evidence; add checks for a named gap.
   a source extension does not turn a raw dump into authored reconstruction.
 - Supplied executables/media, original or extracted game content, credentials
   and raw analysis stay local, outside published history and packages.
-- Adam's standing authorization (2026-11-14): commit and push repo-worthy,
-  reviewed batches as work progresses, using explicit paths. Before every push,
+- Adam's standing authorization (2026-11-14, reaffirmed 2026-11-16): commit and
+  push repo-worthy, reviewed batches as work progresses, using explicit paths;
+  every session ends with its publishable work pushed. Before every push,
   the publication workflow must scan the exact commit and reachable history for
   the intended remote. Keep excluded content and unresolved source defects local.
   `cmre task publish` remains local acceptance, separate from Git publication.

@@ -1,4 +1,5 @@
-/* WIP: five failed test iterations exhausted. Semantic cases 13/27/31 and others still differ on non-stack page 0x00ae2000 (cov=0.8632, inc=67); the remaining memory mismatch cause is unresolved. */
+/* Error formatting passes the two scratch buffers and line number to sprintf,
+   not to the no-argument 0090d130 call. */
 /* Draft for preferred-image VA 0x004093f0, image base 0x00400000, converted from Ghidra 12.1.4
    pseudocode by `cmre draft`. Unvalidated: check names, widths and signedness against
    `cmre show --asm`; acceptance comes only from `cmre test --c` and `cmre accept --c`. */
@@ -41,7 +42,7 @@
 #define s_Error_009870e0 ((char *)0x009870e0)
 #define s_v_s__s__s__d_009870e8 ((char *)0x009870e8)
 extern void cm_fn_005e8290(const char * param_1,const char * param_2,int param_3);
-extern char * cm_fn_0090d130(...);  /* NEEDS-REVIEW: callee draft says (void); these are usually arguments MSVC pushed for the next call (right-to-left evaluation, deferred cleanup) */
+extern char * cm_fn_0090d130(void);
 extern u32 CM_CDECL cm_fn_00944c9f(u32 destination, u32 format, ...);
 extern u32 CM_CDECL cm_fn_00944cff(u32 arg1, u32 arg2, u32 arg3, void *arg4, void *arg5);
 extern unsigned long long CM_CDECL cm_fn_009452ca(u32 arg4);
@@ -61,18 +62,19 @@ void CM_THISCALL cm_fn_004093f0(int param_1)
   u8 *local_200 = scratch;
   u8 *local_100 = scratch + 0x100;
   
-  *(volatile short *)(param_1 + 0x34) = *(volatile short *)(param_1 + 0x3e);
-  iVar2 = (int)(u32)cm_fn_00945501((int)*(volatile short *)(param_1 + 0x3e),0x13);
+  iVar2 = *(volatile short *)(param_1 + 0x3e);
+  *(volatile short *)(param_1 + 0x34) = (short)iVar2;
+  iVar2 = (int)(u32)cm_fn_00945501(iVar2,0x13);
   iVar4 = 0;
   *(volatile int *)(param_1 + 0x18) = iVar2;
   if (iVar2 == 0) {
     cm_fn_00944cff(s_E__dev_CM3_cm3_00_01_cm3_code_co_009874ec,0,0,local_100,local_200);
-    puVar6 = local_100;
-    puVar5 = local_200;
+    puVar6 = local_200;
+    puVar5 = local_100;
     uVar7 = 0x638;
 LAB_00409ba5:
-    uVar7 = (u32)cm_fn_0090d130(puVar5,puVar6,uVar7);
-    cm_fn_00944c9f((u32)&DAT_00ae24d0,(u32)s_v_s__s__s__d_009870e8,uVar7);
+    iVar2 = (int)cm_fn_0090d130();
+    cm_fn_00944c9f((u32)&DAT_00ae24d0,(u32)s_v_s__s__s__d_009870e8,iVar2,puVar5,puVar6,uVar7);
     cm_fn_005e8290(s_Error_009870e0,(char *)&DAT_00ae24d0,0);
     DAT_00b67a34 = 0;
     return;
