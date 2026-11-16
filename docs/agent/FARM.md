@@ -499,7 +499,7 @@ moves; these are the byte pools, largest first:
 
 | Pool (work-state blockers) | Held bytes | What releases it |
 | --- | --- | --- |
-| x87 call boundary (`x87-live-stack`, `x87-power-call-boundary`, `original-live-x87-argument`, 11 smaller) | 161 KB, ~30 fn | A policy-approved way for plain C to call an original routine that takes or returns values on the x87 stack (for example `0x00945ff0`) |
+| x87 `_CIpow` transport (holds naming `0x00945ff0`) | 97 KB, 18 fn (8 fn / 38 KB blocked by the transport alone) | ADR 0010 release, prepared on branch `release/x87-cipow-20261116`: the `cm_x87_CIpow` bridge plus `-mno-sse3`. Apply at a batch boundary with one full revalidation, then `retry` these functions. The other x87 holds call only `__ftol`, which ADR 0006 already allows; the 15 Nov run attempted them and they failed on translation mismatches, so they are ordinary retry work |
 | Import out-parameters (`native-directory-output`, `file-search-import-outparams`, `shutdown-uninitialized-find-output`, `unwritten-*-output`, `readfile-import-outparams`) | 85 KB, ~60 fn | Import stubs that write their output buffers (recorded results, item 1) |
 | Virtual-entry inventory (`missing-real-virtual-entry`, `virtual-target-inventory-entry`, `real-virtual-*`) | 27 KB, ~45 fn | Inventory entries for real vtable targets (the `fn_0051c020` seed flow of 15 Nov) |
 | Stack-probe fault address (`callee-stack-probe-address`, `*stack-probe*`) | 25 KB, ~15 fn | A harness rule for a stack-exhaustion fault at the same original instruction whose address differs only by frame layout (`fn_006146b0`: 598 of 600 cases equal) |

@@ -7,6 +7,10 @@ extern u32 CM_CDECL cm_fn_005e2eb0(volatile u32 first, volatile u32 second, vola
 
 u32 CM_THISCALL cm_fn_00402d10(volatile u8 *self)
 {
+    /* Unresolved: if 00403760 returns without writing these words, original
+       VAs 00402d27 and 00402d2f consume preexisting stack contents. C cannot
+       recover their incoming values from this evidence. Pinned image SHA-256:
+       0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86. */
     volatile u32 output[2];
     u32 x, y, current, a, b, c, d;
     cm_fn_00403760((u32)self, (u32)&output[0], (u32)&output[1]);
