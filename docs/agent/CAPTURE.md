@@ -40,11 +40,33 @@ reach more of a function.
 Completion: a session summary with reached functions and bytes, and capture
 files under `local/captures/`.
 
+### Fullscreen and season-boundary capture
+
+When a windowed client is black but its cursor/UI still responds, preserve the
+process evidence and ask the owner for display intervention. On 2026-11-17,
+the owner loaded a reference save and selected fullscreen in the unchanged
+primary executable; rendering returned and holiday progression worked. This
+is an observed workaround, not a diagnosis or a guarantee for other hosts.
+Keep that working mode: take PID-scoped client screenshots without restoring,
+repositioning or refocusing the window. Desktop driving requires the owner's
+current permission and a bounded handover deadline.
+
+For season-transition supply, load a suitable local reference save and let
+holiday progression cross late July/early August without UI interruptions.
+Keep the same game process across bounded, non-overlapping recording rounds,
+with a fresh status/output path for each. Heavy transition processing or a
+capture plateau is not by itself a hang; inspect the visible game and retained
+progress before intervening. Entry captures do not establish every call or
+replay native import outputs.
+
 ## 2. Expand and apply (no game needed; parallel)
 
+During an active farm, name unaccepted targets explicitly and retain their
+existing effective fixture/capture prefixes and execution policies:
+
 ```powershell
-py -3.13 -m cmre capture expand --jobs 16 --output CM0102/Analysis/cmre/captures/expand-N.json
-py -3.13 -m cmre capture apply --jobs 16 --output CM0102/Analysis/cmre/captures/apply-N.json
+py -3.13 -m cmre capture expand fn_XXXXXXXX --jobs 4 --output CM0102/Analysis/cmre/captures/expand-N.json
+py -3.13 -m cmre capture apply fn_XXXXXXXX --jobs 4 --output CM0102/Analysis/cmre/captures/apply-N.json
 ```
 
 `expand` adds derived inputs only where the original executes new instructions
@@ -53,6 +75,12 @@ hints as `captures` (removing `"auto": true`, which claims the hint), and runs
 the unchanged lifted gate. Its summary lists `passing` functions and their
 bytes. Both commands default to every function that has stored captures; name
 `fn_XXXXXXXX` IDs to bound them. Neither takes the writer lease.
+
+If greedy selection would replace an existing prefix, prepare a private
+append-only proposal for review and supported hint application instead.
+Accepted lifts need C-only additions; accepted C needs explicit parent input
+maintenance and fresh identity-bound review. Additional stored captures alone
+authorize neither changing an accepted corpus nor dropping a failing case.
 
 By default `expand` changes only captured registers, stack words and memory
 bytes. `--mutate-import-seed` opts into also mutating the u32
@@ -83,8 +111,8 @@ lease, so the parent runs it between recovery batches:
 py -3.13 -m cmre accept fn_XXXXXXXX
 ```
 
-Accepted lifts enter `cmre next --c`. Translate them through [C.md](C.md);
-their C tests replay the same captures.
+Accepted lifts enter `cmre next --c`; the running [farm](FARM.md) picks them up.
+Their C tests replay the same captures.
 
 Completion: accepted lifted records; `cmre pipeline survey` shows the bytes
 moved from `unlifted` to `lifted`.
