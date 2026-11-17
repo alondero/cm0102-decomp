@@ -10,7 +10,8 @@ import pytest
 from native_debug_fixture import ROOT, Unavailable, build_fixture
 from native_import_observer import observe_calls, _exit_transition_candidate
 from cmre import capture_record as api
-import native_import_observer as backend
+from cmre import debug_observe as backend
+import native_import_observer as child_driver
 
 
 @pytest.fixture(scope="module")
@@ -222,14 +223,14 @@ def test_received_native_exit_checked_before_dispatch(
         # Do NOT mutate the shared time module or native event bytes.
         monkeypatch.setattr(backend, "time", SimpleNamespace(monotonic=clock))
 
-    popen = backend.subprocess.Popen
+    popen = child_driver.subprocess.Popen
 
     class OwnedChild(popen):
         def kill(self):
             control["kill_started"] = True
             return super().kill()
 
-    monkeypatch.setattr(backend.subprocess, "Popen", OwnedChild)
+    monkeypatch.setattr(child_driver.subprocess, "Popen", OwnedChild)
 
     def continued(pid, tid, status):
         if control.get("delivered") and (pid, tid) == control["event_identity"]:
