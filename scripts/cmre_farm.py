@@ -831,8 +831,12 @@ class InlineExecutor:
 
 
 class Farm:
-    def __init__(self, run_dir, root, cmre, launcher, config, clock=time.monotonic, verifier=None, *, reconcile=True):
+    def __init__(self, run_dir, root, cmre, launcher, config, clock=time.monotonic, verifier=None, *, reconcile=True,
+                 request_only=False):
         self.run_dir, self.root, self.cmre, self.launcher, self.config = Path(run_dir), Path(root), cmre, launcher, config
+        # Process-local capability, deliberately outside FarmConfig/control.json:
+        # offline requests may gate/accept, but no live setting can enable model work.
+        self.request_only = request_only
         self.clock = clock
         # Gate re-tests (median 48 s per job) run here so they never block dispatch.
         self.verifier = verifier or InlineExecutor()
@@ -1446,7 +1450,7 @@ class Farm:
         return path
 
     def _dispatch(self):
-        if self.stopping():
+        if self.request_only or self.stopping():
             return
         translators = [j for j, _, _ in self.running if j['kind'] != 'audit']
         while len(translators) < self.config.workers:
@@ -2689,7 +2693,7 @@ def apply_requests_now(run_dir):
         state = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))
         config = FarmConfig(workers=0, ladder=['-'], audit_workers=0, audit_model=None, attempt_minutes=1,
                             hours=None, min_bytes=0, max_bytes=None, include_held=False, owner=state.get('owner', ''))
-        farm = Farm(run_dir, ROOT, CmreAdapter(), None, config)
+        farm = Farm(run_dir, ROOT, CmreAdapter(), None, config, request_only=True)
         farm.tick()
         while farm.verifying or farm.accept_queue or farm._has_unquarantined_requests():
             time.sleep(5)

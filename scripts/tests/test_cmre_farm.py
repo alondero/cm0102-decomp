@@ -1188,6 +1188,34 @@ def test_restart_requeues_terminal_audit_without_current_identity(root, identity
     assert fn in resumed.audit_queue
 
 
+def test_offline_adopt_accepts_without_dispatch_from_persistent_controls(root, monkeypatch):
+    f, cmre, job, canonical = prepared_candidate(root)
+    cmre.items = [item('fn_00401100')]
+    control = f.run_dir / 'control.json'
+    control.write_text(json.dumps({'workers': 24, 'audit_workers': 8,
+                                   'ladder': ['m/live'], 'audit_model': 'm/audit',
+                                   'confirm_model': 'm/confirm'}))
+    before = control.read_bytes()
+    request = reviewed_request(f, job['fn'], 'adopt', source=job['source'])
+    monkeypatch.setattr(farm, 'ROOT', root)
+    monkeypatch.setattr(farm, 'CmreAdapter', lambda: cmre)
+
+    # These assertions also show that any dispatch failure comes AFTER acceptance.
+    try:
+        result = farm.apply_requests_now(f.run_dir)
+    finally:
+        assert cmre.accepted == [job['fn']]
+        assert canonical.read_text() == GOOD
+        assert not request.exists()
+    assert result.launcher is None
+    assert not result.running
+    assert len(cmre.tests) >= 2  # candidate and installed-source gates still run
+    assert control.read_bytes() == before
+    assert json.loads(result.state_path.read_text())['accepted'][job['fn']]
+    events, _ = farm._read_events(f.run_dir / 'events.jsonl', 0)
+    assert not any(e['event'] == 'dispatch' for e in events)
+
+
 def test_offline_lock_precedes_state_read(root, monkeypatch):
     f, _, _ = make(root, [], writes(GOOD), workers=0)
     f.save()
@@ -1196,9 +1224,88 @@ def test_offline_lock_precedes_state_read(root, monkeypatch):
             farm.apply_requests_now(f.run_dir)
 
 
+def test_offline_without_requests_never_probes_or_claims_supply(root, monkeypatch):
+    f, cmre, _ = make(root, [item('fn_00401100')], writes(GOOD), workers=0)
+    f.save()
+    control = f.run_dir / 'control.json'
+    control.write_text(json.dumps({'workers': 24, 'audit_workers': 8, 'ladder': ['m/live'],
+                                   'audit_model': 'm/audit', 'confirm_model': 'm/confirm',
+                                   'request_only': False}))
+    before = control.read_bytes()
+    def unexpected(*args, **kwargs):
+        pytest.fail('offline requests must not probe models or fetch/claim model supply')
+    monkeypatch.setattr(cmre, 'frontier', unexpected)
+    monkeypatch.setattr(cmre, 'claim', unexpected)
+    monkeypatch.setattr(cmre, 'brief', unexpected, raising=False)
+    monkeypatch.setattr(farm, 'probe', unexpected)
+    monkeypatch.setattr(farm, 'make_launcher', unexpected)
+    monkeypatch.setattr(farm, 'ROOT', root)
+    monkeypatch.setattr(farm, 'CmreAdapter', lambda: cmre)
+
+    result = farm.apply_requests_now(f.run_dir)
+    # A subsequent control reload also cannot remove the process-local restriction.
+    result.tick()
+    assert result.launcher is None
+    assert not result.running and not result.pending
+    assert not cmre.tests and not cmre.accepted
+    assert result.config.workers == 24 and result.config.audit_workers == 8
+    assert result.config.ladder == ['m/live']
+    assert control.read_bytes() == before
+
+
+@pytest.mark.parametrize('lane', ['translate', 'fix', 'audit', 'confirm'])
+def test_request_only_blocks_model_lanes_but_later_live_run_dispatches(root, lane):
+    fn = 'fn_00401000'
+    if lane == 'fix':
+        f, cmre, _, _ = bound_automatic_fix(root)
+        launcher = f.launcher
+    else:
+        f, cmre, launcher = make(root, [item(fn)] if lane == 'translate' else [],
+                                 writes(GOOD), workers=0,
+                                 confirm_model='m/confirm' if lane == 'confirm' else None)
+        if lane in ('audit', 'confirm'):
+            (root / f'recovery/c/{fn}.c').write_text(GOOD)
+            f.state['accepted'][fn] = {'bytes': 200}
+            if lane == 'confirm':
+                seed_unconfirmed_audit(f, fn, [{'detail': 'FAKE concern', 'evidence': 'FAKE listing'}])
+    f.save()
+    launcher.started.clear()
+    control = f.run_dir / 'control.json'
+    control.write_text(json.dumps({'workers': 24 if lane in ('translate', 'fix') else 0,
+                                   'audit_workers': 8 if lane in ('audit', 'confirm') else 0,
+                                   'ladder': ['m/live'], 'audit_model': 'm/audit',
+                                   'confirm_model': 'm/confirm', 'request_only': False}))
+    before = control.read_bytes()
+    offline = farm.Farm(f.run_dir, root, cmre, launcher, f.config, request_only=True)
+    offline.pending.extend(f.pending)  # retained in-process fix work is not dispatched either
+    pending = list(offline.pending)
+    for _ in range(2):
+        offline.tick()
+    assert not launcher.started and not offline.running
+    assert offline.pending == pending
+    assert control.read_bytes() == before
+
+    # No offline marker is persisted: the next real supervisor still honors model controls.
+    live = farm.Farm(f.run_dir, root, cmre, launcher, f.config)
+    live.pending.extend(offline.pending)
+    live.tick()
+    assert len(launcher.started) == 1
+    dispatched = launcher.started[0][0]
+    assert dispatched['kind'] == ('audit' if lane == 'confirm' else lane)
+    assert bool(dispatched.get('confirm')) == (lane == 'confirm')
+    assert dispatched['model'] == ('m/confirm' if lane == 'confirm' else
+                                    'm/audit' if lane == 'audit' else 'm/live')
+    assert control.read_bytes() == before
+
+
 def test_offline_drains_second_request_queued_during_verification(root, monkeypatch):
     from concurrent.futures import Future
     f, cmre, job, canonical = prepared_candidate(root)
+    cmre.items = [item('fn_00401100')]
+    control = f.run_dir / 'control.json'
+    control.write_text(json.dumps({'workers': 24, 'audit_workers': 8,
+                                   'ladder': ['m/live'], 'audit_model': 'm/audit'}))
+    before = control.read_bytes()
     monkeypatch.setattr(farm, 'ROOT', root)
     monkeypatch.setattr(farm, 'CmreAdapter', lambda: cmre)
     reviewed_request(f, job['fn'], 'adopt', source=job['source'])
@@ -1229,6 +1336,8 @@ def test_offline_drains_second_request_queued_during_verification(root, monkeypa
     assert len(cmre.accepted) == 2
     assert not result.verifying and not result.accept_queue
     assert not list((f.run_dir / 'requests').glob('*.json'))
+    assert result.launcher is None and not result.running
+    assert control.read_bytes() == before
 
 
 @pytest.mark.parametrize('boundary', ['prepared', 'installing', 'installed', 'accepted', 'complete'])
