@@ -41,6 +41,10 @@ void CM_THISCALL cm_fn_00663a50(u32 self)
            Evidence: pinned 3.9.68 SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86. */
         v = ((u32 (CM_THISCALL *)(u32,u32,void *,void *,u32))CM_GLOBAL(volatile u32,table+0x3c))(self,2,s,s+4,0);
         obj = (u32)cm_fn_00944cf1(0xb2);
+        /* 00663af7 mov [esp+0x14],eax spills the allocation result at
+           scratch+8 before 00663afd clears SEH state (VA proof: pinned
+           3.9.68 bytes 89442414 / c78424200400000000000000). */
+        CM_GLOBAL(volatile u32, (u32)(s + 8)) = obj;
         frame.state = 0;
         if (obj) {
             a = CM_GLOBAL(volatile u32,(u32)(s+4));

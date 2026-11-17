@@ -167,12 +167,15 @@ void CM_FASTCALL cm_fn_0043a900(u32 self)
   if (created != 0) {
     u32 comp;
     u32 yw;
+    u16 year_word;
 
-    /* 0x0043aa49 `mov ecx,[esi+4]`, 0x0043aa3e `mov dx,word [esi+0x40]`:
-       the year argument is the partial-register artefact of the original
-       (upper half still the address in EDX, lower half the word), kept as is. */
+    /* 0x0043aa3e reads [esi+0x40] before 0x0043aa49 reads [esi+4]; sequence
+       the volatile object reads in that order.  Year keeps the original
+       partial-register value (upper half from the address in EDX, lower half
+       the word). */
+    year_word = (u16)CM_LD16(self + 0x40);
     comp = CM_LD32(self + 4);
-    yw = ((u32)&S & 0xffff0000u) | (u32)CM_LD16(self + 0x40);
+    yw = ((u32)&S & 0xffff0000u) | (u32)year_word;
     /* receiver ECX = the 0xb2 allocation (0x0043aa5c); 15 pushed dwords. */
     created = cm_fn_00522e00(created, self, 2, (u32)p8, (s16)S.slot8, comp,
                              vt_result, (u16)yw, 2, 1, (u16)S.slot4, 0x14, 0, 1,

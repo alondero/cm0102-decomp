@@ -233,7 +233,10 @@ u32 CM_THISCALL cm_fn_008c39f0(u32 self, u32 *param_2, u32 param_3)
                     if ((*(u8 *)(unsigned long)ea2 & 0x20) != 0) {
                       u32 e;
 
-                      if (p != 0 && (int)id2 < G_AE2364) {
+                      /* 008c3c6e test esi,esi / 008c3c70 je 008c3c7e: a null
+                         receiver skips the 008c3c72 bound check but still runs
+                         the 008c3c7e map-bit test and the 008c3ca5 lookup. */
+                      if (p == 0 || (int)id2 < G_AE2364) {
                         if ((*(u8 *)(unsigned long)ea2 & 0x20) == 0) {
                           e = 0;
                         }
