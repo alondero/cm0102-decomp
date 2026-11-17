@@ -2883,9 +2883,16 @@ def test_commandcode_flash_matches_go_effort_tiers_not_fast():
     go = 'opencode-go/deepseek-v4.1-flash'
     commandcode = 'commandcode/deepseek/deepseek-v4.1-flash'
     assert farm.COMMANDCODE_FLASH_MODEL == commandcode
-    assert farm.DEFAULT_LADDER[1:-1] == (
+    assert farm.DEFAULT_LADDER[1:-2] == (
         go + '#low', commandcode + '#low', go, commandcode)
     assert not any('flash-fast' in model for model in farm.DEFAULT_LADDER)
+
+
+def test_default_worker_ladder_includes_free_hy4_and_separate_minimax_plan():
+    assert farm.DEFAULT_LADDER[0] == 'minimax-coding-plan/MiniMax-M3.1-Flash'
+    assert farm.HY4_FLASH_MODEL == 'opencode-go/hy4-flash-free'
+    assert farm.DEFAULT_LADDER[-2:] == (farm.HY4_FLASH_MODEL, farm.TERRA_MODEL)
+    assert 'opencode-go/minimax-m3.1-flash' not in farm.DEFAULT_LADDER
 
 
 @pytest.mark.parametrize('provider, expected', [
