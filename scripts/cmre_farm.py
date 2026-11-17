@@ -36,10 +36,11 @@ sys.path.insert(0, str(ROOT))
 # Adam added Terra as an ordinary farm lane on 2026-11-15 after provider quotas ran low.
 TERRA_MODEL = 'openai/gpt-6.1-terra'
 COMMANDCODE_FLASH_MODEL = 'commandcode/deepseek/deepseek-v4.1-flash'
+HY4_FLASH_MODEL = 'opencode-go/hy4-flash-free'
 # Same capability/effort tiers as Go, with independent provider availability. Not Flash Fast.
 DEFAULT_LADDER = ('minimax-coding-plan/MiniMax-M3.1-Flash', 'opencode-go/deepseek-v4.1-flash#low',
                   COMMANDCODE_FLASH_MODEL + '#low', 'opencode-go/deepseek-v4.1-flash',
-                  COMMANDCODE_FLASH_MODEL, TERRA_MODEL)
+                  COMMANDCODE_FLASH_MODEL, HY4_FLASH_MODEL, TERRA_MODEL)
 DEFAULT_AUDIT_MODEL = TERRA_MODEL
 # A defect needs a second auditor before any fix: the MiniMax M3 auditor flagged 8 of 8 functions
 # with false positives, DeepSeek #low passed real defects (cross-audits, 2026-11-13). The second
