@@ -302,7 +302,8 @@ directory), `events.jsonl`, `src/` candidates, `bundle/` job inputs, `audit/`
 verdicts, `audit/snapshots/` dispatch inputs, `transactions/` durable candidate
 journals, `reviews/` explicit immutable review claims, `hints/` private input
 proposals/receipts, `fix/snapshots/` automatic-fix dispatch evidence, `hand/` manual
-defect fixes, `requests/` (including immutable
+defect fixes, `x87-mutants/` retained ADR 0010 operand-mutant receipts,
+`requests/` (including immutable
 `requests/candidates/` proposals and `requests/rejected/` evidence), and `logs/`
 (prompts and worker transcripts). Retain/archive these together with their
 receipts and identities under the policy below. They are local evidence; never publish them.
@@ -344,6 +345,16 @@ inputs with `retry`; an input-bound candidate is re-gated automatically. There i
 no claimed real-worker mutation-provenance adapter. Unrelated canonical changes
 are preserved and parked; provider/auth paths never restore canonical hints.
 Private drafts replaced on redispatch are retained with their dispatch metadata.
+
+For an accepted lift with no accepted C, the hint applier permits append-only
+`c_hints` fixtures/captures and provenance without changing shared inputs or
+generator policy. The existing effective C input prefix includes inherited
+shared fixtures/captures and must remain intact. Use `--expected-sha256 absent`
+only when the canonical hint file is absent; the tool rechecks that absence
+under its writer lease and retains a prior-absence receipt. Remove `auto: true`
+to claim an edited hint. Accepted-C and legacy records remain refused by this
+tool: changes to their inputs require explicit parent review and the farm's
+fresh identity-bound adoption protocol, not an automatic fixture append.
 
 Adopt/dismiss requests must carry `--review-receipt` from the actual prior
 `review --claim NAME`, not a new claim created after a hand fix is reviewed.
@@ -449,6 +460,11 @@ before writing. Then:
 - Unknown meaning stays unnamed. Never invent logic, defaults or initialization.
 - Five failed tests (build failures count) end the attempt. Report the first
   remaining mismatch on the final line; the farm escalates to a stronger model.
+- A candidate that still needs work must keep its truthful
+  `UNVALIDATED CANDIDATE`, `must not be accepted` or `BLOCKER:` statement.
+  The farm refuses such a source; never delete a disclaimer merely to get it
+  accepted. Resolve the boundary, or leave the candidate blocked for the parent
+  input lane.
 
 ## Audit checklist
 

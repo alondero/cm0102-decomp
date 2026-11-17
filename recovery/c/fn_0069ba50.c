@@ -48,7 +48,7 @@ extern void CM_CDECL    cm_fn_00547e70(u32 object, u32 value, u32 selector);
 extern void CM_FASTCALL cm_fn_0054a110(u16 *param_1);
 extern int  CM_THISCALL cm_fn_0054cdb0(u32 self, u32 a, u32 b);
 extern unsigned long long CM_THISCALL cm_fn_005fd210(void *self, u32 arg1);
-extern u32  CM_THISCALL cm_fn_005fea50(u32 self, s8 category, u32 person);
+extern u8   CM_THISCALL cm_fn_005fea50(u32 self, s8 category, u32 person); /* caller tests AL at 0x0069c4ec */
 extern u32  CM_CDECL    cm_fn_00600a50(u32 club, u32 skip_status, u8 flag, u32 person, u32 force);
 extern unsigned long long CM_FASTCALL cm_fn_0068d0d0(volatile u8 *self, u32 edx_in, const u8 *src, s16 count);
 extern void CM_THISCALL cm_fn_0069ca00(u32 self, volatile u32 club_arg, volatile u32 person_arg);

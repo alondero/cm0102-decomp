@@ -1,5 +1,5 @@
 /* fn_005a8090 - preferred-image VA 0x005a8090, image base 0x00400000.
-   CM0102 3.9.68 SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1c627a22c445d14d489bd9bff86.
+   CM0102 3.9.68 SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
 
    Prologue resolution (held concern, 0x005a8090/0x005a8095):
      mov eax,0x16c0 ; call 0x00945610  is MSVC's stack probe helper.  The helper
@@ -115,10 +115,23 @@ u32 CM_STDCALL cm_fn_005a8090(u32 arg1, u32 arg2, u32 arg3)
         (void)cm_fn_0053e140(frame[3], frame[1], frame[2],
                              (u32)(base + 0x1a8), 0x190, 5, v0);
 
+        /* Formatter argument order in the v9 == 1 branch is fixed by the
+           original push sequence at preferred-image VAs (pinned binary
+           SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86):
+           0x005a82d2 lea edx,[esp+0x1b8] (second buffer, base+0x1a8) and
+           0x005a82d9 lea eax,[esp+0x28] (first buffer, base+0x18); then
+           0x005a82dd cmp esi,1 / 0x005a82e0 push edx / 0x005a82e1 push eax /
+           0x005a82e2 jne.  On equality: 0x005a82e4 push 0x64,
+           0x005a82e6 lea ecx,[esp+0x354] (destination, base+0x338),
+           0x005a82ed push 0x9cbc44 (format), 0x005a82f2 push ecx,
+           0x005a82f3 call 0x66f4e0, 0x005a82f8 add esp,0x14 (five arguments).
+           cdecl pushes in reverse, so the call is
+           destination, format, 0x64, first buffer, second buffer: 0x64 is the
+           first variadic argument, not the last. */
         if (v9 == 1) {
             (void)cm_fn_0066f4e0((char *)(base + 0x338), (char *)0x009cbc44,
-                                 (char *)(base + 0x18), (char *)(base + 0x1a8),
-                                 0x64);
+                                 0x64, (char *)(base + 0x18),
+                                 (char *)(base + 0x1a8));
         } else {
             (void)cm_fn_0066f4e0((char *)(base + 0x338), (char *)0x009cbbe4,
                                  (char *)(base + 0x18), (char *)(base + 0x1a8));

@@ -201,12 +201,22 @@ int CM_THISCALL cm_fn_005ee590(int *this_, u32 arg_in)
                 DAT_00ae2a24 = (int)*(volatile u32 *)(s + 0x5c);
                 {
                     u32 n = 1;
-                    u32 k;
+                    u32 k, dwords;
 
                     while (*(volatile u8 *)(txt + (n - 1u)) != 0) n = n + 1u;
-                    for (k = 0; k < n; k = k + 1u) {
-                        *(volatile u8 *)(&DAT_00ae2920 + k) =
-                            *(volatile u8 *)(txt + k);
+                    /* 005ee6b9/005ee6bc rep movsd over n>>2 dwords, then
+                       005ee6be/005ee6c0/005ee6c3 rep movsb over n&3 bytes.
+                       Forward and volatile-persisted so a source/destination
+                       overlap reloads the just-written bytes as the original
+                       does; DF is clear under input policy v2. */
+                    dwords = n >> 2;
+                    for (k = 0; k < dwords; k = k + 1u) {
+                        *(volatile u32 *)(&DAT_00ae2920 + k * 4u) =
+                            *(volatile u32 *)(txt + k * 4u);
+                    }
+                    for (k = 0; k < (n & 3u); k = k + 1u) {
+                        *(volatile u8 *)(&DAT_00ae2920 + dwords * 4u + k) =
+                            *(volatile u8 *)(txt + dwords * 4u + k);
                     }
                 }
                 DAT_00ae291c = 1;
