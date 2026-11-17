@@ -1466,6 +1466,9 @@ class FakeCmre:
         # here, unlike an unavailable production ledger query.
         return {'status': 'not-accepted'} if fn not in self.accepted else None
 
+    def current_execution_identity(self):
+        return json.loads(json.dumps(X87_EXECUTION_IDENTITY))
+
     def hold(self, fn):
         return self.holds.get(fn)
 
@@ -2161,6 +2164,28 @@ def test_status_counts_running_workers_from_events(root, capsys):
     f.save()
     farm.main(['status', str(f.run_dir)])
     assert 'running 2' in capsys.readouterr().out
+
+
+def test_quota_limited_dispatch_is_not_still_running(tmp_path):
+    path = tmp_path / 'events.jsonl'
+    rows = [
+        {'event': 'dispatch', 'n': 1, 'fn': 'fn_00401000',
+         'kind': 'translate', 'model': 'opencode-go/minimax-m3.1-flash'},
+        {'event': 'model-limited', 'n': 1, 'provider': 'opencode-go'},
+    ]
+    path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    assert farm.running_from_events(path) == []
+
+
+def test_clean_farm_exit_clears_historical_unfinished_dispatches(tmp_path):
+    path = tmp_path / 'events.jsonl'
+    rows = [
+        {'event': 'dispatch', 'n': 1, 'fn': 'fn_00401000',
+         'kind': 'translate', 'model': 'opencode-go/minimax-m3.1-flash'},
+        {'event': 'farm-exit', 'status': 'running 0'},
+    ]
+    path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    assert farm.running_from_events(path) == []
 
 
 def test_worker_config_sets_explicit_reasoning_effort_for_the_job_model(root):
@@ -3277,3 +3302,501 @@ def test_supervisor_does_not_restart_after_the_deadline(root):
     assert farm.supervise(run, [], launch=lambda command: launched.append(command) or 0,
                           sleep=lambda s: None, clock=lambda: 0.0) == 0
     assert len(launched) == 1
+
+
+# --- pre-accept safeguards: self-declared candidates and ADR 0010 condition 3 ---
+
+BRIDGED = ('#include "cmre.h"\n'
+           '#include "cmre_x87.h"\n'
+           'long double cm_fn_00401000(long double base, long double exponent)\n'
+           '{ return cm_x87_CIpow(base, exponent); } // PASS\n')
+
+
+def x87_mutant_report(outcome):
+    """Synthetic gate reports for an operand mutant."""
+    if outcome == 'survivor':
+        return {'status': 'pass', 'problems': [],
+                'builds': {opt: {'status': 'pass', 'difftest': {'cases': 8, 'inconclusive': 0,
+                                                               'mismatches': []}}
+                           for opt in ('-O0', '-O2')}}
+    if outcome == 'build-failed':
+        return {'status': 'fail', 'problems': [],
+                'builds': {opt: {'status': 'build-failed', 'detail': 'compile error'}
+                           for opt in ('-O0', '-O2')}}
+    if outcome == 'inconclusive':
+        return {'status': 'fail', 'problems': [],
+                'builds': {opt: {'status': 'fail', 'difftest': {'cases': 8, 'inconclusive': 1,
+                                                               'mismatches': [{'case': 0, 'field': 'regs'}]}}
+                           for opt in ('-O0', '-O2')}}
+    if outcome == 'no-inconclusive':
+        report = x87_mutant_report('killed')
+        for build in report['builds'].values():
+            build['difftest'].pop('inconclusive')
+        return report
+    return {'status': 'fail', 'problems': [],
+            'builds': {opt: {'status': 'fail', 'difftest': {'cases': 8, 'inconclusive': 0,
+                                                           'mismatches': [{'case': 1, 'field': 'regs'}]}}
+                       for opt in ('-O0', '-O2')}}
+
+
+X87_EXECUTION_IDENTITY = {
+    'target': 'a' * 64, 'harness': 'b' * 64, 'python': '3.13',
+    'inventory': {'inventory.json': 'c' * 64},
+    'headers': {'recovery/include/cmre.h': 'd' * 64},
+    'dependencies': {name: '1.0' for name in ('capstone', 'unicorn', 'pefile')},
+    'toolchain': {name: {'version': 'fake 1.0', 'sha256': 'e' * 64}
+                  for name in ('gcc', 'as', 'ld', 'nm')},
+}
+
+
+def bind_x87_report(report, path, fn):
+    """Give a synthetic gate report the real report identity fields the farm binds."""
+    report = json.loads(json.dumps(report))
+    digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    report.update({'va': '0x' + fn[3:], 'tier': 'c', 'profile': 'semantic',
+                   'source_sha256': digest, 'execution_identity': X87_EXECUTION_IDENTITY,
+                   'key': digest[:16]})
+    return report
+
+
+
+
+
+@pytest.mark.parametrize('marker', ['UNVALIDATED CANDIDATE', 'UNVALIDATED candidate',
+                                    'BLOCKER: unresolved x87 operand boundary',
+                                    'must not be accepted', 'MUST NOT be accepted'])
+def test_candidate_self_disclaimer_is_refused_before_the_gate(root, marker):
+    source = GOOD.replace('return a + 1;', f'return a + 1; /* {marker} */')
+    f, cmre, _ = make(root, [item('fn_00401000')], writes(source), workers=1, ladder=['m/cheap'])
+    drain(f)
+    assert cmre.accepted == []
+    assert cmre.tests == []
+    assert not (root / 'recovery/c/fn_00401000.c').exists()
+    detail = f.state['parked']['fn_00401000']['detail']
+    assert detail.startswith('BLOCKER:')
+    assert 'candidate self-declares' in detail
+
+
+def x87_gate(root, cmre, outcome, *, drift=None):
+    original = cmre.test
+
+    def gate(fn, source=None):
+        path = Path(source) if source else root / 'recovery/c' / f'{fn}.c'
+        text = path.read_text() if path.exists() else ''
+        if '+ 1.0L' in text:
+            if drift == 'hints':
+                (root / f'recovery/hints/{fn}.json').write_text('{"arg_count": 3}')
+            elif drift == 'source':
+                (root / f'run/src/{fn}.c').write_text(text.replace('return', 'return /* drift */ return'))
+            report = x87_mutant_report(outcome)
+        else:
+            report = original(fn, source)
+        return bind_x87_report(report, path, fn)
+    cmre.test = gate
+    return gate
+
+
+def test_x87_operand_mutants_must_each_fail_and_their_evidence_is_retained(root):
+    f, cmre, _ = make(root, [item('fn_00401000')], writes(BRIDGED), workers=1, ladder=['m/cheap'])
+    x87_gate(root, cmre, 'killed')
+    drain(f)
+    assert cmre.accepted == ['fn_00401000']
+    summaries = list((f.run_dir / 'x87-mutants').glob('*/summary.json'))
+    assert len(summaries) == 1
+    summary = json.loads(summaries[0].read_text())
+    assert summary['status'] == 'killed'
+    assert [row['operand'] for row in summary['mutants']] == ['base', 'exp']
+    assert [row['outcome'] for row in summary['mutants']] == ['killed', 'killed']
+    directory = summaries[0].parent
+    accepted_bytes = (root / 'recovery/c/fn_00401000.c').read_bytes()
+    assert summary['candidate_sha256'] == hashlib.sha256(accepted_bytes).hexdigest()
+    baseline = summary['baseline']
+    assert (directory / baseline['source']).read_bytes() == accepted_bytes
+    assert baseline['source_sha256'] == summary['candidate_sha256']
+    baseline_report = directory / baseline['report']
+    assert hashlib.sha256(baseline_report.read_bytes()).hexdigest() == baseline['report_sha256']
+    assert json.loads(baseline_report.read_text())['status'] == 'pass'
+    for row in summary['mutants']:
+        mutant = directory / row['source']
+        report = directory / row['report']
+        assert mutant.is_file() and report.is_file()
+        assert hashlib.sha256(mutant.read_bytes()).hexdigest() == row['source_sha256']
+        assert hashlib.sha256(report.read_bytes()).hexdigest() == row['report_sha256']
+        assert '+ 1.0L' in mutant.read_text()
+        assert json.loads(report.read_text())['source_sha256'] == row['source_sha256']
+    assert summary['mutants'][0]['line'] == 4
+
+
+@pytest.mark.parametrize('outcome,needle', [
+    ('survivor', 'survivor'),
+    ('build-failed', 'build-failed'),
+    ('inconclusive', 'inconclusive'),
+    ('no-inconclusive', 'inconclusive'),
+])
+def test_x87_operand_mutant_without_a_differential_kill_blocks_acceptance(root, outcome, needle):
+    f, cmre, _ = make(root, [item('fn_00401000')], writes(BRIDGED), workers=1, ladder=['m/cheap'])
+    x87_gate(root, cmre, outcome)
+    drain(f)
+    assert cmre.accepted == []
+    assert not (root / 'recovery/c/fn_00401000.c').exists()
+    detail = f.state['parked']['fn_00401000']['detail']
+    assert detail.startswith('BLOCKER:')
+    assert needle in detail
+    summary = json.loads(next((f.run_dir / 'x87-mutants').glob('*/summary.json')).read_text())
+    assert summary['status'] == 'blocked'
+
+
+def test_x87_operand_parsing_fails_closed_on_an_unsupported_call_shape(root):
+    source = ('#include "cmre.h"\n'
+              'long double cm_fn_00401000(long double a, long double b)\n'
+              '{ return cm_x87_CIpow(a, b, 0); } // PASS\n')
+    f, cmre, _ = make(root, [item('fn_00401000')], writes(source), workers=1, ladder=['m/cheap'])
+    drain(f)
+    assert cmre.accepted == []
+    detail = f.state['parked']['fn_00401000']['detail']
+    assert detail.startswith('BLOCKER:')
+    assert 'unsupported' in detail
+    summary = json.loads(next((f.run_dir / 'x87-mutants').glob('*/summary.json')).read_text())
+    assert summary['status'] == 'blocked'
+    assert summary['mutants'] == []
+
+
+@pytest.mark.parametrize('drift', ['source', 'hints'])
+def test_x87_operand_mutant_evidence_rejects_candidate_or_hints_drift(root, drift):
+    (root / 'recovery/hints/fn_00401000.json').write_text('{"arg_count": 2}')
+    f, cmre, _ = make(root, [item('fn_00401000')], writes(BRIDGED), workers=1, ladder=['m/cheap'])
+    x87_gate(root, cmre, 'killed', drift=drift)
+    drain(f)
+    assert cmre.accepted == []
+    detail = f.state['parked']['fn_00401000']['detail']
+    assert 'BLOCKER:' in detail
+    assert 'drift' in detail.lower()
+
+@pytest.mark.parametrize('change', ['missing', 'changed'])
+def test_x87_acceptance_rechecks_retained_mutant_evidence(root, change):
+    f, cmre, _ = make(root, [item('fn_00401000')], writes(BRIDGED), workers=1, ladder=['m/cheap'])
+    executor = ManualExecutor()
+    f.verifier = executor
+    x87_gate(root, cmre, 'killed')
+    f.tick()                       # dispatch
+    f.tick()                       # reap and submit verification
+    executor.run_all()
+    f._collect()
+    assert f.accept_queue
+    summary = next((f.run_dir / 'x87-mutants').glob('*/summary.json'))
+    if change == 'missing':
+        summary.unlink()
+    else:
+        mutant = summary.parent / json.loads(summary.read_text())['mutants'][0]['source']
+        mutant.write_bytes(mutant.read_bytes() + b'// changed after verification\n')
+    f._accept()
+    assert cmre.accepted == []
+    assert not (root / 'recovery/c/fn_00401000.c').exists()
+    detail = f.state['parked']['fn_00401000']['detail']
+    assert detail.startswith('BLOCKER:')
+    assert 'x87 operand evidence' in detail
+
+
+def test_x87_bridge_parser_ignores_comments_and_strings_and_blocks_macro_aliases():
+    text = ('/* cm_x87_CIpow(a, b) */\n'
+            'const char *s = "cm_x87_CIpow(a, b)";\n'
+            'long double f(long double a, long double b) { return cm_x87_CIpow(a, b); }\n')
+    assert len(farm.bridge_call_sites(text)) == 1
+    with pytest.raises(ValueError, match='preprocessor directive'):
+        farm.bridge_call_sites('#define alias(a, b) cm_x87_CIpow(a, b)\n')
+
+
+def test_x87_bridge_mutation_preserves_a_multiline_operand_expression():
+    text = ('long double f(long double a, long double b)\n'
+            '{ return cm_x87_CIpow((long double)(a + 1),\n'
+            '                      (long double)b); } // PASS\n')
+    rows = farm.bridge_mutant_sources(text)
+    assert [row['operand'] for row in rows] == ['base', 'exp']
+    assert '((long double)(a + 1)) + 1.0L' in rows[0]['source']
+    assert '((long double)b) + 1.0L' in rows[1]['source']
+
+
+def x87_pending_accept(root, outcome='killed'):
+    f, cmre, _ = make(root, [item('fn_00401000')], writes(BRIDGED), workers=1, ladder=['m/cheap'])
+    executor = ManualExecutor()
+    f.verifier = executor
+    x87_gate(root, cmre, outcome)
+    f.tick()
+    f.tick()
+    executor.run_all()
+    f._collect()
+    assert f.accept_queue
+    return f, cmre, next((f.run_dir / 'x87-mutants').glob('*/summary.json'))
+
+
+@pytest.mark.parametrize('restart', [False, True])
+@pytest.mark.parametrize('change', ['harness', 'headers', 'target', 'toolchain', 'python'])
+def test_x87_current_execution_identity_drift_blocks_acceptance(root, restart, change):
+    f, cmre, summary_path = x87_pending_accept(root)
+    original_evidence = summary_path.read_bytes()
+    current = cmre.current_execution_identity()
+    if change == 'headers':
+        current['headers']['recovery/include/cmre.h'] = 'f' * 64
+    elif change == 'toolchain':
+        current['toolchain']['gcc']['sha256'] = 'f' * 64
+    else:
+        current[change] = 'f' * 64
+    cmre.current_execution_identity = lambda: current
+    if restart:
+        f.save()
+        f = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    f._accept()
+    assert cmre.accepted == []
+    assert 'fn_00401000' not in f.state['accepted']
+    assert not (root / 'recovery/c/fn_00401000.c').exists()
+    detail = f.state['parked']['fn_00401000']['detail']
+    assert detail.startswith('BLOCKER:')
+    assert 'current execution identity' in detail
+    assert summary_path.read_bytes() == original_evidence
+
+
+@pytest.mark.parametrize('restart', [False, True])
+@pytest.mark.parametrize('current', [
+    None, {}, [], {'harness': 'b' * 64}, 'unavailable', 'system-exit', 'missing-method',
+])
+def test_x87_current_execution_identity_unavailable_or_malformed_blocks(root, restart, current):
+    f, cmre, _ = x87_pending_accept(root)
+
+    def identity():
+        if current == 'unavailable':
+            raise OSError('identity inputs unavailable')
+        if current == 'system-exit':
+            raise SystemExit('identity provider stopped')
+        return current
+
+    cmre.current_execution_identity = identity
+    if current == 'missing-method':
+        cmre.current_execution_identity = None
+    if restart:
+        f.save()
+        f = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    f._accept()
+    assert cmre.accepted == []
+    detail = f.state['parked']['fn_00401000']['detail']
+    assert detail.startswith('BLOCKER:')
+    assert 'current execution identity' in detail
+
+
+@pytest.mark.parametrize('field', ['target', 'harness', 'python', 'inventory', 'headers',
+                                   'dependencies', 'toolchain'])
+def test_x87_matching_malformed_execution_identities_are_not_proof(root, field):
+    f, cmre, summary_path = x87_pending_accept(root)
+    malformed = cmre.current_execution_identity()
+    malformed[field] = None
+    cmre.current_execution_identity = lambda: malformed
+    summary = json.loads(summary_path.read_bytes())
+    for row in [summary['baseline'], *summary['mutants']]:
+        report_path = summary_path.parent / row['report']
+        report = json.loads(report_path.read_bytes())
+        report['execution_identity'] = malformed
+        report_path.write_text(json.dumps(report))
+        row['report_sha256'] = hashlib.sha256(report_path.read_bytes()).hexdigest()
+    summary_path.write_text(json.dumps(summary))
+    f._accept()
+    assert cmre.accepted == []
+    detail = f.state['parked']['fn_00401000']['detail']
+    assert 'current execution identity is malformed' in detail
+
+
+def test_no_bridge_does_not_require_current_execution_identity(root):
+    f, cmre, _ = make(root, [item('fn_00401000')], writes(GOOD), workers=1, ladder=['m/cheap'])
+
+    def unavailable():
+        raise AssertionError('nonbridge source must not query execution identity')
+
+    cmre.current_execution_identity = unavailable
+    drain(f)
+    assert cmre.accepted == ['fn_00401000']
+
+
+def test_real_adapter_current_execution_identity_uses_live_local_provider(monkeypatch):
+    from cmre import recover
+
+    calls = []
+    current = json.loads(json.dumps(X87_EXECUTION_IDENTITY))
+
+    def identity():
+        calls.append(True)
+        return current
+
+    monkeypatch.setattr(recover, 'execution_identity', identity)
+    adapter = farm.CmreAdapter()
+    assert adapter.current_execution_identity() == current
+    current['harness'] = 'f' * 64
+    assert adapter.current_execution_identity()['harness'] == 'f' * 64
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize('change', [
+    'summary-source', 'duplicate-row', 'duplicate-only', 'malformed-row', 'missing-row',
+    'missing-report', 'changed-report', 'bad-report-json', 'changed-baseline',
+])
+def test_x87_acceptance_rejects_tampered_or_malformed_evidence(root, change):
+    f, cmre, summary_path = x87_pending_accept(root)
+    summary = json.loads(summary_path.read_text())
+    directory = summary_path.parent
+    row = summary['mutants'][0]
+    if change == 'summary-source':
+        row['source'] = 'baseline.c'
+        row['source_sha256'] = summary['baseline']['source_sha256']
+        row['sha256'] = row['source_sha256']
+    elif change == 'duplicate-row':
+        summary['mutants'].append(dict(row))
+    elif change == 'duplicate-only':
+        summary['mutants'][1] = dict(row)
+    elif change == 'malformed-row':
+        summary['mutants'].append('not-a-row')
+    elif change == 'missing-row':
+        summary['mutants'].pop()
+    elif change == 'missing-report':
+        (directory / row['report']).unlink()
+    elif change == 'changed-report':
+        (directory / row['report']).write_text('{"status": "pass"}')
+    elif change == 'bad-report-json':
+        (directory / row['report']).write_bytes(b'{')
+        row['report_sha256'] = hashlib.sha256(b'{').hexdigest()
+    elif change == 'changed-baseline':
+        (directory / summary['baseline']['source']).write_bytes(b'changed baseline')
+    summary_path.write_text(json.dumps(summary))
+    f._accept()
+    assert cmre.accepted == []
+    assert not (root / 'recovery/c/fn_00401000.c').exists()
+    detail = f.state['parked']['fn_00401000']['detail']
+    assert detail.startswith('BLOCKER:')
+    assert 'x87 operand' in detail
+
+
+@pytest.mark.parametrize('change', ['survivor', 'no-inconclusive', 'missing-source-sha'])
+def test_x87_acceptance_revalidates_retained_report_bytes_and_classification(root, change):
+    f, cmre, summary_path = x87_pending_accept(root)
+    summary = json.loads(summary_path.read_text())
+    directory = summary_path.parent
+    row = summary['mutants'][0]
+    report_path = directory / row['report']
+    source_path = directory / row['source']
+    if change == 'survivor':
+        report = x87_mutant_report('survivor')
+    elif change == 'no-inconclusive':
+        report = x87_mutant_report('no-inconclusive')
+    else:
+        report = json.loads(report_path.read_text())
+    report = bind_x87_report(report, source_path, 'fn_00401000')
+    if change == 'missing-source-sha':
+        report.pop('source_sha256')
+    report_path.write_text(json.dumps(report))
+    row['report_sha256'] = hashlib.sha256(report_path.read_bytes()).hexdigest()
+    row['outcome'] = 'killed'
+    summary_path.write_text(json.dumps(summary))
+    f._accept()
+    assert cmre.accepted == []
+    detail = f.state['parked']['fn_00401000']['detail']
+    assert detail.startswith('BLOCKER:')
+    assert 'x87 operand' in detail
+
+
+def test_x87_operand_evidence_hashes_exact_crlf_source(root):
+    raw = BRIDGED.replace('\n', '\r\n').encode()
+
+    def write_crlf(job, repo):
+        Path(job['source']).parent.mkdir(parents=True, exist_ok=True)
+        Path(job['source']).write_bytes(raw)
+
+    f, cmre, _ = make(root, [item('fn_00401000')], write_crlf, workers=1, ladder=['m/cheap'])
+    x87_gate(root, cmre, 'killed')
+    drain(f)
+    assert cmre.accepted == ['fn_00401000']
+    canonical = (root / 'recovery/c/fn_00401000.c').read_bytes()
+    assert canonical == raw
+    summary = json.loads(next((f.run_dir / 'x87-mutants').glob('*/summary.json')).read_text())
+    assert summary['candidate_sha256'] == hashlib.sha256(raw).hexdigest()
+    directory = next((f.run_dir / 'x87-mutants').glob('*/summary.json')).parent
+    assert (directory / summary['baseline']['source']).read_bytes() == raw
+    for row in summary['mutants']:
+        mutant = (directory / row['source']).read_bytes()
+        assert b'\r\n' in mutant and b'+ 1.0L' in mutant
+        assert hashlib.sha256(mutant).hexdigest() == row['source_sha256']
+
+
+def x87_journal_candidate(root, phase):
+    f, cmre, _ = make(root, [], writes(BRIDGED), workers=0)
+    fn = 'fn_00401000'
+    canonical = root / f'recovery/c/{fn}.c'
+    canonical.write_bytes(b'prior canonical')
+    job = f._new_job('translate', fn, 'hand', bytes=200)
+    source = root / 'candidate.c'
+    source.write_bytes(BRIDGED.encode())
+    job.update(source=str(source), _snap={'c': b'prior canonical', 'hint': None})
+    f._begin_transaction(job)
+    data = f._transaction(job, phase)
+    canonical.write_bytes(BRIDGED.encode())
+    f.save()
+    return f, cmre, job, canonical, data
+
+
+def test_restart_parks_installed_bridge_candidate_without_operand_proof(root):
+    f, cmre, _, canonical, _ = x87_journal_candidate(root, 'installed')
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert 'fn_00401000' not in resumed.state['accepted']
+    assert canonical.read_bytes() == b'prior canonical'
+    assert 'fn_00401000' in resumed.state['parked']
+    detail = resumed.state['parked']['fn_00401000']['detail']
+    assert detail.startswith('BLOCKER:')
+    assert 'x87 operand evidence' in detail
+
+
+@pytest.mark.parametrize('phase', ['accepted', 'accepting'])
+def test_restart_preserves_authoritative_bridge_acceptance_without_new_proof(root, phase):
+    f, cmre, _, canonical, data = x87_journal_candidate(root, phase)
+    if phase == 'accepting':
+        cmre.acceptance_identity = lambda fn: data['identity']
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert 'fn_00401000' in resumed.state['accepted']
+    assert canonical.read_bytes() == BRIDGED.encode()
+    assert 'fn_00401000' not in resumed.state['parked']
+
+
+def test_restart_routes_installed_bridge_candidate_with_intact_proof_to_acceptance(root):
+    f, cmre, _ = x87_pending_accept(root)
+    canonical = root / 'recovery/c/fn_00401000.c'
+    installed = canonical.read_bytes()
+    f.save()
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert canonical.read_bytes() == installed          # no unproven rollback
+    assert 'fn_00401000' not in resumed.state['accepted']
+    assert resumed.accept_queue
+    resumed._accept()
+    assert cmre.accepted == ['fn_00401000']
+    assert 'fn_00401000' in resumed.state['accepted']
+
+
+def test_restart_parks_accepting_bridge_candidate_after_nonacceptance_without_proof(root):
+    f, cmre, _, canonical, _ = x87_journal_candidate(root, 'accepting')
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert 'fn_00401000' not in resumed.state['accepted']
+    assert canonical.read_bytes() == b'prior canonical'
+    assert 'fn_00401000' in resumed.state['parked']
+    assert resumed.state['parked']['fn_00401000']['detail'].startswith('BLOCKER:')
+
+
+def test_x87_unbound_gate_reports_are_not_treated_as_operand_proof(root):
+    f, cmre, _ = make(root, [item('fn_00401000')], writes(BRIDGED), workers=1, ladder=['m/cheap'])
+    original = cmre.test
+
+    def gate(fn, source=None):
+        path = Path(source) if source else root / 'recovery/c' / f'{fn}.c'
+        text = path.read_text() if path.exists() else ''
+        if '+ 1.0L' in text:
+            return x87_mutant_report('killed')
+        return original(fn, source)
+
+    cmre.test = gate
+    drain(f)
+    assert cmre.accepted == []
+    detail = f.state['parked']['fn_00401000']['detail']
+    assert detail.startswith('BLOCKER:')
+    assert 'not bound' in detail
