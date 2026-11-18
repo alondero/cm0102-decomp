@@ -30,6 +30,12 @@ Keep every declared input of a live proof fixed, including documentation when it
 regression receipt covers those files. Stage updates outside that input set until
 finalization finishes.
 
+A separate Git worktree does not isolate the Python interpreter or toolchain.
+While a full-suite receipt is running, do not install, remove or upgrade shared
+packages or tools from any lane. Prepare new dependencies in a worktree-local
+virtual environment, and keep the recovery interpreter and its environment
+fixed. Package-only drift invalidates exact-input reuse just like file drift.
+
 During a required gate, authorized input workers may prepare private proposals
 and bounded original-only diagnostics when their selected protocol supports those
 operations. Keep the VM, pinned original code and all declared live inputs fixed;
