@@ -17,16 +17,26 @@ extern unsigned long long CM_CDECL cm_fn_009452ca(u32 arg4);
 
 void CM_THISCALL cm_fn_005ba320(u32 self)
 {
-    volatile struct { u32 prev, handler, state; } frame;
+    /* CM0102 3.9.68 SHA-256:
+       0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+       Preferred-image VAs 0x005ba32d/0x005ba32e link &frame.prev.
+       After pushes at 0x005ba335/0x005ba336/0x005ba339,
+       0x005ba33a writes ESI (self) at frame-4. Keep that word adjacent
+       to the linked record; exception dispatch/unwinding remains unproven. */
+    volatile struct {
+        u32 saved_self;
+        struct { u32 prev, handler, state; } frame;
+    } context;
 
-    frame.state = 0xffffffffu;
-    frame.handler = 0x00959918u;
-    frame.prev = CM_FS(u32, 0);
-    CM_FS(u32, 0) = (u32)&frame;
+    context.frame.state = 0xffffffffu;
+    context.frame.handler = 0x00959918u;
+    context.frame.prev = CM_FS(u32, 0);
+    CM_FS(u32, 0) = (u32)&context.frame;
+    context.saved_self = self;
 
     CM_GLOBAL(volatile u32, self) = 0x0096a864u;
     u32 value = CM_GLOBAL(volatile u32, self + 0xa7u);
-    frame.state = 0;
+    context.frame.state = 0;
     if (value != 0)
         cm_fn_009452ca(value);
 
@@ -52,7 +62,7 @@ void CM_THISCALL cm_fn_005ba320(u32 self)
         cm_fn_00944c94((void *)value);
     }
 
-    frame.state = 0xffffffffu;
+    context.frame.state = 0xffffffffu;
     cm_fn_00518690((void *)self);
-    CM_FS(u32, 0) = frame.prev;
+    CM_FS(u32, 0) = context.frame.prev;
 }

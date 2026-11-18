@@ -2209,7 +2209,8 @@ their binding: preserve the concern and let fresh review reestablish evidence.
 
 def defect_agent():
     rules = [('*', '*', 'deny'), ('read', '*', 'allow'), ('grep', '*', 'allow'), ('glob', '*', 'allow'),
-             ('edit', 'CM0102/Analysis/cmre/farm/*/hand/*.c', 'allow')]
+             ('edit', 'CM0102/Analysis/cmre/farm/*/hand/*.c', 'allow'),
+             ('write', 'CM0102/Analysis/cmre/farm/*/hand/*.c', 'allow')]
     shell = [f'{PY} scripts/cmre_farm.py test *', f'{PY} scripts/cmre_farm.py review *']
     shell += [f'{PY} -m cmre {command} *' for command in WORKER_COMMANDS if command not in ('test', 'explain')]
     shell += list(READ_ONLY_SHELL)
