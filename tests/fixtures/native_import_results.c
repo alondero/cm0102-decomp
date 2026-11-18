@@ -19,7 +19,7 @@ _Static_assert(sizeof(U32) == 4, "u32 stack words only");
 extern U32 heap_iat __asm__("__imp__HeapAlloc@12");
 extern U32 read_iat __asm__("__imp__ReadFile@20");
 extern char heap_pushes, heap_call, heap_cont, read_pushes, read_call, read_cont;
-extern char fixture_done, fixture_probe;
+extern char fixture_done, fixture_probe, native_return;
 extern void native_calls(void), done_marker(void), probe(void);
 HANDLE heap, file;
 U32 heap_result, read_result, read_count = 0xdeadbeef, read_request = 24;
@@ -39,7 +39,8 @@ __asm__(
     "_read_pushes:\npushl $0\npushl $_read_count\npushl _read_request\n"
     "pushl $_read_buffer\npushl _file\n"
     "_read_call:\ncall *__imp__ReadFile@20\n"
-    "_read_cont:\nmovl %eax, _read_result\nret\n"
+    "_read_cont:\nmovl %eax, _read_result\n"
+    ".globl _native_return\n_native_return:\nret\n"
     ".globl _done_marker, _fixture_done\n"
     "_done_marker:\n_fixture_done:\nint3\nret\n"
     ".globl _probe, _fixture_probe\n_probe:\n_fixture_probe:\nnop\nret\n"
@@ -93,6 +94,8 @@ void start(void)
     for (i = 0; i < sizeof(read_buffer); ++i) read_buffer[i] = 0xa5;
     text("{\"version\":2,\"done\":"); number((U32)&fixture_done);
     text(",\"probe\":"); number((U32)&fixture_probe);
+    text(",\"function_entry\":"); number((U32)&native_calls);
+    text(",\"function_return\":"); number((U32)&native_return);
     text(",\"HeapAlloc\":{\"iat\":"); number((U32)&heap_iat);
     text(",\"pushes\":"); number((U32)&heap_pushes);
     text(",\"call\":"); number((U32)&heap_call);

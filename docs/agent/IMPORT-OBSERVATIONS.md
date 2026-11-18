@@ -206,3 +206,9 @@ fixture profile with a hard-coded scope would not prove that integration.
 The four enumeration/time definitions remain deferred rather than enlarging
 the mock-only facade. No replay, capture-format, emulator or default recorder
 policy changes are part of this extraction.
+
+The subsequent [native function-scope tooling slice](ENTRY-IMPORT-SCOPES.md)
+observes a real authored-child function entry, its enclosed OS imports and its
+function endpoint through the same backend/protocol. It does not modify
+`Recorder.run` or admit game-PID attachment; its scope and replay limitations are
+explicitly separate from production recorder integration.
