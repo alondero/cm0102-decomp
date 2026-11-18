@@ -51,4 +51,9 @@ C/legacy, lifts, composed calls and live integration separately, with search and
 history. Successful session checks refresh it automatically. See
 [visual progress](docs/agent/PROGRESS.md) for worktree use and sharing.
 
+For live farm activity, run `py -3.13 scripts/cmre_farm_dashboard.py serve` and open
+[the local pipeline dashboard](http://127.0.0.1:8042/). See the
+[farm dashboard guide](docs/agent/FARM.md#live-pipeline-dashboard) for capacity,
+supply, and reporting expert assignments.
+
 From the authoritative checkout, start a parent session with `py -3.13 scripts/cmre_session.py start`. The C workflow uses `py -3.13 -m cmre next --c`, `cmre brief`, `cmre test --c`, and `cmre accept --c`. Close the session with `py -3.13 scripts/cmre_session.py check --parent RECEIPT`; both pytest and `cmre verify` must pass. The local `docs/ROADMAP.md` defines the runtime, integration, subsystem, and standalone parity gates. Accepted C, lifts, composed calls, and live integration are separate measures.

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Recovery Pipeline · CM 01/02</title>
+  <link rel="stylesheet" href="/dashboard.css">
+  <script src="/dashboard.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="shell mast-inner">
+      <a class="brand" href="/">
+        <span class="pitch" aria-hidden="true"></span>
+        <span>CM 01/02 <small>RECOVERY</small></span>
+      </a>
+      <nav aria-label="Dashboard sections">
+        <a href="#pipeline">Pipeline</a><a href="#assignments">Assignments</a><a href="#supply">Supply</a>
+      </nav>
+      <div class="connection" id="connection" role="status"><i></i> Connecting</div>
+    </div>
+  </header>
+  <main class="shell" id="pipeline">
+    <div class="intro">
+      <div>
+        <p class="eyebrow">RECOVERY OPERATIONS <span>/</span> 3.9.68</p>
+        <h1>Recovery pipeline</h1>
+        <p class="subtitle">Farm capacity, current assignments and the supply feeding each run.</p>
+      </div>
+      <div class="run-control">
+        <label for="run-select">Farm run</label>
+        <select id="run-select" disabled><option>Loading runs…</option></select>
+      </div>
+    </div>
+    <div class="status-bar">
+      <span><span class="pill" id="status">Connecting</span><span id="status-detail"> Waiting for local telemetry</span></span>
+      <span id="updated"></span>
+    </div>
+    <div class="metrics" id="metrics" aria-label="Progress and capacity"></div>
+
+    <div class="section-title">
+      <h2>Pipeline flow</h2>
+      <span id="pipeline-caption">Selected run · slots and queues</span>
+    </div>
+    <div class="lanes" id="lanes" aria-label="Pipeline stages"></div>
+
+    <div class="columns">
+      <section class="panel assignments" id="assignments" aria-labelledby="assignment-title">
+        <header class="panel-heading">
+          <div><h2 id="assignment-title">Assignments</h2><p id="assignment-summary">Model workers and farm stages</p></div>
+          <label class="filter">Show <select id="assignment-filter">
+            <option value="all">All assignments</option><option value="model">Model workers</option>
+            <option value="gate">Gate &amp; acceptance</option><option value="reported">Reported sessions</option>
+          </select></label>
+        </header>
+        <div class="table-scroll" id="assignment-rows"></div>
+        <div id="pool-models" class="pool-models"></div>
+      </section>
+      <section class="panel scaling" aria-labelledby="scaling-title">
+        <header class="panel-heading"><div><h2 id="scaling-title">Capacity &amp; scaling</h2><p>Applied farm settings</p></div></header>
+        <div class="panel-body" id="scaling"></div>
+      </section>
+    </div>
+
+    <div class="columns details">
+      <section class="panel" id="supply" aria-labelledby="supply-title">
+        <header class="panel-heading"><div><h2 id="supply-title">Supply inventory</h2><p>Workspace-wide · original body bytes</p></div><span id="inventory-age"></span></header>
+        <div class="panel-body" id="inventory">Reading the local inventory…</div>
+      </section>
+      <section class="panel" aria-labelledby="throughput-title">
+        <header class="panel-heading"><div><h2 id="throughput-title">Translation throughput</h2><p id="throughput-caption">Original body bytes accepted per hour</p></div></header>
+        <div class="panel-body" id="throughput"></div>
+      </section>
+    </div>
+
+    <section class="panel activity" aria-labelledby="activity-title">
+      <header class="panel-heading">
+        <div><h2 id="activity-title">Run activity</h2><p>Latest events from the farm journal</p></div>
+        <label class="filter">Show <select id="event-filter">
+          <option value="all">All events</option><option value="supply">Supply</option><option value="workers">Workers</option>
+          <option value="recovery">Acceptance &amp; defects</option><option value="farm">Lifecycle &amp; settings</option>
+        </select></label>
+      </header>
+      <div id="events" class="event-list"></div>
+    </section>
+    <footer>
+      <span>CM 01/02 · local pipeline monitor</span>
+      <span id="refresh-note">Farm updates every 5 s · inventory every 60 s</span>
+    </footer>
+  </main>
+</body>
+</html>
