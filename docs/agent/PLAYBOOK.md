@@ -76,10 +76,9 @@ are for tool-less model workers only.
   it prints bounded recorded steps, PIDs and log paths without starting work.
   This view does not prove live process ownership or current-input validity.
   Check command help when syntax is unknown.
-- Harness modules (`HARNESS_MODULES` in `cmre/recover.py`) are frozen during a
-  recovery session. For tooling changes, inspect `cmre revalidate --plan`, batch
-  fixes and follow [HARNESS.md](HARNESS.md). Global/unknown impact requires the
-  full inventory; bounded input dispatch needs an explicit compatibility receipt.
+- Keep harness modules (`HARNESS_MODULES` in `cmre/recover.py`) frozen during a
+  recovery session. Prepare tooling changes separately and use the validation
+  budget below to scope a release.
 - Report progress as the `Progress since` line from the closing check.
 - Reuse the parent preflight receipt across continuations and workers. Use
   function tests within a batch and one closing check at the parent boundary;
@@ -106,15 +105,15 @@ are for tool-less model workers only.
 
 ### Validation budget
 
-Run the cheapest level that answers the question. A higher level runs only when
-its trigger has fired. This table is the single source for when validation runs.
+Run the cheapest check that supplies the evidence for the decision. This table
+defines when to run each check.
 
-| Level | Trigger | Runs | Does not run |
-| --- | --- | --- | --- |
-| Function | `cmre test --c`, then `cmre accept --c` | The differential test. Accept repeats it once in a fresh process as a determinism check. | pytest, `check`, `revalidate`, `status --write` |
-| Batch | A handoff, or a batch of about 20 accepted functions or one hour, whichever comes first | `py -3.13 scripts/cmre_session.py check --parent RECEIPT`, once | Anything per function |
-| Harness | An edit to a `HARNESS_MODULES` file in `cmre/recover.py` | `cmre revalidate --plan`, then one run with `--reuse` (or `--resume RECEIPT` after an interruption) | `--audit`, unless a milestone |
-| Milestone | A named gate claim in [ROADMAP](../ROADMAP.md) | `cmre revalidate --audit`, and `compose-test` for each affected composition | Nothing is skipped here |
+| Scope | Trigger | Evidence to collect |
+| --- | --- | --- |
+| Function | A candidate is ready for acceptance | Test it with `cmre test --c`, then run the acceptance gate with `cmre accept --c`, which repeats the differential test for determinism. |
+| Batch or tooling | A handoff, about 20 accepted functions or one hour of recovery, whichever comes first | Run the relevant focused checks and one `py -3.13 scripts/cmre_session.py check --parent RECEIPT` for pytest and ledger integrity. This covers routine instructions, tests, queue, adapter and publication tooling changes. |
+| Bounded harness or acceptance change | A release changes an identifiable set of fixtures, build inputs, execution paths or acceptance decisions | Follow [validation scope](HARNESS.md#validation-scope). Test the affected paths, inspect `cmre revalidate --plan` for changed inventory evidence and reuse prior results whose inputs and behavior are proven unchanged. |
+| Whole inventory | A named [milestone gate](../ROADMAP.md), or a batched release with global execution impact or unresolved scope after planning | Run one `cmre revalidate --audit` on the frozen release and `compose-test` for affected compositions. Resume an interrupted sweep from its receipt. |
 
 Why the levels sit where they do:
 
@@ -138,8 +137,8 @@ Working rules:
   back one tested batch for a single revalidation.
 - Check a long job with `py -3.13 -m cmre job status RECEIPT` no more than hourly.
   Repeated status polling costs context without changing the result.
-- A plan that lists a global harness change is the signal to stop and batch, not to
-  start a second whole-inventory job.
+- Review the plan's invalidation reasons before counting a harness hash change
+  as global execution impact. Use the scope decision in [HARNESS.md](HARNESS.md#validation-scope).
 
 ## 3. Close the session
 

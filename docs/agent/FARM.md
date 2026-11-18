@@ -45,11 +45,11 @@ drained eight times in 19 hours and then sat idle for nine.
 5. **Resume the same RUN directory** across sessions. It remembers what is
    parked and which candidates wait for inputs; a new directory dispatches the
    whole held queue again.
-6. **Validation budget.** `cmre_session.py check` runs once, at the handoff,
-   after the final `stop`. A harness release's own full revalidation is
-   authorized (Adam, 2026-11-16) and runs at the release's batch boundary. Other
-   full revalidation and composition runs need Adam's request; they produced no
-   recovery on 15–16 Nov (4 h 46 min plus 1 h 42 min).
+6. **Validation budget.** Run `cmre_session.py check` once at the handoff after
+   the final `stop`. Scope each harness release using the
+   [validation budget](PLAYBOOK.md#validation-budget). Adam's 2026-11-16
+   authorization covers the resulting release checks at the batch boundary.
+   Other full revalidation and composition runs require Adam's request.
 7. **Write `docs/NEXT-SESSION-PROMPT.md` once**, at the handoff. It records
    state, not a live log.
 8. **Report byte movement per supply item.** A lane that moves no bytes into
@@ -531,8 +531,8 @@ one harness release, not per-function work: retrying those functions on any
 model repeats the recorded failure. Sessions build these releases themselves
 (Adam, 2026-11-16): an ADR, the change in a worktree with failing regression
 tests first ([HARNESS.md](HARNESS.md), [ADR 0007](../adr/0007-harness-releases.md)),
-the release's full revalidation at a batch boundary, then `retry` of the
-family. Adam reviews the finished release before it merges to `main`; the
+the release's [validation gate](HARNESS.md#validation-scope) at a batch boundary,
+then `retry` of the family. Adam reviews the finished release before it merges to `main`; the
 session does not wait for him to start one. The fidelity rules still bound
 every release: plain C calls original code across the boundary, and nothing
 invents API results or engine behaviour. Expert sessions work this list in
