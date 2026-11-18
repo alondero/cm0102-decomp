@@ -24,6 +24,13 @@ closure; a delegated reviewer inherits the parent's baseline.
    and runtime gates still run; supplemental checks answer the named gap and stop
    when it is resolved. A new reviewer can audit existing evidence without
    regenerating the same experiments.
+   Before publishing a confirmed C fix to a branch, ordered access or call,
+   retain an original observation, a failing control from the exact pre-fix
+   source, and a passing observation from the final source at O0 and O2.
+   Use a named mutation plan for effects covered by the normal observations.
+   Use a focused raw differential witness for effects outside that profile.
+   Bind the witness to the final source, evidence and execution identities.
+   If the effect cannot be observed, leave the finding open.
    Reuse a return-width proof only for the same value origin, call edge and
    argument positions. A later call can introduce new high bits after an earlier
    proof's full-register kill. Follow those bits through each forwarded slot;

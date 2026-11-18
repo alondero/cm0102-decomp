@@ -129,6 +129,21 @@ def test_original_instruction_listings_are_found(originals):
     assert kinds(pub.scan_blob("tests/fixtures/x.S", lifted.encode(), originals["index"])) == ["instruction-listing"]
 
 
+def test_candidate_listing_advice_honors_only_exact_source_review(tmp_path):
+    data = LISTING.encode()
+    source = "recovery/c/fn_006181d0.c"
+    assert kinds(pub.candidate_listing_findings(tmp_path, 0x006181D0, data)) == ["instruction-listing"]
+    reviews = tmp_path / "CM0102/Analysis/cmre/publication/source-reviews.json"
+    reviews.parent.mkdir(parents=True)
+    reviews.write_text(json.dumps({"schema": "cmre-source-reviews/1", "reviews": [
+        {"path": source, "sha256": pub.env.digest_bytes(data), "reviewer": "analyst", "reason": "authored"}
+    ]}), encoding="utf-8")
+    assert pub.candidate_listing_findings(tmp_path, 0x006181D0, data) == []
+    assert kinds(pub.candidate_listing_findings(tmp_path, 0x006181D0, data + b"\n")) == ["instruction-listing"]
+    reviews.write_text("{", encoding="utf-8")
+    assert kinds(pub.candidate_listing_findings(tmp_path, 0x006181D0, data)) == ["instruction-listing"]
+
+
 def test_short_listings_and_prose_addresses_are_not_findings(originals):
     seven = "".join(LISTING.splitlines(keepends=True)[:7])
     prose = "".join(f"0x{0x00401000 + i:08x} and 0x{0x00402000 + i:08x} call sites differ\n" for i in range(20))
@@ -230,6 +245,42 @@ def test_default_private_history_survives_main_migration(originals, repo):
     _git(repo, "update-ref", "-d", "refs/private/cm0102-pre-publication")
     with pytest.raises(SystemExit, match="cannot compare"):
         pub.scan_commit(repo, "main", originals["index"])
+
+
+def test_staged_scan_checks_inherited_accepted_c(originals, repo, tmp_path, monkeypatch):
+    path = "recovery/c/fn_00401000.c"
+    _commit(repo, {path: b"int before(void) { return 1; }\n"}, "published snapshot")
+    ledger = tmp_path / "accepted-ledger"
+    ledger.mkdir()
+    monkeypatch.setattr(pub.env, "LEDGER_DIR", ledger)
+    accepted = b"int after(void) { return 2; }\n"
+    (ledger / "fn_00401000.json").write_text(
+        json.dumps({"c": {"source_sha256": pub.env.digest_bytes(accepted)}}), encoding="utf-8"
+    )
+    (repo / "notes.md").write_text("update notes\n", encoding="utf-8")
+    _git(repo, "add", "--", "notes.md")
+
+    findings = pub.scan_staged(repo, originals["index"])
+    assert [(finding.path, finding.kind) for finding in findings] == [(path, "accepted-mismatch")]
+
+    _git(repo, "rm", "--", path)
+    assert pub.scan_staged(repo, originals["index"]) == []
+
+
+def test_commit_checks_accepted_identity_for_each_path_sharing_a_blob(originals, repo, tmp_path, monkeypatch):
+    stale = "recovery/c/fn_00401000.c"
+    equal = "recovery/c/fn_00402000.c"
+    original = b"int f(void) { return 1; }\n"
+    _commit(repo, {stale: original, equal: original}, "shared blob")
+    ledger = tmp_path / "accepted-ledger"
+    ledger.mkdir()
+    monkeypatch.setattr(pub.env, "LEDGER_DIR", ledger)
+    for path, digest in ((stale, "1" * 64), (equal, pub.env.digest_bytes(original))):
+        record = ledger / (path.rsplit("/", 1)[1].removesuffix(".c") + ".json")
+        record.write_text(json.dumps({"c": {"source_sha256": digest}}), encoding="utf-8")
+
+    _, findings = pub.scan_commit(repo, "HEAD", originals["index"], private_refs=())
+    assert [(finding.path, finding.kind) for finding in findings] == [(stale, "accepted-mismatch")]
 
 
 def test_published_c_must_be_the_accepted_bytes(originals, repo, tmp_path, monkeypatch):

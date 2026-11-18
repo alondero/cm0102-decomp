@@ -12,12 +12,20 @@ import ctypes
 import struct
 import time
 import uuid
+from typing import Any, TypedDict, cast
 
 from . import capture_record as api
-from .import_observe import ImportObserver, MemoryRead, Snapshot
+from .import_observe import ImportObserver, MemoryRead, Snapshot, ThreadInstance
 
 
 SINGLE_STEP = (0x80000004, 0x4000001e)
+
+
+class _PhysicalStep(TypedDict):
+    owner: ThreadInstance
+    address: int
+    original_flags: int
+    executed: bool
 BREAKPOINT = (api.STATUS_BREAKPOINT, api.STATUS_WX86_BREAKPOINT)
 TF = 0x100
 DBG_REPLY_LATER = 0x40010001
@@ -39,6 +47,12 @@ def _exit_transition_candidate(fact):
             and fact["object_query_status"] == 0 and fact["granted_access"] & 2 != 0
             and fact["queried_exit"] and fact["exit_code"] == 259
             and fact["wait_result"] == 258)
+
+
+def _owns_step(owner: ThreadInstance, event_owner: ThreadInstance | None) -> bool:
+    if not isinstance(owner, ThreadInstance):
+        raise TypeError("a physical step requires a thread instance owner")
+    return owner == event_owner
 
 
 def run_session(client, *, detach_at: str | None = None,
@@ -84,12 +98,16 @@ def run_session(client, *, detach_at: str | None = None,
     process, event_process, pending = None, None, None
     attached, exited, ready, early = False, False, False, False
     main_tid, attach_tid, command_released = None, None, False
-    threads, originals, armed, facts = {}, {}, set(), {}
-    generations = {}
-    suspended = {}
-    exit_waiting, reply_expected = {}, {}
+    threads: dict[int, Any] = {}
+    originals, armed = {}, set()
+    facts: dict[int, dict] = {}
+    generations: dict[int, int] = {}
+    suspended: dict[int, dict] = {}
+    exit_waiting: dict[ThreadInstance | None, dict] = {}
+    reply_expected: dict[ThreadInstance | None, int] = {}
     exit_wait_deadline, unsafe_stop_reason = None, None
-    stepping, stopped_hit = None, None
+    stepping: _PhysicalStep | None = None
+    stopped_hit = None
     manifest = {}
     entry_addresses = set()
     obs = ImportObserver(enabled=True, source={**client.source, "session": result["run_id"]})
@@ -219,7 +237,10 @@ def run_session(client, *, detach_at: str | None = None,
                 ntstatus=ntstatus, actual_tid=actual_tid, actual_pid=actual_pid,
                 expected_pid=client.pid, object_query_status=object_status & 0xffffffff,
                 granted_access=basic[1], queried_exit=bool(queried), exit_code=exit_code.value,
-                wait_result=wait, pending_event=pending, stepping=stepping,
+                wait_result=wait, pending_event=pending,
+                stepping=({**{k: v for k, v in stepping.items() if k != "owner"},
+                           "tid": stepping["owner"].tid, "generation": stepping["owner"].generation}
+                          if stepping is not None else None),
                 last_peer_event=next((e for e in reversed(result["debug_events"]) if e["tid"] == tid), None))
             result.setdefault("suspend_failures", []).append(fact)
             if wait == 0:
@@ -236,7 +257,7 @@ def run_session(client, *, detach_at: str | None = None,
             suspend_one(tid, threads[tid])
             if tid not in suspended:
                 raise RuntimeError("cannot hold the breaking thread for reply-later")
-            reply_expected[(tid, generation)] = address
+            reply_expected[ThreadInstance(tid, generation)] = address
             witnesses = [memory(site, 1, "reply-later-armed-readback") for site in sorted(armed)]
             if any(not read.complete or read.data != b"\xcc" for read in witnesses):
                 raise RuntimeError("armed breakpoint drift before reply-later")
@@ -269,7 +290,7 @@ def run_session(client, *, detach_at: str | None = None,
                 proof = dict(tid=other, generation=fact["generation"], handle=handle,
                              suspend_failure=fact, held_owner=dict(tid=tid, generation=generation,
                                                                   address=address))
-                exit_waiting[(other, fact["generation"])] = proof
+                exit_waiting[ThreadInstance(other, fact["generation"])] = proof
                 result.setdefault("peer_exit_deferrals", []).append(proof)
                 exit_wait_deadline = time.monotonic() + 1
                 reply_later(tid, generation, address)
@@ -280,7 +301,7 @@ def run_session(client, *, detach_at: str | None = None,
         nonlocal stepping, stopped_hit
         if ctx.EFlags & TF:
             raise RuntimeError("fixture unexpectedly supplied TF; refusing to steal trap ownership")
-        stepping = dict(tid=tid, generation=generation, address=address,
+        stepping = dict(owner=ThreadInstance(tid, generation), address=address,
                         original_flags=ctx.EFlags, executed=False)
         # Peer leases were acquired BEFORE recording the endpoint. This prevents
         # a replayed stop from duplicating logical entries/returns.
@@ -291,7 +312,7 @@ def run_session(client, *, detach_at: str | None = None,
 
     def finish_step():
         nonlocal stepping
-        tid, address = stepping["tid"], stepping["address"]
+        tid, address = stepping["owner"].tid, stepping["address"]
         ctx = context(tid)
         ctx.EFlags = (ctx.EFlags & ~TF) | (stepping["original_flags"] & TF)
         set_control(tid, ctx)
@@ -299,7 +320,7 @@ def run_session(client, *, detach_at: str | None = None,
             site["address"] == address and site["owners"] for site in obs.report()["breakpoints"])
         if wanted:
             install(address)
-        result["steps"].append(dict(tid=tid, generation=stepping["generation"], address=address, next_ip=ctx.Eip,
+        result["steps"].append(dict(tid=tid, generation=stepping["owner"].generation, address=address, next_ip=ctx.Eip,
                                      rearmed=wanted, trap_flag_after=context(tid).EFlags & TF,
                                      peers_suspended=len(suspended)))
         resume_others()
@@ -336,7 +357,7 @@ def run_session(client, *, detach_at: str | None = None,
                     set_control(tid, ctx)
                     fact["rewound_ip"] = context(tid).Eip
                 elif (record.ExceptionCode in SINGLE_STEP and stepping is not None
-                      and tid == stepping["tid"]):
+                      and tid == stepping["owner"].tid):
                     ctx.EFlags = (ctx.EFlags & ~TF) | (stepping["original_flags"] & TF)
                     set_control(tid, ctx)
                 else:
@@ -374,7 +395,7 @@ def run_session(client, *, detach_at: str | None = None,
         event = api._DebugEvent()
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            if exit_waiting and time.monotonic() >= exit_wait_deadline:
+            if exit_waiting and time.monotonic() >= cast(float, exit_wait_deadline):
                 unsafe_stop_reason = "terminating peer exit event not confirmed within 1s"
                 raise TimeoutError(unsafe_stop_reason)
             if not k.WaitForDebugEvent(ctypes.byref(event), 50):
@@ -390,7 +411,7 @@ def run_session(client, *, detach_at: str | None = None,
             pending = (client.pid, tid)
             if exit_waiting:
                 received_at = time.monotonic()
-                if received_at >= exit_wait_deadline:
+                if received_at >= cast(float, exit_wait_deadline):
                     unsafe_stop_reason = "terminating peer exit event not confirmed within 1s"
                     result["received_after_peer_exit_deadline"] = dict(
                         pid=client.pid, tid=tid, generation=generations.get(tid), code=code,
@@ -406,6 +427,7 @@ def run_session(client, *, detach_at: str | None = None,
             # Stamp identity at transport ingress, before any deferred dispatch.
             # Never look up today's generation when delivering an old event.
             event_generation = generations.get(tid)
+            event_owner = ThreadInstance(tid, event_generation) if event_generation is not None else None
             result["debug_events"].append(dict(tid=tid, generation=event_generation, code=code))
             status = api.DBG_CONTINUE
             if code == api.CREATE_PROCESS_DEBUG_EVENT:
@@ -432,7 +454,7 @@ def run_session(client, *, detach_at: str | None = None,
                 if event.u.LoadDll.hFile:
                     k.CloseHandle(event.u.LoadDll.hFile)
             elif code == api.EXIT_THREAD_DEBUG_EVENT:
-                proof = exit_waiting.get((tid, event_generation))
+                proof = exit_waiting.get(event_owner)
                 if proof is not None:
                     if proof["handle"] != threads.get(tid):
                         unsafe_stop_reason = "exit proof handle/generation changed"
@@ -440,8 +462,8 @@ def run_session(client, *, detach_at: str | None = None,
                     proof["confirmed_by_exit_event"] = dict(
                         tid=tid, generation=event_generation, handle=threads[tid],
                         exit_code=struct.unpack_from("<I", bytes(event.u.raw))[0])
-                    del exit_waiting[(tid, event_generation)]
-                obs.thread_exit(tid, generation=event_generation,
+                    del exit_waiting[event_owner]
+                obs.thread_exit(tid, generation=cast(int, event_generation),
                                 exit_code=struct.unpack_from("<I", bytes(event.u.raw))[0])
                 lease = suspended.pop(tid, None)
                 if lease is not None:
@@ -477,10 +499,10 @@ def run_session(client, *, detach_at: str | None = None,
                 if exit_waiting and not (exception in BREAKPOINT and address in originals):
                     unsafe_stop_reason = "unowned exception during peer exit proof"
                     raise RuntimeError(unsafe_stop_reason)
-                if (stepping is not None and tid == stepping["tid"]
-                        and event_generation != stepping["generation"]):
+                if (stepping is not None and tid == stepping["owner"].tid
+                        and not _owns_step(stepping["owner"], event_owner)):
                     raise RuntimeError("single-step event has a different thread generation")
-                if stepping is not None and exception in SINGLE_STEP and tid == stepping["tid"]:
+                if stepping is not None and exception in SINGLE_STEP and _owns_step(stepping["owner"], event_owner):
                     stepping["executed"] = True
                     if detach_at == "step-stop" or fail_at == "step-stop":
                         early = True
@@ -489,7 +511,7 @@ def run_session(client, *, detach_at: str | None = None,
                         break
                     finish_step()
                 elif (stepping is not None and exception in BREAKPOINT
-                      and address in originals and tid != stepping["tid"]):
+                      and address in originals and tid != stepping["owner"].tid):
                     if tid not in suspended:
                         raise RuntimeError("queued peer trap escaped single-step suspension")
                     # This trap may have been queued before we unpatched the
@@ -504,7 +526,7 @@ def run_session(client, *, detach_at: str | None = None,
                         rewound_ip=context(tid).Eip))
                 elif exception in BREAKPOINT and address in originals:
                     ctx = context(tid)
-                    expected = reply_expected.pop((tid, event_generation), None)
+                    expected = reply_expected.pop(event_owner, None)
                     if expected is not None:
                         if expected != address or exit_waiting:
                             unsafe_stop_reason = "reply-later replay identity/address mismatch"
@@ -535,7 +557,7 @@ def run_session(client, *, detach_at: str | None = None,
                         # target (fixture depth==0 bypasses the recursive CALL).
                         # Keep the rejected endpoint raw; never fabricate a pair.
                         obs.return_hit(tid, address, snapshot(ctx, ip=address, reads=reads, gaps=gaps),
-                                       generation=event_generation)
+                                       generation=cast(int, event_generation))
                         drain_requests()
                     prepare_step(tid, event_generation, address, ctx)
                     if detach_at == "step-prepared" or fail_at == "step-prepared":
@@ -562,7 +584,7 @@ def run_session(client, *, detach_at: str | None = None,
                         client.release()
                         command_released = True
                 else:
-                    obs.exception(tid, generation=event_generation, code=exception, address=address,
+                    obs.exception(tid, generation=cast(int, event_generation), code=exception, address=address,
                                   first_chance=bool(event.u.Exception.dwFirstChance),
                                   snapshot=snapshot(context(tid)))
                     status = api.DBG_EXCEPTION_NOT_HANDLED
@@ -600,12 +622,12 @@ def run_session(client, *, detach_at: str | None = None,
                     ctx.Eip = address
                     set_control(tid, ctx)
                 if stepping is not None:
-                    tid = stepping["tid"]
+                    tid = stepping["owner"].tid
                     ctx = context(tid)
                     ctx.EFlags = (ctx.EFlags & ~TF) | (stepping["original_flags"] & TF)
                     set_control(tid, ctx)
                     result["cleanup"]["interrupted_step"] = dict(
-                        tid=tid, generation=stepping["generation"],
+                        tid=tid, generation=stepping["owner"].generation,
                         executed=stepping["executed"], ip=context(tid).Eip,
                         trap_flag_after=context(tid).EFlags & TF)
                 obs.detach("authored driver in-flight detach" if early else "authored driver completed")

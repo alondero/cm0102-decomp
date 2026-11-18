@@ -34,7 +34,7 @@ def test_c_rejects_insufficient_evidence(tmp_path, monkeypatch, coverage, exclud
     monkeypatch.setattr(recover.lift, "discover", lambda va: SimpleNamespace(va=va, region_end=va+1,
                                                                           insns={va: ret}, tables={}, data=[], name="test"))
     monkeypatch.setattr(recover.build, "build", lambda *args: SimpleNamespace(
-        image=SimpleNamespace(return_bindings=(), jump_bindings=(), x87_bindings=())))
+        symbols={}, image=SimpleNamespace(return_bindings=(), jump_bindings=(), x87_bindings=())))
     monkeypatch.setattr(difftest, "run", lambda *args, **kwargs: {"mismatches": [], "inconclusive": 0,
                                                                  "coverage": coverage, "code_as_data_cases": excluded})
     report = recover.test_c(0x004671b0, {"cases": 100}, fresh=True, profile=profile)

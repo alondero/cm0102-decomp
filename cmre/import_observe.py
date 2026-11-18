@@ -11,6 +11,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 import json
+from typing import cast
 
 
 REGISTERS = ("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags")
@@ -22,10 +23,23 @@ def _u32(value: int) -> int:
     return value
 
 
-def _text(value: str) -> str:
+def _text(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("nonempty evidence description required")
     return value
+
+
+@dataclass(frozen=True)
+class ThreadInstance:
+    """A thread in one observation session, including its recorded generation."""
+
+    tid: int
+    generation: int
+
+    def __post_init__(self):
+        _u32(self.tid)
+        if self.tid == 0 or type(self.generation) is not int or self.generation < 1:
+            raise ValueError("thread instance requires a registered positive generation")
 
 
 @dataclass(frozen=True)
@@ -182,7 +196,7 @@ class ImportObserver:
                 words.add(int.from_bytes(bytes.fromhex(read["data_hex"]), "little"))
         verified_word = return_site is not None and words == {return_site}
         if verified_word:
-            expected = return_site.to_bytes(4, "little")
+            expected = cast(int, return_site).to_bytes(4, "little")
             for read in raw["memory"]:
                 blob = bytes.fromhex(read["data_hex"])
                 lo, hi = max(sp, read["address"]), min(sp + 4, read["address"] + len(blob))

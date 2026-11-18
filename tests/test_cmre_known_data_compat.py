@@ -1,4 +1,5 @@
 """Closed known-data proof: real source-pair recognition and adversarial origins."""
+import ast
 import copy
 import json
 from pathlib import Path
@@ -6,9 +7,14 @@ import pytest
 from cmre import known_data_compat as p
 from cmre import env, ledger, recover, validation as v
 
+FIXTURES = Path(__file__).parent / "fixtures"
+AFTER = FIXTURES / "known_data_recover_after.py"
+
+
 def pair():
-    return ((Path(__file__).parent/'fixtures/known_data_recover_before.py').read_text(),
-            Path(recover.__file__).read_text())
+    return ((FIXTURES / "known_data_recover_before.py").read_bytes().decode("utf-8"),
+            AFTER.read_bytes().decode("utf-8"))
+
 
 def test_exact_actual_reviewed_source_pair():
     p.check_sources(*pair())
@@ -30,14 +36,32 @@ def test_ast_backstop_rejects_guest_or_policy_changes_even_if_pair_hash_guard_we
     with pytest.raises(ValueError):p.check_sources(a,b)
 
 def identities():
-    a,b=pair();components={n:env.digest(Path(recover.__file__).with_name(n)) for n in recover.HARNESS_MODULES}
+    a, b = pair()
+    modules = next(node.value for node in ast.parse(b).body if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == 'HARNESS_MODULES'
+                           for target in node.targets))
+    components = {name: env.digest(Path(recover.__file__).with_name(name))
+                  for name in ast.literal_eval(modules)}
+    components['recover.py'] = env.digest(AFTER)
     before={'harness':p.OLD_HARNESS,'components':{**components,'recover.py':p.OLD_RECOVER},'planner':'old',
             'dispatch_sources':{'recover.py':a,'difftest.py':Path(recover.__file__).with_name('difftest.py').read_bytes().decode()},
             'target':'pinned','python':'same','dependencies':{'unicorn':'same'},'build_environment':{},'workspace':'same'}
     return before,{**copy.deepcopy(before),'harness':p.NEW_HARNESS,'components':components,'planner':'new',
                    'dispatch_sources':{**before['dispatch_sources'],'recover.py':b}}
 
-def test_exact_guest_transition():p.transition(*identities())
+def test_exact_guest_transition(monkeypatch):
+    digest = env.digest
+    def historical_digest(path):
+        return digest(AFTER if path.name == 'recover.py' else path)
+
+    monkeypatch.setattr(env, 'digest', historical_digest)
+    p.transition(*identities())
+
+
+def test_historical_transition_rejects_current_recover_changes():
+    assert env.digest(Path(recover.__file__)) != env.digest(AFTER)
+    with pytest.raises(ValueError, match='Current guest module changed'):
+        p.transition(*identities())
 
 @pytest.mark.parametrize('field,value', [('harness','unknown'),('target','changed'),('python','changed'),
  ('build_environment',{'CPATH':'unknown'}),('workspace','other'),('dependencies',{'unicorn':'different'})])

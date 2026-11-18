@@ -29,7 +29,7 @@ def test_c_forwards_known_data_spans_without_hiding_changed_return(tmp_path,monk
  monkeypatch.setattr(recover,'c_inputs',lambda va:'v2')
  lifted=SimpleNamespace(va=VA,region_end=REGION[1],name='inline-data-test',insns={VA:None},data=[SimpleNamespace(va=RAW,raw=b'abcd')],tables={TABLE:SimpleNamespace(va=TABLE,targets=[VA,VA+1])})
  monkeypatch.setattr(recover.lift,'discover',lambda va:lifted)
- monkeypatch.setattr(recover.build,'build',lambda *args:SimpleNamespace(image=SimpleNamespace(return_bindings=(),jump_bindings=(),x87_bindings=())))
+ monkeypatch.setattr(recover.build,'build',lambda *args:SimpleNamespace(symbols={},image=SimpleNamespace(return_bindings=(),jump_bindings=(),x87_bindings=())))
  captured=[]
  def run(va,region,insns,built,call_returns,opts,profile,data_spans=(),**kwargs):
   captured.append(list(data_spans))

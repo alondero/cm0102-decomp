@@ -608,6 +608,10 @@ def publish(task_id: str, *, worktree_worker: Path | None = None) -> dict:
                     or review.get('input_fingerprint') != submitted['input_fingerprint']
                     or review.get('attempt_number') != attempt['number']):
                 raise ValueError('Stale worktree review; fresh review required')
+            from . import screen
+
+            gate = json.loads((env.ROOT / attempt['report_path']).read_bytes())
+            screen.require_promotion(va, gate, review.get('return_screen'))
             expected_hold_generation = review.get('hold_generation')
             if type(expected_hold_generation) is not int or expected_hold_generation < 0:
                 raise ValueError('Worktree review lacks a valid hold generation')

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cmre import coordination, env, tasks, work, worktrees
+from cmre import acceptance_request, coordination, env, screen, tasks, work, worktrees
 from test_cmre_tasks import VA, workspace  # shared synthetic instruction fixture
 
 
@@ -20,6 +20,25 @@ def worker(workspace, tmp_path, monkeypatch):
     monkeypatch.setattr(worktrees, '_git_identity', lambda root: {'common': 'same', 'head': 'first'})
     monkeypatch.setattr(worktrees, '_code_identity', lambda root: 'same-code')
     monkeypatch.setattr(worktrees, '_pins', lambda: None)
+    identity = {'schema': screen.SCHEMA, 'execution': workspace, 'profile': 'semantic', 'options': {}}
+    monkeypatch.setattr(screen, 'current_identity', lambda va: (identity, None))
+
+    def original_screen(va):
+        path = screen._directory(va, identity) / 'synthetic.json'
+        report = {'schema': screen.SCHEMA, 'identity': identity, 'cases': 1,
+                  'status': 'return-observed', 'first_return_case': 0, 'outcomes': {'return': 1}}
+        coordination.atomic_json(path, report)
+        return {**report, 'receipt': env.rel(path)}
+
+    def candidate_gate(va, *, source):
+        return {'status': 'pass', 'source': str(source), 'profile': 'semantic',
+                'execution_identity': workspace,
+                'effective_options_sha256': acceptance_request.digest_json(identity['options']),
+                'builds': {opt: {'status': 'pass', 'difftest': {'outcomes': {'return': 1}}}
+                           for opt in tasks.recover.C_OPT_LEVELS}}
+
+    monkeypatch.setattr(screen, 'run', original_screen)
+    monkeypatch.setattr(tasks.recover, 'test_c', candidate_gate)
     worktrees.bootstrap(worker)
     return worker
 
@@ -128,6 +147,23 @@ def test_submission_requires_review_and_imports_only_bound_source(worker, monkey
     assert worktrees.publish(worker, VA)['status'] == 'published'
     assert worktrees.publish(worker, VA)['status'] == 'published'
     assert 'fn_00401000' not in work.claims()
+
+
+def test_a_passing_fault_only_build_cannot_be_reviewed_for_promotion(worker, monkeypatch):
+    gate = tasks.recover.test_c
+
+    def test_c(va, *, source):
+        report = gate(va, source=source)
+        report['builds']['-O2']['difftest']['outcomes'] = {'fault': 1}
+        return report
+
+    monkeypatch.setattr(tasks.recover, 'test_c', test_c)
+    worktrees.claim(worker, VA, 'translator')
+    source = candidate(worker)
+    result = worktrees.submit(worker, VA)
+    with pytest.raises(ValueError, match='top-level return'):
+        worktrees.review(worker, VA, reviewer='reviewer', reason='Checked the instruction listing',
+                         source_sha256=env.digest(source), report_sha256=env.digest(worker / result['report']))
 
 
 def test_source_report_and_snapshot_drift_reject_review_or_submission(worker, workspace):
@@ -441,11 +477,16 @@ def test_pinned_target_and_inventory_hashes_are_checked(tmp_path, monkeypatch):
 def test_fifth_success_recovers_interrupted_report_export_without_another_attempt(worker, monkeypatch):
     claimed = worktrees.claim(worker, VA, 'translator')
     candidate(worker)
+    gate = tasks.recover.test_c
     monkeypatch.setattr(tasks.recover, 'test_c', lambda *a, **k: {'status': 'fail'})
     for _ in range(4):
         worktrees.submit(worker, VA)
     calls = []
-    monkeypatch.setattr(tasks.recover, 'test_c', lambda *a, **k: (calls.append('gate') or {'status': 'pass'}))
+    def succeeds(*args, **kwargs):
+        calls.append('gate')
+        return gate(*args, **kwargs)
+
+    monkeypatch.setattr(tasks.recover, 'test_c', succeeds)
     write = coordination.atomic_bytes
     def interrupt_export(path, payload):
         if path == worker / worktrees.LOCAL / 'fn_00401000/report-5.json':
