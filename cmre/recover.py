@@ -13,11 +13,14 @@ import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import capstone
 
 from . import HARNESS_VERSION, build, coordination, difftest, env, inventory, jump_transport, ledger, lift, return_transport, semantic, x87_transport
+
+from . import acceptance_request, operand_evidence
 
 LIFTED_PROFILE = "exact"
 C_PROFILE = "semantic"  # default for new C; existing records keep theirs (ADR 0002)
@@ -30,7 +33,7 @@ C_OPT_LEVELS = ("-O0", "-O2")
 # change what a run proves, so they do not change the recorded harness identity.
 HARNESS_MODULES = ("__init__.py", "env.py", "image.py", "inventory.py", "lift.py", "build.py", "emu.py",
                    "imports.py", "difftest.py", "recover.py", "return_transport.py", "jump_transport.py", "x87_transport.py",
-                   "semantic.py", "csource.py")
+                   "semantic.py", "csource.py", "acceptance_request.py", "operand_evidence.py")
 
 
 @functools.cache
@@ -345,6 +348,31 @@ def _semantic_contract(va: int, text: str) -> tuple[str, list[str]]:
     return returns, problems
 
 
+def _cipow_calls(built) -> int:
+    # A tail jump also transfers control into the bridge. Inspect the linked
+    # image so preprocessor aliases cannot hide all source-level call sites.
+    targets = {built.symbols[name] for name in ('_cm_x87_CIpow', '_cm_fn_00945ff0')
+               if name in built.symbols}
+    if not targets:
+        return 0
+    section = built.image.text
+    bridge = built.symbols.get('_cm_x87_CIpow')
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+    md.skipdata = True
+    count = 0
+    for address, _, mnemonic, operand in md.disasm_lite(section.raw, section.va):
+        if mnemonic not in ('call', 'jmp') or not re.fullmatch(r'0x[0-9a-f]+', operand):
+            continue
+        target = int(operand, 16)
+        # The supplied bridge itself loads two 80-bit operands and calls the
+        # original helper once. Only hand/transformed caller sites need proof.
+        if bridge is not None and bridge <= address < bridge + 14 and target != bridge:
+            continue
+        if target in targets:
+            count += 1
+    return count
+
+
 def test_c(va: int, overrides: dict | None = None, fresh: bool = False, *, source: Path | None = None,
            profile: str | None = None) -> dict:
     source = Path(source) if source is not None else env.C_DIR / f"fn_{va:08x}.c"
@@ -403,7 +431,8 @@ def test_c(va: int, overrides: dict | None = None, fresh: bool = False, *, sourc
             builds[opt] = {"status": "pass" if ok else "fail", "difftest": result,
                            "return_transport": return_transport.report(built.image.return_bindings),
                            "jump_transport": jump_transport.report(built.image.jump_bindings),
-                           "x87_transport": x87_transport.report(built.image.x87_bindings)}
+                           "x87_transport": x87_transport.report(built.image.x87_bindings),
+                           "cipow_calls": _cipow_calls(built)}
             if not ok:
                 status = "fail"
     if contract_problems:
@@ -415,6 +444,7 @@ def test_c(va: int, overrides: dict | None = None, fresh: bool = False, *, sourc
               "toolchain": env.toolchain_identity(), "builds": builds,
               "jump_contract": contract,
               "x87_contract": fp_contract,
+              "effective_options_sha256": acceptance_request.digest_json(opts.__dict__),
               "source_dependencies": dependencies["files"], "preprocessed_sha256": dependencies["preprocessed"]}
     run_dir.mkdir(parents=True, exist_ok=True)
     ledger.write_json(cached, report)
@@ -429,6 +459,24 @@ def _digests(report: dict) -> list[str]:
 
 @coordination.coordinated
 def accept(va: int, tier: str = "lifted", *, refresh: bool = False, profile: str | None = None) -> tuple[bool, dict]:
+    return _accept(va, tier, refresh=refresh, profile=profile, request=None)
+
+
+@coordination.coordinated
+def accept_farm(va: int, request_path: Path) -> tuple[bool, dict]:
+    """Consume a mandatory farm request inside the same lease as the ledger write."""
+    try:
+        request = acceptance_request.FarmAcceptance.load(request_path)
+        if request.va != va:
+            raise ValueError('Farm acceptance request names a different function')
+        request.check_inputs()
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return False, {"status": "acceptance-input-drift", "detail": str(exc)}
+    return _accept(va, "c", refresh=False, profile=None, request=request)
+
+
+def _accept(va: int, tier: str, *, refresh: bool, profile: str | None,
+            request: acceptance_request.FarmAcceptance | None) -> tuple[bool, dict]:
     path = ledger.record_path(va)
     existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
     if tier == "lifted" and refresh and existing and existing.get("c"):
@@ -444,8 +492,20 @@ def accept(va: int, tier: str = "lifted", *, refresh: bool = False, profile: str
     first = test_lifted(va) if tier == "lifted" else test_c(va, profile=profile)
     if first["status"] != "pass":
         return False, first
-    if refresh and existing and first["source_sha256"] != existing[tier]["source_sha256"]:
+    if refresh and existing and first["source_sha256"] != (existing.get(tier) or {}).get("source_sha256"):
         return False, {**first, "status": "source-drift"}
+    hint_path = env.HINTS_DIR / f"fn_{va:08x}.json"
+    initial_hint = acceptance_request.optional_digest(acceptance_request.optional_bytes(hint_path))
+    proof = None
+    if request is not None:
+        try:
+            request.check_gate(first)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return False, {"status": "acceptance-input-drift", "detail": str(exc)}
+    if tier == "c" and not refresh:
+        proof, blocker = _operand_proof(va, first, initial_hint, request)
+        if blocker:
+            return False, {"status": "operand-evidence-needed", "detail": blocker}
     # Fresh machines, same process: catches state leaking between runs. Cross-process
     # and hash-seed determinism is a harness property covered by the test suite.
     second = test_lifted(va, fresh=True) if tier == "lifted" else test_c(va, fresh=True, profile=profile)
@@ -455,6 +515,7 @@ def accept(va: int, tier: str = "lifted", *, refresh: bool = False, profile: str
     if (first["key"] != second["key"] or first["execution_identity"] != second["execution_identity"]
             or second["execution_identity"] != execution_identity()
             or initial_options != difftest.Options.for_function(va, tier=tier).__dict__
+            or initial_hint != acceptance_request.optional_digest(acceptance_request.optional_bytes(hint_path))
             or (tier == "c" and env.digest(env.C_DIR / f"fn_{va:08x}.c") != second["source_sha256"])):
         return False, {**first, "status": "input-drift"}
     if tier == "lifted":
@@ -486,14 +547,76 @@ def accept(va: int, tier: str = "lifted", *, refresh: bool = False, profile: str
         record = dict(existing)
         record["status"] = {**record["status"], "decompiled": True}
         record["c"] = _tier_record(first, env.ROOT / first["source"])
-        record["hints"] = env.rel(env.HINTS_DIR / f"fn_{va:08x}.json") if (env.HINTS_DIR / f"fn_{va:08x}.json").exists() else None
+        if proof is not None:
+            record["c"]["operand_evidence"] = {
+                "path": env.rel(proof.path), "sha256": proof.sha256, "status": "current",
+            }
+        elif refresh and (retained := existing["c"].get("operand_evidence")):
+            record["c"]["operand_evidence"] = {**retained, "status": "historical"}
+        record["hints"] = env.rel(hint_path) if hint_path.exists() else None
     if existing and existing.get('c_retractions'):
         record['c_retractions'] = existing['c_retractions']
+    if request is not None:
+        try:
+            request.check_gate(second)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return False, {"status": "acceptance-input-drift", "detail": str(exc)}
+    if proof is not None:
+        blocker = _check_operand_proof(va, second, initial_hint, request, proof)
+        if blocker:
+            return False, {"status": "operand-evidence-needed", "detail": blocker}
     ledger.write_json(path, record)
     bp = ledger.blocked_path(va)
     if bp.exists():
         bp.unlink()
     return True, {"status": "accepted", "record": env.rel(path)}
+
+
+def _check_operand_proof(va, gate, hints_sha, request, proof):
+    try:
+        proof.checked_bytes()
+        raw = (env.C_DIR / f"fn_{va:08x}.c").read_bytes()
+        if env.digest_bytes(raw) != gate['source_sha256']:
+            return 'Canonical source changed after operand validation'
+        return operand_evidence.verify_receipt(
+            proof.path, raw, fn=f"fn_{va:08x}", job_number=request.job if request else None,
+            hints_sha=hints_sha, current_execution=execution_identity, active_gate=gate,
+        )
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return f'Invalid retained operand evidence: {exc}'
+
+
+def _operand_proof(va, baseline, hints_sha, request):
+    fn = f"fn_{va:08x}"
+    source = env.C_DIR / f"{fn}.c"
+    raw = source.read_bytes()
+    existing_proof = request.operand_proof if request else None
+    if existing_proof is not None:
+        return existing_proof, _check_operand_proof(va, baseline, hints_sha, request, existing_proof)
+    if not operand_evidence.operand_proof_needed(raw, baseline):
+        return None, None
+    if request is not None and (operand_evidence.bridge_call_sites(raw.decode('utf-8'))
+                                or any(b.get('cipow_calls') for b in baseline['builds'].values())):
+        return None, 'A bridge candidate from the farm requires its retained operand proof'
+    path = env.RUNS / fn / f"c-{baseline['key']}" / 'operands' / str(time.time_ns()) / 'summary.json'
+
+    def check_inputs():
+        if source.read_bytes() != raw:
+            return 'canonical source changed during operand validation'
+        hint = acceptance_request.optional_bytes(env.HINTS_DIR / f"{fn}.json")
+        if acceptance_request.optional_digest(hint) != hints_sha:
+            return 'canonical hints changed during operand validation'
+        return None
+
+    blocker = operand_evidence.generate(
+        path, fn, None, raw, baseline, hints_sha,
+        gate=lambda candidate: test_c(va, source=candidate, profile=baseline['profile']),
+        check_inputs=check_inputs, report_event=lambda status: None,
+    )
+    if blocker or not path.is_file():
+        return None, blocker
+    proof = acceptance_request.Artifact(path, env.digest(path))
+    return proof, _check_operand_proof(va, baseline, hints_sha, request, proof)
 
 
 def accept_with_inference(va: int, rounds: int = 2) -> tuple[bool, dict]:

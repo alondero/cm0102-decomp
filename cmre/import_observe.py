@@ -29,6 +29,19 @@ def _text(value: str) -> str:
 
 
 @dataclass(frozen=True)
+class ThreadInstance:
+    """A thread in one observation session, including its recorded generation."""
+
+    tid: int
+    generation: int
+
+    def __post_init__(self):
+        _u32(self.tid)
+        if self.tid == 0 or type(self.generation) is not int or self.generation < 1:
+            raise ValueError("thread instance requires a registered positive generation")
+
+
+@dataclass(frozen=True)
 class MemoryRead:
     address: int
     requested_size: int

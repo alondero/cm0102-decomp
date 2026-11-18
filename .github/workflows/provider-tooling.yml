@@ -22,4 +22,6 @@ jobs:
       - name: Exercise provider coordination without game assets or provider access
         run: |
           $providerTests = @(Get-ChildItem tests -File | Where-Object { $_.Name -like 'test_provider_*.py' -or $_.Name -like 'test_pipeline*.py' } | ForEach-Object { $_.FullName })
-          py -3.13 -m pytest $providerTests scripts/tests/test_cmre_provider_worker.py scripts/tests/test_cmre_session.py tests/test_cmre_worktrees.py tests/test_cmre_tasks.py tests/test_cmre_retract.py tests/test_cmre_composition_diagnostic.py tests/test_cmre_pipeline_stages.py scripts/tests/test_cmre_provider_slots.py scripts/tests/test_cmre_hint_check.py scripts/tests/test_cmre_native_plan.py scripts/tests/test_cmre_farm.py -q
+          py -3.13 -m pytest $providerTests scripts/tests/test_cmre_provider_worker.py scripts/tests/test_cmre_session.py tests/test_cmre_worktrees.py tests/test_cmre_tasks.py tests/test_cmre_acceptance_evidence.py tests/test_cmre_retract.py tests/test_cmre_composition_diagnostic.py tests/test_cmre_pipeline_stages.py scripts/tests/test_cmre_provider_slots.py scripts/tests/test_cmre_hint_check.py scripts/tests/test_cmre_native_plan.py scripts/tests/test_cmre_farm.py -q
+      - name: Check native thread identity without game assets
+        run: py -3.13 -m pytest tests/test_debug_observe_backend.py tests/test_native_peer_exit.py -q -k "step_ownership or worker_exit_selection"

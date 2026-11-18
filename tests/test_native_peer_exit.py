@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from cmre.import_observe import ThreadInstance
+
 from native_debug_fixture import ROOT, Unavailable, build_fixture
 from native_import_observer import observe_calls, _exit_transition_candidate
 from cmre import capture_record as api
@@ -25,11 +27,12 @@ def exit_race_fixture():
 
 def _worker_exit_events(protocol):
     """Exclude reused non-worker TIDs: they once made 24 worker exits count as 25."""
-    worker_identities = {(record["tid"], record["thread_generation"])
+    worker_identities = {ThreadInstance(record["tid"], record["thread_generation"])
                          for record in protocol["invocations"]}
     return [event for event in protocol["events"]
             if event["kind"] == "thread-exit"
-            and (event["tid"], event["generation"]) in worker_identities]
+            and event["generation"] is not None
+            and ThreadInstance(event["tid"], event["generation"]) in worker_identities]
 
 
 def test_worker_exit_selection_distinguishes_reused_thread_generations():

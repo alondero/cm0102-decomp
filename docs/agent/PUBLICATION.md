@@ -37,7 +37,9 @@ approve a binary package.
    findings; remediate actual copied content locally. A `.c` or `.S` suffix is
    not proof of authorship. Do not strip labels or alter accepted source merely
    to avoid detection; a behavior/source change requires normal review and
-   acceptance before publishing that new revision.
+   acceptance before publishing that new revision. Farm and manual acceptance
+   surface instruction-listing findings as publication alerts. Resolve them by
+   exact-hash review or withhold the candidate from Git publication.
 3. The address-keyed listing detector can also flag authored executable assembly.
    An independent reviewer may classify that exact file as authored reconstruction
    after inspecting its provenance and retained build evidence. Record only
@@ -62,7 +64,9 @@ approve a binary package.
    history or accepted-source mismatch findings. Raw disassembly is ineligible.
    Do not create a disposition simply because a file is useful or already accepted.
 4. Stage explicit reviewed paths and run `py -3.13 -m cmre publication scan
-   --staged`, adding the source-review argument if needed. Resolve findings before
+   --staged`, adding the source-review argument if needed. The staged scan
+   compares all tracked C in the index to the authoritative local ledger, so
+   inherited mismatches appear before committing. Resolve findings before
    committing a source-publication batch. Local-only history and evidence backups
    remain separate from the publication branch.
 5. For a requested push, run `py -3.13 -m cmre publication scan --commit BRANCH`

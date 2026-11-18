@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cmre import build, difftest, emu, env, image, lift, recover, screen
+from cmre import acceptance_request, build, difftest, emu, env, image, lift, recover, screen
 
 VA = 0x401000
 
@@ -60,6 +60,27 @@ def test_all_fault_cases_hold_without_task_attempts_or_candidate_build(simulatio
     assert result['coverage'] == 0.5
     assert len(simulation.calls) == 4
     assert not (env.ANALYSIS / 'cmre/tasks').exists()
+
+
+@pytest.mark.parametrize('returns', [False, True])
+def test_promotion_requires_current_return_evidence_or_explicit_nonreturning_review(simulation, returns):
+    if returns:
+        simulation.outcomes[0] = 'return'
+    report = screen.run(VA)
+    path = env.ROOT / report['receipt']
+    binding = {'receipt': report['receipt'], 'sha256': env.digest(path)}
+    gate = {'status': 'pass', 'profile': 'semantic', 'execution_identity': simulation.identity.copy(),
+            'effective_options_sha256': acceptance_request.digest_json(report['identity']['options']),
+            'builds': {opt: {'status': 'pass', 'difftest': {'outcomes': report['outcomes']}}
+                       for opt in recover.C_OPT_LEVELS}}
+    if not returns:
+        with pytest.raises(ValueError, match='top-level return'):
+            screen.require_promotion(VA, gate, binding)
+        binding['nonreturning_reason'] = 'Original body terminates through its fatal boundary'
+    screen.require_promotion(VA, gate, binding)
+    simulation.opts.hints = {'ecx': 'ptr'}
+    with pytest.raises(ValueError, match='Stale return-screen'):
+        screen.require_promotion(VA, gate, binding)
 
 
 def test_return_observation_keeps_later_faults_and_exact_discovery_sequence(simulation):

@@ -111,11 +111,10 @@ callees as explicit boundaries. C acceptance does not establish composed executi
      `#include "cmre_x87.h"` and write `cm_x87_CIpow(base, exponent)` with both
      operands as `long double` computed as the listing does; the bridge calls the
      original helper. Never declare `cm_fn_00945ff0` with stack parameters, and
-     never substitute a C `pow`. Name each original call VA in a comment. Break
-     the base and the exponent once each in a scratch copy and run
-     `cmre test fn_X --c --source COPY`; a capped or clamped result often hides
-     the power from the random corpus, so if a copy also passes, add evidenced
-     `c_hints` fixtures that reach the value before accepting.
+     never substitute a C `pow`. Name each original call VA in a comment.
+     `cmre accept fn_X --c` requires retained evidence that a changed base and
+     a changed exponent each produce a mismatch at O0 and O2 for every call.
+     If a control survives, add evidenced `c_hints` fixtures that reach it.
    - MSVC pushes arguments right to left and may run a nested call between pushes.
      Pushes before `call A` that A's `(void)` signature does not take belong to the
      next call: `push x; push y; call A; push eax; push fmt; call B` is `B(fmt, A(), y, x)`.

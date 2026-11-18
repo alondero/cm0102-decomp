@@ -405,8 +405,12 @@ def sync(worker: Path, va: int) -> dict:
 
 
 def review(worker: Path, va: int, *, reviewer: str, reason: str,
-           source_sha256: str, report_sha256: str) -> dict:
+           source_sha256: str, report_sha256: str, nonreturning_reason: str | None = None) -> dict:
+    from . import screen
+
     worker = Path(worker).resolve()
+    if nonreturning_reason is not None and not nonreturning_reason.strip():
+        raise ValueError('Nonreturning review requires specific original instruction evidence')
     if not reviewer.strip() or not reason.strip():
         raise ValueError('Review requires reviewer identity and instruction-evidence justification')
     with coordination.writer(), _worker_lock(worker), _function_lock(va):
@@ -415,6 +419,12 @@ def review(worker: Path, va: int, *, reviewer: str, reason: str,
         attempt = manifest['attempts'][-1]
         if source_sha256 != attempt['candidate_sha256'] or report_sha256 != attempt['report_sha256']:
             raise ValueError('Review hashes differ from the submitted source/report')
+        screened = screen.run(va)
+        path = env.ROOT / screened['receipt']
+        return_screen = {'receipt': screened['receipt'], 'sha256': env.digest(path),
+                         'nonreturning_reason': nonreturning_reason}
+        gate = json.loads((env.ROOT / attempt['report_path']).read_bytes())
+        screen.require_promotion(va, gate, return_screen)
         with work.locked():
             records = work.read()['functions']
             record = records.get(f'fn_{va:08x}', {})
@@ -423,7 +433,8 @@ def review(worker: Path, va: int, *, reviewer: str, reason: str,
             generation = record.get('hold_generation', 0)
             entry['review'] = {'reviewer': reviewer, 'reason': reason, 'source_sha256': source_sha256,
                                'report_sha256': report_sha256, 'input_fingerprint': manifest['input_fingerprint'],
-                               'hold_generation': generation, 'attempt_number': attempt['number']}
+                               'hold_generation': generation, 'attempt_number': attempt['number'],
+                               'return_screen': return_screen}
             _save(worker, state)
         return entry['review']
 
@@ -495,6 +506,7 @@ def add_commands(sub) -> None:
         if action == 'review':
             for key in ('reviewer', 'reason', 'source-sha256', 'report-sha256'):
                 p.add_argument('--' + key, required=True)
+            p.add_argument('--nonreturning-reason', help='original instruction evidence for intentional nonreturn')
         if action == 'revise':
             p.add_argument('--reason', required=True)
         p.set_defaults(func=command)
@@ -509,7 +521,8 @@ def command(a) -> int:
         return forward(a.va)
     args = [a.worker] if a.action == 'bootstrap' else [a.worker, _va(a.va)]
     options = {k: v for k, v in vars(a).items() if k in (
-        'align', 'owner', 'seconds', 'binding', 'reviewer', 'reason', 'source_sha256', 'report_sha256')}
+        'align', 'owner', 'seconds', 'binding', 'reviewer', 'reason', 'source_sha256', 'report_sha256',
+        'nonreturning_reason')}
     result = globals()[a.action](*args, **options)
     if a.action == 'bootstrap':
         result = {k: result[k] for k in ('schema', 'worker', 'coordinator')}

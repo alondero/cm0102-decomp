@@ -313,7 +313,10 @@ receipts and identities under the policy below. They are local evidence; never p
 The controller owns `RUN/transactions/`: each journal retains exact prior and
 candidate C/hints bytes, SHA-256 input identities, request/resume identity,
 acceptance evidence when available, and lifecycle phase **before** replacement.
-Worker/model pass claims are not acceptance evidence. Completed collection is
+The farm sends a typed local request to `cmre farm-accept`. Under the serial
+writer lease, acceptance rechecks canonical source and hints, the canonical
+gate, and any prior review or operand proof. Worker/model pass claims are not
+acceptance evidence. Completed collection is
 recorded only after terminal status; interrupted collection remains resumable.
 
 Restart restores only bytes whose ownership is proven. After an interrupted

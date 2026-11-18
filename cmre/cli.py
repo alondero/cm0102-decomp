@@ -454,19 +454,31 @@ def cmd_accept(a) -> int:
     from . import recover, work
 
     va = _va(a.va)
-    if a.c:
+    request = getattr(a, "request", None)
+    if a.c or request is not None:
+        from . import publication
+
+        candidate = env.C_DIR / f"fn_{va:08x}.c"
+        if candidate.is_file():
+            for finding in publication.candidate_listing_findings(env.ROOT, va, candidate.read_bytes()):
+                print(f"Publication review needed: {finding.path}: {finding.detail}", file=sys.stderr)
         with work.hold_fence(va):
             with work.locked():
                 record = work.read()['functions'].get(f'fn_{va:08x}', {})
                 if record.get('state') in work.HARD_HOLDS:
                     raise ValueError(f"Function has an acceptance hold: {record['state']}; {record.get('retry_when', '')}")
-            ok, r = recover.accept(va, "c", profile=a.profile)
+            if request is not None:
+                ok, r = recover.accept_farm(va, request)
+            else:
+                ok, r = recover.accept(va, "c", profile=a.profile)
     else:
         ok, r = recover.accept_with_inference(va)
     if r.get("va"):
         _print_report(r, False)
     else:
         print(json.dumps(r))
+    if request is not None and r.get('status') in ('acceptance-input-drift', 'operand-evidence-needed'):
+        return 3  # The typed entry point refused before writing the ledger.
     return 0 if ok else 1
 
 
@@ -818,6 +830,10 @@ def main(argv=None) -> int:
             s.add_argument("--cases", type=int)
             s.add_argument("--budget", type=int)
         s.set_defaults(func=func, cases=None, budget=None)
+    s = sub.add_parser("farm-accept", help="accept C from a bound local farm request")
+    s.add_argument("va")
+    s.add_argument("--request", type=Path, required=True)
+    s.set_defaults(func=cmd_accept, c=True)
     s = sub.add_parser("explain", help="where the original stops (no --case), or one case side by side")
     s.add_argument("va")
     s.add_argument("--case", type=int)
@@ -994,7 +1010,7 @@ def main(argv=None) -> int:
     try:
         # A command owns publication for its whole process pool. Supervised
         # children inherit the lease; unrelated direct CLI writers cannot join.
-        if a.command in {'accept', 'block', 'unblock', 'batch', 'revalidate', 'validation-compatibility', 'validation-benchmark'} or (
+        if a.command in {'accept', 'farm-accept', 'block', 'unblock', 'batch', 'revalidate', 'validation-compatibility', 'validation-benchmark'} or (
                 a.command == 'status' and a.write):
             with writer():
                 return a.func(a)

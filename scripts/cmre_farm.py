@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from typing import Protocol
 import re
 import subprocess
 import sys
@@ -28,6 +29,10 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from cmre import acceptance_request, operand_evidence
+from cmre.acceptance_request import validate_worker_hints as _validate_worker_hints
+from cmre.operand_evidence import bridge_call_sites, bridge_mutant_sources, bridge_mutant_outcome
 
 # 2026-11-13 head-to-head, 300-1500 B, opencode 2.x: MiniMax M3.1 Flash 6/11 passes (free plan),
 # MiniMax M3 3/13 (dropped), DeepSeek v4.1 Flash #low 4/12 then default effort 2/4; DeepSeek
@@ -206,7 +211,6 @@ _CANDIDATE_DISCLAIMER = re.compile(r'\bUNVALIDATED\s+CANDIDATE\b', re.I)
 _CANDIDATE_BLOCKER = re.compile(r'(?<![A-Za-z0-9_])BLOCKER\s*:')
 _CANDIDATE_MUST_NOT_ACCEPT = re.compile(r'\bmust\s+not\s+be\s+accepted\b', re.I)
 _X87_BRIDGE = 'cm_x87_CIpow'
-_X87_BUILD_LEVELS = ('-O0', '-O2')
 
 
 def candidate_disclaimer_problems(text):
@@ -229,205 +233,6 @@ def candidate_safeguard_relevant(raw):
         return True
     return bool(candidate_disclaimer_problems(raw.decode('utf-8', errors='replace')))
 
-
-def _bridge_directive_spans(text):
-    """Character spans of preprocessor directives, including backslash continuations."""
-    spans, start, offset = [], None, 0
-    for line in text.splitlines(keepends=True):
-        stripped = line.lstrip(' \t')
-        if start is not None or stripped.startswith('#'):
-            if start is None:
-                start = offset
-            if not line.rstrip('\r\n').endswith('\\'):
-                spans.append((start, offset + len(line)))
-                start = None
-        offset += len(line)
-    if start is not None:
-        spans.append((start, len(text)))
-    return spans
-
-
-def _bridge_matching_paren(masked, opening):
-    depth = 0
-    for index in range(opening, len(masked)):
-        char = masked[index]
-        if char == '(':
-            depth += 1
-        elif char == ')':
-            depth -= 1
-            if depth == 0:
-                return index
-    raise ValueError('unsupported: unterminated cm_x87_CIpow call')
-
-
-def _bridge_operand_spans(masked, start, end):
-    """Split a call's top-level comma separators, preserving exact source offsets."""
-    spans, depth, part = [], 0, start
-    for index in range(start, end):
-        char = masked[index]
-        if char in '([{':
-            depth += 1
-        elif char in ')]}':
-            depth -= 1
-            if depth < 0:
-                raise ValueError('unsupported: unbalanced brackets in cm_x87_CIpow operands')
-        elif char == ',' and depth == 0:
-            spans.append((part, index))
-            part = index + 1
-    spans.append((part, end))
-    return spans
-
-
-def bridge_call_sites(text):
-    """Exact per-call operand spans, or ValueError when parsing is not provable.
-
-    This is deliberately narrower than a C parser: only a direct call with two
-    observable operands is inspectable. Macro aliases, directive occurrences,
-    indirect references and irregular argument lists fail closed.
-    """
-    masked = _NONCODE.sub(_mask_noncode, text)
-    directives = _bridge_directive_spans(text)
-    sites = []
-    for match in re.finditer(r'\b%s\b' % re.escape(_X87_BRIDGE), masked):
-        if any(lo <= match.start() < hi for lo, hi in directives):
-            raise ValueError('unsupported: cm_x87_CIpow inside a preprocessor directive '
-                             'cannot be mutated per call')
-        opening = match.end()
-        while opening < len(masked) and masked[opening].isspace():
-            opening += 1
-        if opening >= len(masked) or masked[opening] != '(':
-            raise ValueError('unsupported: cm_x87_CIpow occurrence is not a direct function call')
-        closing = _bridge_matching_paren(masked, opening)
-        spans = _bridge_operand_spans(masked, opening + 1, closing)
-        if len(spans) != 2:
-            raise ValueError(f'unsupported: cm_x87_CIpow call has {len(spans)} operand(s), expected 2')
-        operands = []
-        for start, end in spans:
-            while start < end and masked[start].isspace():
-                start += 1
-            while end > start and masked[end - 1].isspace():
-                end -= 1
-            if start == end:
-                raise ValueError('unsupported: empty cm_x87_CIpow operand')
-            if '#' in masked[start:end]:
-                raise ValueError('unsupported: preprocessor token inside a cm_x87_CIpow operand')
-            operands.append((start, end))
-        sites.append({'index': len(sites), 'line': text.count('\n', 0, match.start()) + 1,
-                      'operands': operands})
-    return sites
-
-
-def bridge_mutant_sources(text):
-    """One mutant per call operand: base + 1.0L, then exponent + 1.0L."""
-    rows = []
-    for site in bridge_call_sites(text):
-        for operand, (start, end) in zip(('base', 'exp'), site['operands']):
-            rows.append({'index': site['index'], 'line': site['line'], 'operand': operand,
-                         'source': text[:start] + f'(({text[start:end]}) + 1.0L)' + text[end:]})
-    return rows
-
-
-def bridge_mutant_outcome(report):
-    """'killed' only for a differential witness in both ordinary builds."""
-    if not isinstance(report, dict):
-        return 'unresolved', 'gate-report-not-an-object'
-    if report.get('problems'):
-        return 'unresolved', 'gate-problems'
-    builds = report.get('builds')
-    if not isinstance(builds, dict) or set(builds) != set(_X87_BUILD_LEVELS):
-        return 'unresolved', 'optimization-builds-missing'
-    if report.get('status') == 'pass':
-        return 'survivor', 'differential-mismatch-not-observed'
-    if report.get('status') != 'fail':
-        return 'unresolved', f"gate-status-{report.get('status')}"
-    for opt in _X87_BUILD_LEVELS:
-        build = builds[opt]
-        if not isinstance(build, dict):
-            return 'unresolved', f'{opt}-build-record-missing'
-        if build.get('status') == 'build-failed':
-            return 'unresolved', f'{opt}-build-failed'
-        if build.get('status') != 'fail':
-            return 'unresolved', f"{opt}-gate-status-{build.get('status')}"
-        diff = build.get('difftest')
-        if not isinstance(diff, dict):
-            return 'unresolved', f'{opt}-difftest-missing'
-        inconclusive = diff.get('inconclusive')
-        if type(inconclusive) is not int or inconclusive < 0:
-            return 'unresolved', f'{opt}-inconclusive-counter-missing'
-        if inconclusive:
-            return 'unresolved', f'{opt}-inconclusive-{inconclusive}'
-        mismatches = diff.get('mismatches')
-        if not isinstance(mismatches, list) or not mismatches:
-            return 'unresolved', f'{opt}-mismatch-missing'
-        if not any(isinstance(m, dict) and type(m.get('case')) is int
-                   and m.get('kind') != 'budget-asymmetry' for m in mismatches):
-            return 'unresolved', f'{opt}-witness-missing'
-    return 'killed', 'differential-mismatch-both-optimizations'
-
-
-def bridge_report_identity_problems(report, source_sha256, expected_va, *,
-                                    profile=None, execution_identity=None):
-    """Require the real gate report's own identity fields, not summary claims."""
-    if not isinstance(report, dict):
-        return ['report is not an object']
-    problems = []
-    if report.get('va') != expected_va:
-        problems.append(f"va={report.get('va')!r}")
-    if report.get('tier') != 'c':
-        problems.append(f"tier={report.get('tier')!r}")
-    report_profile = report.get('profile')
-    if not isinstance(report_profile, str) or not report_profile:
-        problems.append('profile missing')
-    elif profile is not None and report_profile != profile:
-        problems.append(f'profile={report_profile!r} differs from baseline')
-    if report.get('source_sha256') != source_sha256:
-        problems.append('source_sha256 differs from the retained source')
-    identity = report.get('execution_identity')
-    if not isinstance(identity, dict) or not identity:
-        problems.append('execution_identity missing')
-    elif execution_identity is not None and identity != execution_identity:
-        problems.append('execution_identity differs from baseline')
-    key = report.get('key')
-    if not isinstance(key, str) or not re.fullmatch(r'[0-9a-f]{16}', key):
-        problems.append('gate key missing')
-    return problems
-
-
-def valid_execution_identity(identity):
-    """Recognize the live recover.execution_identity contract, not a receipt claim."""
-    def text(value):
-        return isinstance(value, str) and bool(value)
-
-    def sha(value):
-        return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value) is not None
-
-    if not isinstance(identity, dict):
-        return False
-    if not all(sha(identity.get(key)) for key in ('target', 'harness')):
-        return False
-    if not text(identity.get('python')):
-        return False
-    for key in ('inventory', 'headers'):
-        values = identity.get(key)
-        if (not isinstance(values, dict) or not values
-                or not all(text(name) and sha(value) for name, value in values.items())):
-            return False
-    dependencies = identity.get('dependencies')
-    if (not isinstance(dependencies, dict)
-            or not all(text(dependencies.get(name)) for name in ('capstone', 'unicorn', 'pefile'))):
-        return False
-    toolchain = identity.get('toolchain')
-    if not isinstance(toolchain, dict):
-        return False
-    for name in ('gcc', 'as', 'ld', 'nm'):
-        tool = toolchain.get(name)
-        if (not isinstance(tool, dict) or not text(tool.get('version'))
-                or not sha(tool.get('sha256'))):
-            return False
-    return True
-
-
-# --- worker configuration and prompts -----------------------------------------
 
 def _rel(root, path):
     try:
@@ -722,6 +527,14 @@ def _durable_json(path, data):
     tmp.replace(path)
 
 
+def _acceptance_pin(path, expected=...):
+    path = Path(path).resolve()
+    digest = acceptance_request.optional_digest(_read(path))
+    if expected is not ... and digest != expected:
+        raise ValueError(f'Acceptance evidence changed: {path}')
+    return {'path': str(path), 'sha256': digest}
+
+
 def _identity(snapshot):
     return {k: hashlib.sha256(v).hexdigest() if v is not None else None
             for k, v in snapshot.items()}
@@ -747,28 +560,6 @@ def _restore(path, data):
             stream.flush()
             os.fsync(stream.fileno())
         tmp.replace(path)
-
-
-def _validate_worker_hints(before, after):
-    """Only c_hints may differ from the dispatch snapshot; never repair worker input."""
-    if before == after:
-        return
-    if after is None:
-        raise ValueError('worker deleted the hints file')
-    old = json.loads(before) if before is not None else {}
-    new = json.loads(after)
-    if not isinstance(old, dict) or not isinstance(new, dict):
-        raise ValueError('hints must be objects')
-    shared = lambda hints: json.dumps({k: v for k, v in hints.items() if k != 'c_hints'},
-                                     sort_keys=True, allow_nan=False)
-    if shared(old) != shared(new):
-        raise ValueError('worker changed shared hints outside c_hints')
-    from cmre import difftest
-    # Validate only the authorized proposal under worker rules. Existing shared
-    # policy/bindings are frozen, not worker proposals; preserve inherited input
-    # dimensions so fixture validation uses the actual C argument/arena sizes.
-    dimensions = {k: new[k] for k in ('arg_count', 'arena_size') if k in new}
-    difftest.validate_hints({**dimensions, 'c_hints': new.get('c_hints', {})}, worker=True)
 
 
 def _gate_summary(diff):
@@ -830,13 +621,17 @@ class InlineExecutor:
         return future
 
 
+class ModelLauncher(Protocol):
+    def start(self, job: dict, prompt: str, config: dict): ...
+
+
 class Farm:
-    def __init__(self, run_dir, root, cmre, launcher, config, clock=time.monotonic, verifier=None, *, reconcile=True,
-                 request_only=False):
-        self.run_dir, self.root, self.cmre, self.launcher, self.config = Path(run_dir), Path(root), cmre, launcher, config
-        # Process-local capability, deliberately outside FarmConfig/control.json:
-        # offline requests may gate/accept, but no live setting can enable model work.
-        self.request_only = request_only
+    def __init__(self, run_dir, root, cmre, launcher: ModelLauncher | None, config,
+                 clock=time.monotonic, verifier=None, *, reconcile=True):
+        self.run_dir, self.root, self.cmre, self.config = Path(run_dir), Path(root), cmre, config
+        # Only live construction supplies the dispatch capability. Saved controls
+        # tune a live farm and cannot give an offline drain a launcher.
+        self.launcher = launcher
         self.clock = clock
         # Gate re-tests (median 48 s per job) run here so they never block dispatch.
         self.verifier = verifier or InlineExecutor()
@@ -1175,8 +970,6 @@ class Farm:
                 setattr(self.config, key, value)
         if any(key in changes for key in SUPPLY_KEYS):
             self.frontier, self.last_scan = None, None
-        if 'include_held' in changes and hasattr(self.cmre, 'include_held'):
-            self.cmre.include_held = self.config.include_held   # the adapter claims with it
         if 'ladder' in changes:
             for job in self.pending:    # rungs index the ladder: keep requeued jobs on a real rung
                 job['rung'] = min(job['rung'], len(self.config.ladder) - 1)
@@ -1238,12 +1031,13 @@ class Farm:
         return self.config.continuous and age >= 5 * self.config.rescan_seconds
 
     def _next_item(self):
+        include_held = self.config.include_held
         if self._scan_due():
             self.last_scan = self.clock()
             items = self.cmre.frontier(FRONTIER_LIMIT, self.config.min_bytes, self.config.max_bytes,
-                                       self.config.include_held, self.config.owner)
+                                       include_held, self.config.owner)
             items = [i for i in items if i.fn not in self.seen and not _skipped(i.fn, self.config.skip_ranges)]
-            held = self.cmre.held([i.fn for i in items]) if self.config.include_held else set()
+            held = self.cmre.held([i.fn for i in items]) if include_held else set()
             # Bytes are the goal: unheld first, then callee-ready, then largest.
             self.frontier = sorted(items, key=lambda i: (i.fn in held, not i.ready, -i.bytes, i.fn))
         while self.frontier:
@@ -1252,7 +1046,8 @@ class Farm:
                 continue
             self.seen.add(item.fn)
             try:
-                self.cmre.claim(item.fn, self.config.owner, max(self.config.hours or 24, 1))
+                self.cmre.claim(item.fn, self.config.owner, max(self.config.hours or 24, 1),
+                                include_held=include_held)
             except ValueError as exc:
                 self.state['skipped'][item.fn] = str(exc)[:300]
                 self._event('skipped', fn=item.fn, reason=str(exc)[:300])
@@ -1357,6 +1152,9 @@ class Farm:
             return None
 
     def _launch(self, job):
+        launcher = self.launcher
+        if launcher is None:
+            raise RuntimeError('Model dispatch requires a live launcher')
         detail = self._fix_evidence_error(job, before_dispatch=True)
         if detail:
             self._invalidate_fix(job, detail)
@@ -1425,7 +1223,7 @@ class Farm:
         if detail:
             self._invalidate_fix(job, detail)
             return False
-        handle = self.launcher.start(job, prompt, worker_config(self.root, job))
+        handle = launcher.start(job, prompt, worker_config(self.root, job))
         self.running.append((job, handle, self.clock()))
         self._event('dispatch', fn=job['fn'], kind=job['kind'], model=job['model'], n=job['n'])
         self.save()  # large first dispatch must not look dead to the event monitor
@@ -1450,7 +1248,7 @@ class Farm:
         return path
 
     def _dispatch(self):
-        if self.request_only or self.stopping():
+        if self.launcher is None or self.stopping():
             return
         translators = [j for j, _, _ in self.running if j['kind'] != 'audit']
         while len(translators) < self.config.workers:
@@ -1715,6 +1513,10 @@ class Farm:
         if text_bytes == job.get('_seed_bytes'):
             return 'worker left the starting source unchanged'
         text = text_bytes.decode('utf-8', errors='replace')
+        from cmre import publication
+        for finding in publication.candidate_listing_findings(self.root, int(fn[3:], 16), text_bytes):
+            self._event('publication-review-needed', fn=fn, sha256=hashlib.sha256(text_bytes).hexdigest(),
+                        finding=finding.kind, detail=finding.detail)
         problems = mechanical_problems(fn, text)
         if problems:
             return 'mechanical: ' + '; '.join(problems)
@@ -1758,6 +1560,9 @@ class Farm:
         report = self.cmre.test(fn, None)
         if report.get('status') != 'pass':
             return 'canonical: ' + report_detail(report)
+        path = self.run_dir / 'acceptance' / f"{job['n']:08d}-gate.json"
+        _durable_json(path, report)
+        self._transaction(job, canonical_gate=_acceptance_pin(path))
         return None
 
     def _collect(self):
@@ -1930,109 +1735,26 @@ class Farm:
         """Deterministic, hash-bound receipt location for one job's operand mutants."""
         return self.run_dir / 'x87-mutants' / f"{job['n']:08d}-{digest[:12]}" / 'summary.json'
 
-    def _x87_operand_check(self, job, text_bytes, baseline):
-        """ADR 0010 condition 3 before any canonical install or acceptance.
-
-        Each cm_x87_CIpow call is copied twice, once with +1.0L on the base and
-        once on the exponent. Every mutant must show a differential mismatch at
-        both ordinary builds. Reports and sources are bound by SHA-256; exact
-        decoded raw bytes drive generation so CRLF is preserved. Survivors,
-        build failures, inconclusive runs, unbound reports and source/hint drift
-        are BLOCKERs, and all received evidence stays under RUN/x87-mutants/."""
+    def _x87_operand_check(self, job, raw, baseline):
         fn = job['fn']
-        if _X87_BRIDGE.encode() not in text_bytes:
-            return None
-        encoded = text_bytes
-        digest = hashlib.sha256(encoded).hexdigest()
-        summary_path = self._x87_evidence_path(job, digest)
-        directory = summary_path.parent
-        directory.mkdir(parents=True, exist_ok=True)
-        hints_sha = _identity({'hint': self._inputs(fn)['hint']})['hint']
-        summary = {'schema': 'cmre-farm-x87-operands/1', 'fn': fn, 'job': job['n'],
-                   'candidate_sha256': digest, 'hints_sha256': hints_sha,
-                   'baseline': None, 'mutants': [], 'status': 'running'}
+        hints = self._inputs(fn)['hint']
+        hints_sha = _identity({'hint': hints})['hint']
+        path = self._x87_evidence_path(job, hashlib.sha256(raw).hexdigest())
 
-        def retained(detail):
-            summary.update(status='blocked', detail=detail)
-            _durable_json(summary_path, summary)
-            self._event('x87-mutant-evidence', fn=fn, n=job['n'], path=str(summary_path),
-                        status=summary['status'])
-            return detail
-
-        try:
-            text = encoded.decode('utf-8')
-        except UnicodeDecodeError as exc:
-            return retained(f'BLOCKER: x87 operand safeguard: source is not UTF-8: {exc}; '
-                            f'evidence {summary_path}')
-        try:
-            mutants = bridge_mutant_sources(text)
-        except ValueError as exc:
-            return retained(f'BLOCKER: x87 operand safeguard: {exc}; evidence {summary_path}')
-        if not mutants:
+        def check_inputs():
+            if _read(job['source']) != raw:
+                return 'candidate source changed during execution (source drift)'
+            if self._inputs(fn)['hint'] != hints:
+                return 'canonical hints changed during execution (hints drift)'
             return None
-        expected_va = '0x' + fn[3:]
-        baseline_problems = bridge_report_identity_problems(baseline, digest, expected_va)
-        if not isinstance(baseline, dict):
-            baseline_problems.append('baseline report is not an object')
-        else:
-            if baseline.get('status') != 'pass':
-                baseline_problems.append(f"baseline status={baseline.get('status')!r}")
-            if baseline.get('problems'):
-                baseline_problems.append('baseline gate problems')
-        if baseline_problems:
-            return retained('BLOCKER: x87 operand safeguard: baseline report is not bound: '
-                            + '; '.join(baseline_problems) + f'; evidence {summary_path}')
-        profile, execution = baseline.get('profile'), baseline.get('execution_identity')
-        baseline_source = directory / 'baseline.c'
-        baseline_report = directory / 'baseline.json'
-        _restore(baseline_source, encoded)
-        _durable_json(baseline_report, baseline)
-        summary['baseline'] = {
-            'source': baseline_source.name, 'source_sha256': digest,
-            'report': baseline_report.name,
-            'report_sha256': hashlib.sha256(baseline_report.read_bytes()).hexdigest(),
-            'gate_key': baseline.get('key')}
-        expected_source = encoded
-        for row in mutants:
-            stem = f"call-{row['index']:03d}-{row['operand']}"
-            mutant_path = directory / f'{stem}.c'
-            report_path = directory / f'{stem}.json'
-            _restore(mutant_path, row['source'].encode('utf-8'))
-            gate_report = {'status': 'error', 'problems': ['gate did not return a report']}
-            try:
-                gate_report = self.cmre.test(fn, str(mutant_path))
-            except (Exception, SystemExit) as exc:
-                gate_report = {'status': 'error', 'problems': [f'{type(exc).__name__}: {exc}']}
-            outcome, reason = bridge_mutant_outcome(gate_report)
-            source_sha = hashlib.sha256(mutant_path.read_bytes()).hexdigest()
-            identity_problems = bridge_report_identity_problems(
-                gate_report, source_sha, expected_va, profile=profile, execution_identity=execution)
-            if identity_problems:
-                outcome, reason = 'unresolved', 'report-identity: ' + '; '.join(identity_problems)
-            _durable_json(report_path, gate_report)
-            row.update(source=mutant_path.name, source_sha256=source_sha,
-                       report=report_path.name,
-                       report_sha256=hashlib.sha256(report_path.read_bytes()).hexdigest(),
-                       gate_key=gate_report.get('key') if isinstance(gate_report, dict) else None,
-                       outcome=outcome, reason=reason)
-            summary['mutants'].append(row)
-            _durable_json(summary_path, summary)
-            if _read(job['source']) != expected_source:
-                return retained('BLOCKER: x87 operand mutant evidence invalid: candidate source '
-                                f'changed during execution (source drift); evidence {summary_path}')
-            if _identity({'hint': self._inputs(fn)['hint']})['hint'] != hints_sha:
-                return retained('BLOCKER: x87 operand mutant evidence invalid: canonical hints '
-                                f'changed during execution (hints drift); evidence {summary_path}')
-        blocked = [row for row in summary['mutants'] if row['outcome'] != 'killed']
-        if blocked:
-            row = blocked[0]
-            return retained(
-                f"BLOCKER: x87 operand mutant {row['operand']} for call {row['index'] + 1} "
-                f"(line {row['line']}) {row['outcome']}: {row['reason']}; evidence {summary_path}")
-        summary['status'] = 'killed'
-        _durable_json(summary_path, summary)
-        self._event('x87-mutant-evidence', fn=fn, n=job['n'], path=str(summary_path), status='killed')
-        return None
+
+        return operand_evidence.generate(
+            path, fn, job['n'], raw, baseline, hints_sha,
+            gate=lambda source: self.cmre.test(fn, str(source)),
+            check_inputs=check_inputs,
+            report_event=lambda status: self._event(
+                'x87-mutant-evidence', fn=fn, n=job['n'], path=str(path), status=status),
+        )
 
     def _pre_accept_blocker(self, job, data):
         """Regenerate the expected bridge evidence and verify every retained byte."""
@@ -2056,102 +1778,76 @@ class Farm:
         digest = hashlib.sha256(raw).hexdigest()
         path = self._x87_evidence_path(job, digest)
         try:
-            return self._retained_bridge_blocker(path, raw, text, digest, data, job)
+            return operand_evidence.verify_receipt(
+                path, raw, fn=fn, job_number=job['n'], hints_sha=data['identity'].get('hint'),
+                current_execution=self.cmre.current_execution_identity,
+            )
         except Exception as exc:   # malformed evidence must never crash acceptance
             return f'BLOCKER: x87 operand evidence is malformed or unreadable: {path}: {exc}'
 
-    def _retained_bridge_blocker(self, path, raw, text, digest, data, job):
-        fn = job['fn']
-        expected_va = '0x' + fn[3:]
-        try:
-            summary = json.loads(path.read_bytes())
-        except (OSError, ValueError) as exc:
-            return f'BLOCKER: x87 operand evidence missing or unreadable for acceptance: {path}: {exc}'
-        if (not isinstance(summary, dict)
-                or summary.get('schema') != 'cmre-farm-x87-operands/1'
-                or summary.get('fn') != fn or summary.get('job') != job['n']
-                or summary.get('candidate_sha256') != digest
-                or summary.get('hints_sha256') != data['identity'].get('hint')
-                or summary.get('status') != 'killed'):
-            return f'BLOCKER: x87 operand evidence is not a killed intact receipt: {path}'
-        baseline = summary.get('baseline')
-        if (not isinstance(baseline, dict)
-                or baseline.get('source') != 'baseline.c'
-                or baseline.get('report') != 'baseline.json'):
-            return f'BLOCKER: x87 operand evidence has a malformed baseline record: {path}'
-        baseline_source, baseline_report = path.parent / 'baseline.c', path.parent / 'baseline.json'
-        if not baseline_source.is_file() or not baseline_report.is_file():
-            return f'BLOCKER: x87 operand baseline evidence is missing: {path}'
-        baseline_bytes = baseline_source.read_bytes()
-        baseline_sha = hashlib.sha256(baseline_bytes).hexdigest()
-        if (baseline_bytes != raw or baseline_sha != digest
-                or baseline.get('source_sha256') != digest):
-            return f'BLOCKER: x87 operand baseline source does not match the candidate: {path}'
-        report_bytes = baseline_report.read_bytes()
-        if hashlib.sha256(report_bytes).hexdigest() != baseline.get('report_sha256'):
-            return f'BLOCKER: x87 operand baseline report bytes changed: {path}'
-        baseline_evidence = json.loads(report_bytes)
-        if baseline_evidence.get('status') != 'pass' or baseline_evidence.get('problems'):
-            return f'BLOCKER: x87 operand baseline report is not a passing gate: {path}'
-        identity_problems = bridge_report_identity_problems(baseline_evidence, digest, expected_va)
-        if identity_problems:
-            return ('BLOCKER: x87 operand baseline report is not bound: '
-                    + '; '.join(identity_problems) + f': {path}')
-        profile, execution = baseline_evidence.get('profile'), baseline_evidence.get('execution_identity')
-        try:
-            current_execution = self.cmre.current_execution_identity()
-        except (Exception, SystemExit) as exc:
-            return (f'BLOCKER: x87 operand current execution identity unavailable: '
-                    f'{type(exc).__name__}; evidence {path}')
-        if not valid_execution_identity(current_execution):
-            return f'BLOCKER: x87 operand current execution identity is malformed: {path}'
-        if execution != current_execution:
-            return f'BLOCKER: x87 operand evidence differs from current execution identity: {path}'
-        expected = bridge_mutant_sources(text)
-        rows = summary.get('mutants')
-        if not isinstance(rows, list) or len(rows) != len(expected):
-            return f'BLOCKER: x87 operand evidence has missing or extra mutant rows: {path}'
-        by_key = {}
-        for row in rows:
-            if not isinstance(row, dict):
-                return f'BLOCKER: x87 operand evidence has a malformed mutant row: {path}'
-            key = (row.get('index'), row.get('operand'))
-            if key in by_key:
-                return f'BLOCKER: x87 operand evidence has duplicate mutant rows: {path}'
-            by_key[key] = row
-        if set(by_key) != {(row['index'], row['operand']) for row in expected}:
-            return f'BLOCKER: x87 operand evidence does not cover every call operand: {path}'
-        for expected_row in expected:
-            row = by_key[(expected_row['index'], expected_row['operand'])]
-            stem = f"call-{expected_row['index']:03d}-{expected_row['operand']}"
-            if row.get('line') != expected_row['line']:
-                return f'BLOCKER: x87 operand evidence line changed for {stem}: {path}'
-            if row.get('source') != f'{stem}.c' or row.get('report') != f'{stem}.json':
-                return f'BLOCKER: x87 operand evidence names changed for {stem}: {path}'
-            source_path, report_path = path.parent / row['source'], path.parent / row['report']
-            if not source_path.is_file() or not report_path.is_file():
-                return f'BLOCKER: x87 operand evidence files are missing for {stem}: {path}'
-            source_bytes = source_path.read_bytes()
-            expected_bytes = expected_row['source'].encode('utf-8')
-            if source_bytes != expected_bytes:
-                return f'BLOCKER: x87 operand evidence source does not regenerate for {stem}: {path}'
-            source_sha = hashlib.sha256(source_bytes).hexdigest()
-            if row.get('source_sha256') != source_sha:
-                return f'BLOCKER: x87 operand evidence source hash changed for {stem}: {path}'
-            report_bytes = report_path.read_bytes()
-            if hashlib.sha256(report_bytes).hexdigest() != row.get('report_sha256'):
-                return f'BLOCKER: x87 operand evidence report bytes changed for {stem}: {path}'
-            report = json.loads(report_bytes)
-            outcome, reason = bridge_mutant_outcome(report)
-            if outcome != 'killed' or row.get('outcome') != 'killed':
-                return (f'BLOCKER: x87 operand evidence is not a kill for {stem}: '
-                        f'{outcome}: {reason}; {path}')
-            identity_problems = bridge_report_identity_problems(
-                report, source_sha, expected_va, profile=profile, execution_identity=execution)
-            if identity_problems:
-                return ('BLOCKER: x87 operand report is not bound for '
-                        f'{stem}: ' + '; '.join(identity_problems) + f': {path}')
-        return None
+    def _write_acceptance_request(self, job, data):
+        fn, number = job['fn'], job['n']
+        proof_path = self._x87_evidence_path(job, data['identity']['c'])
+        gate = data.get('canonical_gate')
+        if gate is None:
+            # A controller upgrade can resume an installed legacy transaction.
+            # Recheck its exact canonical bytes before creating new gate evidence.
+            report = self.cmre.test(fn)
+            if report.get('status') != 'pass':
+                raise ValueError('Retained transaction no longer passes the canonical gate')
+            path = self.run_dir / 'acceptance' / f'{number:08d}-gate.json'
+            _durable_json(path, report)
+            gate = _acceptance_pin(path)
+            self._transaction(job, canonical_gate=gate)
+        reviews = []
+        if job['kind'] == 'fix':
+            reviews = self._acceptance_review_artifacts(job)
+        elif job['kind'] == 'adopt':
+            review = Path(job['review_receipt'])
+            expected = job['expected_identity']
+            reviews = [
+                _acceptance_pin(review, job['review_receipt_sha256']),
+                _acceptance_pin(review.with_name('source.c'), expected['c']),
+                _acceptance_pin(review.with_name('hints.json'), expected['hint']),
+            ]
+        if _identity(self._inputs(fn)) != data['identity']:
+            raise ValueError('Canonical inputs changed while preparing farm acceptance')
+        request = {'schema': acceptance_request.SCHEMA, 'fn': fn, 'job': number, 'kind': job['kind'],
+                   'source_sha256': data['identity']['c'], 'hint_sha256': data['identity']['hint'],
+                   'prior_hint': data['prior']['hint'], 'canonical_gate': gate,
+                   'operand_proof': _acceptance_pin(proof_path) if proof_path.is_file() else None,
+                   'reviews': list({row['path']: row for row in reviews}.values())}
+        path = self.run_dir / 'acceptance' / f'{number:08d}-{acceptance_request.digest_json(request)[:16]}.json'
+        if not path.exists():
+            _durable_json(path, request)
+        elif json.loads(path.read_bytes()) != request:
+            raise ValueError('Retained farm acceptance request changed')
+        return path
+
+    def _acceptance_review_artifacts(self, job):
+        identity, origin = job['_finding_identity'], job['_origin_review']
+        paths, metadata, first = _bound_audit_reviews(self.run_dir, self.root, job['fn'], identity, origin)
+        dispatch = job['_fix_dispatch']
+        dispatched, _ = _review_input_artifacts(self.run_dir, self.root, job['fn'], identity, dispatch)
+
+        def bind(files, authority):
+            directory = Path(files['source_snapshot']).parent
+            pins = [
+                _acceptance_pin(directory / 'identity.json', authority['snapshot_metadata_sha256']),
+                _acceptance_pin(files['source_snapshot'], identity['c']),
+                _acceptance_pin(files['hints_snapshot'], identity['hint']),
+            ]
+            if files.get('audit_path'):
+                pins.append(_acceptance_pin(files['audit_path'], authority['verdict_sha256']))
+            if files.get('bundle'):
+                pins.append(_acceptance_pin(files['bundle'], authority['bundle_sha256']))
+            return pins
+
+        pins = bind(paths, origin) + bind(dispatched, dispatch)
+        if first:
+            pins.extend(bind(first, metadata['audit_state']['review']))
+        return pins
+
     def _accept(self):
         waiting = []
         for job in self.accept_queue:
@@ -2189,11 +1885,19 @@ class Farm:
                 job['_safeguard_blocker'] = True
                 self._fail(job, blocker)
                 continue
+            try:
+                request = self._write_acceptance_request(job, data)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                self._fail(job, f'Farm acceptance evidence unavailable: {exc}')
+                continue
             self._transaction(job, 'accepting')
-            code, output = self.cmre.accept(fn)
+            code, output = self.cmre.accept(fn, request=request)
             if code == 2:
                 self._transaction(job, 'waiting-lease', acceptance_result={'code': code, 'output': output})
                 waiting.append(job)   # another writer holds the lease; try next tick
+                continue
+            if code == 3:
+                self._fail(job, f'Farm acceptance refused before ledger write: {output[-600:]}')
                 continue
             if code != 0:
                 # An error return alone does not prove the ledger wasn't written.
@@ -2298,7 +2002,8 @@ class Farm:
             elif request.get('kind') == 'adopt':
                 job = self._new_job('adopt', fn, 'hand', bytes=self.state['accepted'].get(fn, {}).get('bytes', 0),
                                     note=request.get('note', ''), review_receipt=request['review_receipt'],
-                                    expected_identity=request['expected_identity'], reviewed_findings=reviewed_findings,
+                                    review_receipt_sha256=digest, expected_identity=request['expected_identity'],
+                                    reviewed_findings=reviewed_findings,
                                     expected_source_sha256=request['source_sha256'])
                 job['source'] = request['source']
                 job['_request'] = str(path)
@@ -2693,7 +2398,7 @@ def apply_requests_now(run_dir):
         state = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))
         config = FarmConfig(workers=0, ladder=['-'], audit_workers=0, audit_model=None, attempt_minutes=1,
                             hours=None, min_bytes=0, max_bytes=None, include_held=False, owner=state.get('owner', ''))
-        farm = Farm(run_dir, ROOT, CmreAdapter(), None, config, request_only=True)
+        farm = Farm(run_dir, ROOT, CmreAdapter(), None, config)
         farm.tick()
         while farm.verifying or farm.accept_queue or farm._has_unquarantined_requests():
             time.sleep(5)
@@ -2709,7 +2414,7 @@ def reclassify(run_dir, root=ROOT, cmre=None, threads=8):
     accepts it through the normal transaction. Nothing is unparked, installed or accepted here."""
     from concurrent.futures import ThreadPoolExecutor
     run_dir, root = Path(run_dir), Path(root)
-    cmre = cmre or CmreAdapter(root, include_held=True)
+    cmre = cmre or CmreAdapter(root)
     with RunLock(run_dir):
         state = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))
         known = state.setdefault('input_needed', {})
@@ -2799,9 +2504,8 @@ def status_line(s):
 class CmreAdapter:
     """Selection and claims through the Python API; gate and acceptance through the CLI."""
 
-    def __init__(self, root=ROOT, *, include_held=False):
+    def __init__(self, root=ROOT):
         self.root = Path(root)
-        self.include_held = include_held
 
     def _cli(self, *args, timeout=1800):
         result = subprocess.run(['py', '-3.13', '-m', 'cmre', *args], cwd=self.root, capture_output=True,
@@ -2814,10 +2518,10 @@ class CmreAdapter:
                                  include_held=include_held, owner=owner)
         return [Item(f'fn_{i.va:08x}', i.body_bytes, i.ready, i.pending_callees, i.module) for i in items]
 
-    def claim(self, fn, owner, hours):
+    def claim(self, fn, owner, hours, *, include_held):
         from cmre import coordination, work
         try:
-            work.claim([int(fn[3:], 16)], owner, hours, include_held=self.include_held)
+            work.claim([int(fn[3:], 16)], owner, hours, include_held=include_held)
         except coordination.BusyError as exc:   # another farm is claiming or testing it right now
             raise ValueError(str(exc)) from exc
 
@@ -2860,8 +2564,8 @@ class CmreAdapter:
         except ValueError:
             return {'status': 'error', 'problems': [(err or out)[-800:]]}
 
-    def accept(self, fn):
-        code, out, err = self._cli('accept', fn, '--c')
+    def accept(self, fn, *, request: Path):
+        code, out, err = self._cli('farm-accept', fn, '--request', str(request))
         if code != 0 and 'Writer active' in (err + out):
             code = 2
         elif code == 2:
@@ -3382,7 +3086,7 @@ def main(argv=None):
     with RunLock(run_dir), ThreadPoolExecutor(max_workers=max(1, a.verify_threads)) as verifier:
         (run_dir / 'STOP').unlink(missing_ok=True)
         (run_dir / 'farm.pid').write_text(f'{os.getpid()}\n', encoding='utf-8')
-        f = Farm(run_dir, ROOT, CmreAdapter(include_held=a.include_held),
+        f = Farm(run_dir, ROOT, CmreAdapter(),
                  make_launcher(a.opencode, ROOT, run_dir), config, verifier=verifier)
         f.run(poll=a.poll)
     print(status_line(f.summary()))

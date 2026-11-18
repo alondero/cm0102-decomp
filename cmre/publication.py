@@ -327,13 +327,33 @@ def content_findings(path: str, data: bytes, index: OriginalIndex, source_review
             found.append(Finding(path, "original-text",
                                  f"{len(quotes)} quotes, {total} characters of game text; longest {end - start} "
                                  f"at line {line} {sample!r} matches {source}"))
-    listing = LISTING.findall(data)
-    if len(listing) >= LISTING_LINES and (path, env.digest_bytes(data)) not in (source_reviews or {}):
-        first = _line(data, LISTING.search(data).start())
-        found.append(Finding(path, "instruction-listing", f"{len(listing)} address-keyed instruction lines from line {first}"))
+    found.extend(instruction_listing_findings(path, data, source_reviews))
     for match in CREDENTIAL.finditer(data):
         found.append(Finding(path, "credential", f"line {_line(data, match.start())}: {match[0][:12].decode(errors='replace')}..."))
     return sorted(set(found))
+
+
+def instruction_listing_findings(path: str, data: bytes, source_reviews=None) -> list[Finding]:
+    """Advisory provenance findings for authored candidate bytes."""
+    listing = list(LISTING.finditer(data))
+    if len(listing) < LISTING_LINES or (path, env.digest_bytes(data)) in (source_reviews or {}):
+        return []
+    first = _line(data, listing[0].start())
+    return [Finding(path, "instruction-listing", f"{len(listing)} address-keyed instruction lines from line {first}")]
+
+
+def candidate_listing_findings(root: Path, va: int, data: bytes) -> list[Finding]:
+    """Use the same hash-specific dispositions as publication, without supplied assets."""
+    reviews = root / "CM0102/Analysis/cmre/publication/source-reviews.json"
+    path = f"recovery/c/fn_{va:08x}.c"
+    findings = instruction_listing_findings(path, data)
+    if not findings or not reviews.is_file():
+        return findings
+    try:
+        dispositions = load_source_reviews(reviews)
+    except (OSError, ValueError, SystemExit):
+        return findings  # Unreadable review evidence never suppresses an advisory finding.
+    return [] if (path, env.digest_bytes(data)) in dispositions else findings
 
 
 C_SOURCE = re.compile(r"recovery/c/fn_([0-9a-f]{8})\.c")
@@ -417,9 +437,13 @@ def scan_commit(repo: Path, ref: str, index: OriginalIndex,
             found += content_findings(path, data, index, source_reviews)
     # Provenance is a property of the tree being published, not of superseded blobs.
     tree = [line.split("\t", 1) for line in _git(repo, "ls-tree", "-r", commit, "--", "recovery/c").decode().splitlines()]
-    current = {meta.split()[2]: path for meta, path in tree if C_SOURCE.fullmatch(path)}
+    current = {}
+    for meta, path in tree:
+        if C_SOURCE.fullmatch(path):
+            current.setdefault(meta.split()[2], []).append(path)
     for sha, data in _blobs(repo, sorted(current)):
-        found += accepted_mismatch(current[sha], data)
+        for path in current[sha]:
+            found += accepted_mismatch(path, data)
     return commit, sorted(set(found))
 
 
@@ -427,7 +451,11 @@ def scan_staged(repo: Path, index: OriginalIndex, source_reviews=None) -> list[F
     names = [n for n in _git(repo, "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR").decode().split("\0") if n]
     found = []
     for spec, data in _blobs(repo, [":" + name for name in names]):
-        found += scan_blob(spec[1:], data, index, source_reviews) + accepted_mismatch(spec[1:], data)
+        found += scan_blob(spec[1:], data, index, source_reviews)
+    sources = _git(repo, "ls-files", "--cached", "-z", "--", "recovery/c").decode().split("\0")
+    staged = sorted({path for path in sources if C_SOURCE.fullmatch(path)})
+    for spec, data in _blobs(repo, [":" + path for path in staged]):
+        found += accepted_mismatch(spec[1:], data)
     return sorted(set(found))
 
 

@@ -345,11 +345,11 @@ def test_unknown_acceptance_during_offline_drain_does_not_abort_other_function(r
         outputs[fn] = source.read_bytes()
         requests[fn] = reviewed_request(f, fn, 'adopt', source=str(source))
     real_accept = cmre.accept
-    def uncertain_accept(fn):
+    def uncertain_accept(fn, *, request):
         if fn == first:
             cmre.accepted.append(fn)
             return 1, 'unknown error after ledger write'
-        return real_accept(fn)
+        return real_accept(fn, request=request)
     cmre.accept = uncertain_accept
     cmre.acceptance_identity = lambda fn: None
     monkeypatch.setattr(farm, 'ROOT', root)
@@ -367,7 +367,7 @@ def test_newly_unknown_target_action_returns_bounded_quarantine_json(root, monke
     f, cmre, job, canonical = prepared_candidate(root)
     proof = review_receipt(f)
     f._event('farm-exit', status='done')
-    def uncertain_accept(fn):
+    def uncertain_accept(fn, *, request):
         cmre.accepted.append(fn)
         return 1, 'unknown after ledger commit'
     cmre.accept = uncertain_accept
@@ -439,7 +439,8 @@ def test_claim_cli_returns_bounded_expected_status_json(root, case, expected):
     script.write_bytes(MODULE.read_bytes())
     result = farm.subprocess.run(
         [sys.executable, str(script), 'review', str(run), job['fn'], '--claim', 'reviewed-once'],
-        capture_output=True, text=True)
+        capture_output=True, text=True,
+        env=dict(os.environ, PYTHONPATH=str(MODULE.parents[1])))
     assert result.returncode == 2
     assert 'Traceback' not in result.stderr
     view = json.loads(result.stdout)
@@ -751,10 +752,12 @@ def test_documented_lookup_cli_subprocess_reads_and_claims_fake_run(root):
     copied_cli = scripts / 'cmre_farm.py'
     copied_cli.write_bytes(MODULE.read_bytes())  # fake ROOT; never inspect live recovery
     command = [sys.executable, str(copied_cli), 'review', str(f.run_dir), fn]
-    plain = farm.subprocess.run(command, check=True, capture_output=True, text=True)
+    plain = farm.subprocess.run(command, check=True, capture_output=True, text=True,
+                                env=dict(os.environ, PYTHONPATH=str(MODULE.parents[1])))
     assert json.loads(plain.stdout)['status'] == 'bound'
     claimed = farm.subprocess.run(command + ['--claim', 'documented-cli-smoke'],
-                                  check=True, capture_output=True, text=True)
+                                  check=True, capture_output=True, text=True,
+                                env=dict(os.environ, PYTHONPATH=str(MODULE.parents[1])))
     view = json.loads(claimed.stdout)
     assert view['status'] == 'bound'
     assert Path(view['source']).read_text() == GOOD
@@ -848,7 +851,7 @@ def test_spec_unknown_post_ledger_acceptance_preserves_inputs_and_quarantines(ro
     hint = root / 'recovery/hints/fn_00401000.json'
     hint.write_bytes(b'{"arg_count":1}')
     job['_snap']['hint'] = hint.read_bytes()
-    def committed_then_died(fn):
+    def committed_then_died(fn, *, request):
         cmre.accepted.append(fn)  # the ledger was committed
         raise KeyboardInterrupt('death after ledger commit')
     cmre.accept = committed_then_died
@@ -884,7 +887,7 @@ def test_spec_unowned_hint_created_before_verify_is_never_deleted(root):
 def test_spec_accept_error_without_nonacceptance_proof_never_rolls_back(root):
     f, cmre, job, canonical = prepared_candidate(root)
     cmre.acceptance_identity = farm.CmreAdapter(root).acceptance_identity
-    def committed_then_error(fn):
+    def committed_then_error(fn, *, request):
         cmre.accepted.append(fn)
         return 1, 'error after ledger write'
     cmre.accept = committed_then_error
@@ -901,7 +904,7 @@ def test_spec_accept_error_without_nonacceptance_proof_never_rolls_back(root):
 def test_spec_real_adapter_reserves_busy_code_for_explicit_contention(root, output, expected):
     adapter = farm.CmreAdapter(root)
     adapter._cli = lambda *args: (2, output, '')
-    assert adapter.accept('fn_00401000')[0] == expected
+    assert adapter.accept('fn_00401000', request=root / 'bound-request.json')[0] == expected
 
 
 @pytest.mark.parametrize('failure', ['infra', 'limited'])
@@ -1055,7 +1058,7 @@ def prepared_candidate(root):
     f, cmre, _ = make(root, [], writes(GOOD), workers=0)
     canonical = root / 'recovery/c/fn_00401000.c'
     canonical.write_bytes(b'prior canonical')
-    job = f._new_job('adopt', 'fn_00401000', 'hand', bytes=200)
+    job = f._new_job('translate', 'fn_00401000', 'm/cheap', bytes=200)
     source = root / 'candidate.c'
     source.write_text(GOOD)
     job.update(source=str(source), _snap={'c': canonical.read_bytes(), 'hint': None})
@@ -1123,7 +1126,7 @@ def test_interrupted_candidate_restores_only_owned_bytes(root, phase, newer):
     f, cmre, job, canonical = prepared_candidate(root)
     f._verify(job, False)
     if phase == 'accepting':
-        def die(fn):
+        def die(fn, *, request):
             raise KeyboardInterrupt('death during acceptance')
         cmre.accept = die
         f._collect()
@@ -1139,7 +1142,7 @@ def test_interrupted_candidate_restores_only_owned_bytes(root, phase, newer):
 def test_death_after_accept_reconciles_explicit_ledger_identity(root):
     f, cmre, job, canonical = prepared_candidate(root)
     identity = {'c': hashlib.sha256(Path(job['source']).read_bytes()).hexdigest(), 'hint': None}
-    def accepted_then_died(fn):
+    def accepted_then_died(fn, *, request):
         cmre.acceptance_identity = lambda fn: identity
         raise KeyboardInterrupt('after ledger write, before return')
     cmre.accept = accepted_then_died
@@ -1276,7 +1279,7 @@ def test_request_only_blocks_model_lanes_but_later_live_run_dispatches(root, lan
                                    'ladder': ['m/live'], 'audit_model': 'm/audit',
                                    'confirm_model': 'm/confirm', 'request_only': False}))
     before = control.read_bytes()
-    offline = farm.Farm(f.run_dir, root, cmre, launcher, f.config, request_only=True)
+    offline = farm.Farm(f.run_dir, root, cmre, None, f.config)
     offline.pending.extend(f.pending)  # retained in-process fix work is not dispatched either
     pending = list(offline.pending)
     for _ in range(2):
@@ -1378,7 +1381,7 @@ def test_candidate_journal_crash_boundaries_keep_prior_bytes_and_identity(root, 
 def test_accepting_without_matching_ledger_proof_requires_reverification(root, evidence):
     f, cmre, job, canonical = prepared_candidate(root)
     cmre.acceptance_identity = lambda fn: evidence
-    def die(fn):
+    def die(fn, *, request):
         raise KeyboardInterrupt()
     cmre.accept = die
     f._verify(job, False)
@@ -1411,7 +1414,7 @@ def test_resume_collect_pending_is_resumable_with_existing_prefix_and_receipt(ro
     f.tick()
     assert f.verifying
     assert fn not in f.state.get('resume_collected', {})
-    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    resumed = farm.Farm(f.run_dir, root, cmre, f.launcher, f.config)
     assert canonical.read_bytes() == b'prior unfinished source prefix'
     assert resumed._resume_seed(fn, collect=True) == retained.read_bytes()
     resumed._dispatch()
@@ -1528,7 +1531,7 @@ def test_real_adapter_forwards_explicit_held_claim_option(monkeypatch, tmp_path,
     from cmre import work
     calls = []
     monkeypatch.setattr(work, "claim", lambda *args, **kwargs: calls.append((args, kwargs)))
-    farm.CmreAdapter(tmp_path, include_held=include_held).claim("fn_00401000", "farm-t", 2)
+    farm.CmreAdapter(tmp_path).claim("fn_00401000", "farm-t", 2, include_held=include_held)
     assert calls == [(([0x401000], "farm-t", 2), {"include_held": include_held})]
 
 
@@ -1548,7 +1551,7 @@ class FakeCmre:
             out = [i for i in out if i.fn not in self.holds]
         return out[:limit]
 
-    def claim(self, fn, owner, hours):
+    def claim(self, fn, owner, hours, *, include_held):
         if fn == 'fn_badbad00':
             raise ValueError('exhausted its five-attempt budget')
         self.claimed.append(fn)
@@ -1564,7 +1567,7 @@ class FakeCmre:
         return {'status': 'pass' if ok else 'fail', 'problems': [] if ok else ['mismatch'],
                 'builds': {'-O0': {'status': 'pass' if ok else 'mismatch', 'detail': 'case 7 eax'}}}
 
-    def accept(self, fn):
+    def accept(self, fn, *, request):
         code = self.accept_codes.pop(0) if self.accept_codes else 0
         if code == 0:
             self.accepted.append(fn)
@@ -2369,6 +2372,25 @@ def test_unaudited_accepts_are_requeued_after_restart(root):
     assert audits == ['fn_00401000']
 
 
+def test_live_control_uses_the_same_held_policy_for_selection_and_claim(root):
+    fn = 'fn_00401000'
+    f, cmre, launcher = make(root, [item(fn)], writes(GOOD), workers=1, include_held=False,
+                             holds={fn: {'state': 'evidence-needed', 'reason': 'pending'}})
+    claims = []
+    claim = cmre.claim
+    def record_claim(fn, owner, hours, *, include_held):
+        claims.append(include_held)
+        return claim(fn, owner, hours, include_held=include_held)
+    cmre.claim = record_claim
+
+    f.tick()
+    assert not claims and not launcher.started
+    (f.run_dir / 'control.json').write_text('{"include_held": true}', encoding='utf-8')
+    f.tick()
+    assert claims == [True]
+    assert [job['fn'] for job, _, _ in launcher.started] == [fn]
+
+
 def test_include_held_dispatches_unheld_items_first(root):
     # An unattended run drains the ready queue before spending attempts on held functions.
     items = [farm.Item('fn_00000001', 900, True, 0, ''), farm.Item('fn_00000002', 100, True, 0, '')]
@@ -2474,7 +2496,7 @@ def test_claim_race_with_another_farm_is_a_refusal_not_a_crash(monkeypatch):
 
     monkeypatch.setattr(work, 'claim', busy)
     with pytest.raises(ValueError, match='Writer active'):
-        farm.CmreAdapter().claim('fn_0056c570', 'farm-t', 1)
+        farm.CmreAdapter().claim('fn_0056c570', 'farm-t', 1, include_held=False)
 
 
 def test_release_survives_a_busy_work_lock(monkeypatch):

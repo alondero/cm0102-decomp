@@ -86,13 +86,13 @@ acceptance. Receipts record return counts, first returning case, instruction
 coverage, own/callee fault sites and execution seconds. Matching target, inventory,
 harness, headers, input policy, hints and observer identities allow receipt reuse.
 
-Exit 1 (`evidence-needed`) means no return was observed. Prefer another function;
-keep a named returning-input obligation for the held candidate. Exit 0
-(`return-observed`) is a scheduling signal: review the uncovered instructions,
-ABI, stack aliases and callee continuation obligations before accepting. A single
-return cannot establish path completeness. Keep all fault cases and the unchanged
-O0/O2 differential gate. Functions that intentionally never return require a
-specific instruction-evidence review rather than invented returning fixtures.
+Worktree review binds the current original-only screen receipt. For a returning
+routine, the screen and both C builds must observe a top-level return. A STOP
+with an active or pending owned call is an escape. Keep all fault cases and
+review uncovered instructions, ABI, stack aliases and callee continuation.
+For an intentionally nonreturning routine, the reviewer supplies
+`--nonreturning-reason` with the original instruction evidence. Promotion
+rechecks the bound screen, builds and review before writing canonical files.
 
 Before claiming a likely register/stack adapter, check the ABI and availability of
 the required raw stack-alias and late-fault evidence in [C-BOUNDARIES.md](C-BOUNDARIES.md).

@@ -40,3 +40,16 @@ def test_existing_fixture_client_runs_through_extracted_physical_backend(monkeyp
     assert result["protocol"]["replayable"] is False
     assert len(result["steps"]) == 2
     assert all(step["trap_flag_after"] == 0 for step in result["steps"])
+
+
+def test_step_ownership_distinguishes_reused_threads():
+    from cmre.debug_observe import _owns_step
+    from cmre.import_observe import ThreadInstance
+
+    owner = ThreadInstance(41, 2)
+    assert _owns_step(owner, ThreadInstance(41, 2))
+    assert not _owns_step(owner, ThreadInstance(41, 1))
+    assert not _owns_step(owner, ThreadInstance(42, 2))
+    assert not _owns_step(owner, None)
+    with pytest.raises(TypeError, match="thread instance"):
+        _owns_step(41, 41)
