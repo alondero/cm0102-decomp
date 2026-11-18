@@ -46,7 +46,9 @@ extern u32 CM_THISCALL cm_fn_0057ed10(void *self, int a, int b, int c);
 extern u32 CM_THISCALL cm_fn_0057f600(u32 self);
 extern void CM_THISCALL cm_fn_0057f920(void *self);
 extern u32 CM_THISCALL cm_fn_0057fa10(u32 self);
-extern u8 CM_STDCALL cm_fn_005ae6d0(u32 date, u32 id);
+/* 0x0057ff89 loads ECX, 0x0057ff8f/90 push two stack arguments,
+   and 0x0057ff91 calls 0x005ae6d0 (pinned binary hash above). */
+extern u8 CM_THISCALL cm_fn_005ae6d0(u32 receiver, u32 date, u32 id);
 extern void cm_fn_005e8290(const char * param_1, const char * param_2, int param_3);
 extern u32 CM_THISCALL cm_fn_006827d0(int param_1, int param_2);
 extern u32 CM_FASTCALL cm_fn_006835c0(int *param_1);
@@ -230,8 +232,7 @@ L_ff80:
     u32 arg2 = *holder;                                /* 0x0057ff87 `mov edx, [ecx]` */
     u8 taken;
 
-    (void)CM_DAT_00ae2a58;                             /* 0x0057ff89 `mov ecx, [0xae2a58]` */
-    taken = cm_fn_005ae6d0((u32)(void *)(scratch + 0x08), arg2); /* 0x0057ff91 */
+    taken = cm_fn_005ae6d0(CM_DAT_00ae2a58, (u32)(void *)(scratch + 0x08), arg2); /* 0x0057ff89..0x0057ff91 */
     if (taken != 0) {                                  /* 0x0057ff96/0x0057ff98 */
       (void)cm_fn_0057fa10((u32)self);                 /* 0x0057ff9c */
     }
