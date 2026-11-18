@@ -34,18 +34,21 @@ Harness modules change only through a release.
 2. A release batches the reviewed changes. It is applied at a recovery batch
    boundary, when no writer holds the lease (the guard enforces this for
    `cmre/` edits).
-3. Each release runs one revalidation: `--reuse` with compatibility receipts
-   where the impact is bounded, otherwise the inventory audit. It finishes with
-   one full pytest and `cmre verify`.
+3. Each evidence-changing release runs the gate selected by the
+   [validation budget](../agent/PLAYBOOK.md#validation-budget). Use the
+   [scope procedure](../agent/HARNESS.md#validation-scope) to prove reuse and
+   record when global or unresolved impact calls for an inventory audit.
+   Finish with one full pytest and `cmre verify`.
 4. At most one release per working day. A correctness defect in accepted
    evidence may justify an extra release; a new capability does not.
 5. The release record keeps the old and new harness identities, the change
-   list, the revalidation receipt and the pytest receipt.
+   list, the scope decision, and the relevant regression, revalidation and
+   pytest receipts.
 
 ## Consequences
 
-- A harness change costs one scheduled sweep of hours, not a sweep per edit
-  and an idle recovery queue.
+- Bounded releases carry forward proven evidence. A required whole-inventory
+  audit runs once for the batched release.
 - Capability work (x87 forms, transports, input generation) waits for the next
   release. Plan it in release-sized batches.
 - Recovery lanes never see the harness change under them; the guard rule makes

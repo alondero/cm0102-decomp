@@ -30,6 +30,12 @@ Keep every declared input of a live proof fixed, including documentation when it
 regression receipt covers those files. Stage updates outside that input set until
 finalization finishes.
 
+A separate Git worktree does not isolate the Python interpreter or toolchain.
+While a full-suite receipt is running, do not install, remove or upgrade shared
+packages or tools from any lane. Prepare new dependencies in a worktree-local
+virtual environment, and keep the recovery interpreter and its environment
+fixed. Package-only drift invalidates exact-input reuse just like file drift.
+
 During a required gate, authorized input workers may prepare private proposals
 and bounded original-only diagnostics when their selected protocol supports those
 operations. Keep the VM, pinned original code and all declared live inputs fixed;
@@ -41,11 +47,7 @@ inform inputs; C validation and acceptance wait for the required gate.
 1. Bound the requested change and inspect existing worktree changes. For a defect,
    capture a smallest reproducer and a failing regression test before fixing it.
    For instructions, identify a session failure that the wording must prevent.
-   Inspect the selection, reuse reasons and estimated cost before execution.
-   An unproven global harness change stops before a job is created. Supply a
-   verified compatibility receipt, or explicitly choose `--audit` after deciding
-   that a fresh sweep is necessary. A hash change alone is not an instruction to
-   launch another whole-inventory job. Honor the user's validation scope.
+   Apply [validation scope](#validation-scope) before starting differential work.
 
    The exact host read-buffer refactor has a separate, fail-closed proof path:
 
@@ -76,16 +78,17 @@ inform inputs; C validation and acceptance wait for the required gate.
    ([validation budget](PLAYBOOK.md#validation-budget)).
    Changes to `HARNESS_MODULES` ship only as a release
    ([ADR 0007](../adr/0007-harness-releases.md)): batched in a worktree, applied at
-   a recovery batch boundary, one revalidation per release, at most one release
-   per working day unless accepted evidence has a correctness defect.
+   a recovery batch boundary, one inventory gate per evidence-changing release,
+   at most one release per working day unless accepted evidence has a correctness
+   defect.
    A worker reporting a harness issue returns evidence to its parent.
 3. Classify the changed files using `HARNESS_MODULES` in `cmre/recover.py`:
 
    | Change | Required validation |
    | --- | --- |
-   | Instructions, skills, session runner, guard, CLI routing, queue, tests | Focused checks and parent session gate; no blanket revalidation for these files alone |
-   | Module in `HARNESS_MODULES` | Focused regression, full pytest, and dependency-aware inventory gate below; global/unknown changes select everything |
-   | Acceptance/ledger semantics or C build inputs outside that list | Determine and validate affected records explicitly; file-list exclusion does not prove unchanged evidence |
+   | Instructions, skills, session runner, guard, CLI routing, queue, tests | Focused checks and the parent session gate |
+   | Module in `HARNESS_MODULES` | Focused regression, full pytest and a dependency-aware plan. Apply the scope decision below to select execution and reuse. |
+   | Acceptance or ledger semantics, or C build inputs outside that list | Exercise the changed path and identify affected records. Use the plan when prior inventory evidence may change. |
 
    Behaviour-changing code stays fixed during revalidation. A comparison can
    only be relaxed with a test proving the equivalent case and a near miss that
@@ -95,13 +98,16 @@ inform inputs; C validation and acceptance wait for the required gate.
    retain every intermediate failure. Tooling/reporting changes follow their
    own row above and do not trigger inventory refresh merely because they are
    Python files. Never bypass a required revalidation to improve throughput.
-4. Inspect impact before launching differential work. Batch necessary fixes,
-   then freeze execution/build/acceptance inputs for the final run:
+4. For an inventory gate, batch necessary fixes, freeze execution, build and
+   acceptance inputs, and save the plan for the intended run:
 
    ```powershell
-   py -3.13 -m cmre revalidate --refresh --plan --json --output CM0102/Analysis/cmre/validation-plan.json
+   py -3.13 -m cmre revalidate --plan --json --output CM0102/Analysis/cmre/validation-plan.json
    ```
 
+   Use the same scope, reuse and compatibility options for planning and
+   execution. Include `--refresh` in both when the release requires refreshing
+   acceptance records.
    Completion: every accepted lifted and C tier has current executed or explicitly
    reusable evidence, with zero failed, inconclusive or pending tiers. A sampled
    `-n` run is never the inventory gate. The plan lists effective options, profiles,
@@ -145,12 +151,6 @@ inform inputs; C validation and acceptance wait for the required gate.
    computed macro names and external include-availability tests are preprocessed
    again; unchanged source hashes alone do not prove their generated inputs.
 
-   Global emulation, comparison, imports, ABI, compiler or execution-policy changes
-   require a full pass. Use `--audit` at milestone/integration boundaries to execute
-   every selected tier regardless of reuse. Bounded compatibility covers reviewed
-   input-dispatch/validation changes and the exact host read-buffer storage proof
-   described above. Neither lane exempts general guest-execution or comparison
-   changes. File-list exclusion or equal hints alone cannot establish compatibility.
 5. Only after revalidation finishes successfully, run
    `py -3.13 -m cmre unblock --batch` to requeue machine-made blocks. Agent blocks
    remain. Then return to [BATCH.md](BATCH.md) if recovery is the requested task.
@@ -158,6 +158,35 @@ inform inputs; C validation and acceptance wait for the required gate.
 Docs-only work can preserve an observed failing baseline and report it; it
 cannot label that session green. Keep failing contracts intact. Finish through
 the parent [playbook](PLAYBOOK.md#3-close-the-session).
+
+## Validation scope
+
+1. Name the failure the check should catch and the decision it will support.
+   Trace the changed path. Use targeted checks for acceptance, publication,
+   composition and integration behavior. For example, an operand-proof change
+   needs the acceptance path with a valid case and a case for each independently
+   broken operand. The ordinary inventory audit reruns the differential cases
+   and checks accepted source identity. It bypasses the operand-proof gate in
+   `accept`. See [the recorded operand experiment](FARM.md#supply-lane-codex--gpt).
+2. When prior inventory evidence may change, inspect the complete
+   `cmre revalidate --plan` and the exact diff. In the release record include the
+   prior receipt, affected functions or execution paths, the number of tiers to
+   execute and reuse, and the estimated wall time or why it is unknown.
+   A global hash invalidation reports the loss of automatic reuse. Use the diff
+   and dependency evidence to determine the reach of the change.
+3. For bounded changes, run the focused regressions and use dependency-aware
+   reuse for matching tiers. For a changed global identity, carry forward results
+   only through a verified compatibility receipt. Use the supported proof for
+   [input dispatch](#bounded-input-dispatch-compatibility) or the exact host
+   read-buffer refactor above. When a new proof is needed, batch the change while
+   preparing it or record why a sweep is the better use of time for this release.
+   Record the targeted result alongside any inventory receipt.
+4. Run one full sweep for a named milestone or when a frozen release can
+   change results broadly or its affected scope remains unresolved. Global
+   changes to emulation, imports, ABI, compilation, input generation, or
+   comparisons commonly meet this trigger. Record the reason before launch.
+   Reuse matching completed evidence for the same release and resume an
+   interrupted job from its receipt.
 
 ## Bounded input-dispatch compatibility
 
