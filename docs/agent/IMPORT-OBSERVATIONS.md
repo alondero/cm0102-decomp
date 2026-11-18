@@ -14,7 +14,9 @@ scopes. Only one capture scope per thread is supported; scopes cannot be reused.
 Nested imports and threads can share a return breakpoint through the existing
 protocol. Ending a scope makes outstanding calls incomplete, not successful.
 
-Only `HeapAlloc` and `ReadFile` are admitted. Every entry retains and checks:
+`HeapAlloc`, `ReadFile`, `FindFirstFileA`, `FindNextFileA`,
+`FileTimeToLocalFileTime` and `FileTimeToSystemTime` are admitted. Every
+entry retains and checks:
 
 - raw register snapshot, return word and exact stack arguments;
 - a six-byte `CALL [IAT]` immediately before the continuation in pinned text;
@@ -29,7 +31,7 @@ authenticate an OS module or make an arbitrary stream trustworthy.
 Outputs are read only at a protocol-eligible top pending return endpoint.
 Heap observations retain the returned pointer and requested allocation range;
 NULL allocation is incomplete. ReadFile retains the count DWORD and declared
-buffer range, including raw unwritten tails. Each actual output read is capped
+buffer range, including raw unwritten tails. Each heap or file read is capped
 at 64 bytes while its original requested size and partial-read error survive.
 Invalid ranges do not trigger reads or discard other successfully read outputs.
 
@@ -39,6 +41,24 @@ for example an observed CreateFileA call with no overlapped flag. A NULL
 handle provenance, short reads, API errors/pending, missing/unreadable counts,
 and capped reads remain incomplete. No async completion or GetLastError/TEB
 tracking is implemented.
+
+The four fixed file/time APIs retain before and after samples of their
+32-bit output storage. The shared observer and owned-child fixture check the
+same 320-byte find record, 8-byte FILETIME and 16-byte SYSTEMTIME endpoints.
+The first search pattern is read only when the owner supplies its exact
+bounded byte length, including its terminator. FindNextFileA retains the
+raw search handle from the observed arguments. The time conversions retain
+the eight input bytes from their input pointers. [WIN32_FIND_DATAA](https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-win32_find_dataa)
+[FindNextFileA](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findnextfilea)
+[FileTimeToLocalFileTime](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-filetimetolocalfiletime)
+[FileTimeToSystemTime](https://learn.microsoft.com/en-us/windows/win32/api/timezoneapi/nf-timezoneapi-filetimetosystemtime)
+
+File/time records remain incomplete as effect evidence. A failed find retains
+its actual scalar and raw buffer with zero defined ranges. Successful find
+records only classify the selected fixed fields and the terminated filename.
+Before and after samples establish which bytes differ between the reads.
+Write provenance, handle lifecycle and `GetLastError` require separate evidence
+before replay.
 
 ## Backend and cleanup contract
 
@@ -77,6 +97,7 @@ Offline tests (no game, native child or desktop):
 
 ```powershell
 py -3.13 -m pytest tests/test_capture_import_observe.py tests/test_cmre_import_observe.py -q -o addopts=""
+py -3.13 -m pytest tests/test_native_crt_import_results.py -q -o addopts=""
 ```
 
 These test adapter behavior with debugger doubles, not Windows API semantics or
@@ -142,20 +163,15 @@ No additional API definitions were added merely to expand a mock-only surface.
    child-kill fallback for a game PID. An unprovable running/stopped-state
    transition must not be reported as successful detach; implement and test
    explicit safe stopping/retained-stop ownership before enabling this client.
-4. **Add ReadFile, then the four explicitly bounded API definitions.** The
-   likely family is FindFirstFileA, FindNextFileA, FileTimeToLocalFileTime and
-   FileTimeToSystemTime, but bind the exact requested set to original call/IAT
-   evidence before implementation. Retain precise request/output ranges,
-   before/after bytes, raw status and field-layout provenance. No allocation,
-   directory contents, file times, success values or unwritten bytes may be
-   synthesized. In particular, do not extend the current 64-byte cap and claim
-   a complete WIN32_FIND_DATAA without an explicitly evidenced size/layout.
+4. **Integrate the supported observations into a game-owned capture scope.**
+   Bind the requested imports to exact original call/IAT evidence before
+   starting game-side capture. Retain precise request/output ranges,
+   before/after bytes, raw status and field-layout provenance. Retain a
+   partial observation whenever any input or effect is unavailable.
 
-The smallest currently proven slice remains the 33 adapter tests plus 65
-protocol tests. They establish scoped event-to-local-observation behavior,
-**not** a live `Recorder.run` import path. The wiring follow-up stops at this
-identified backend boundary rather than relabeling the facade as integration.
-No desktop or native-child tests were executed in this follow-up.
+The original wiring investigation ran 33 adapter tests and 65 protocol tests.
+Those checks covered scoped events through the observation facade. The game
+recorder event dispatcher still needs integration.
 
 ## Physical backend extraction: implemented next batch
 
@@ -203,9 +219,9 @@ client. The next vertical slice must create a real function-entry scope and
 observe a real HeapAlloc invocation through the opt-in `Recorder.run` path,
 with a fixture-owned client first. Simply forwarding `Recorder.run` to a
 fixture profile with a hard-coded scope would not prove that integration.
-The four enumeration/time definitions remain deferred rather than enlarging
-the mock-only facade. No replay, capture-format, emulator or default recorder
-policy changes are part of this extraction.
+The bounded file/time definitions above now share the authored native test
+implementation. Replay, capture-format, emulator and recorder integration
+still require separate work.
 
 The subsequent [native function-scope tooling slice](ENTRY-IMPORT-SCOPES.md)
 observes a real authored-child function entry, its enclosed OS imports and its

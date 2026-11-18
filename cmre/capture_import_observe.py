@@ -7,18 +7,29 @@ module neither attaches nor continues a process. It is not wired into Recorder.
 """
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import struct
 
-from . import env
+from . import env, file_time_observe
 from .import_observe import ImportObserver, MemoryRead, Snapshot
 
 
 HEAP = "KERNEL32.dll!HeapAlloc"
 READ = "KERNEL32.dll!ReadFile"
-ARGUMENTS = {HEAP: 3, READ: 5}
+FILE_TIME_NAMES = {f"KERNEL32.dll!{name}": name for name in file_time_observe.SIZES}
+ARGUMENTS = {HEAP: 3, READ: 5, **dict.fromkeys(FILE_TIME_NAMES, 2)}
 OBSERVATION_STORE = env.ROOT / "local/import-observations"
+
+
+@dataclass(frozen=True)
+class _Entry:
+    name: str
+    args: tuple[int, ...]
+    synchronous_file_basis: str | None
+    output_before: MemoryRead | None
 
 
 class RecorderImportObserver:
@@ -39,6 +50,7 @@ class RecorderImportObserver:
         self.generations = {}
         self.used_scopes = set()
         self.entries = {}
+        self.file_time_outputs = {}
         self.recover_step = recover_step
         self.stepping = None
         self.step_recovery = []
@@ -97,7 +109,8 @@ class RecorderImportObserver:
             self.observer.acknowledge_breakpoint(
                 request["address"], request["revision"], success=True, memory=memory)
 
-    def import_entry(self, tid, generation, snapshot, *, iat_slot, synchronous_file_basis=None):
+    def import_entry(self, tid, generation, snapshot, *, iat_slot, synchronous_file_basis=None,
+                     find_pattern_size=None):
         self._active()
         if self.stepping is not None:
             raise RuntimeError("step obligation must finish before processing endpoints")
@@ -125,23 +138,32 @@ class RecorderImportObserver:
         argc = ARGUMENTS[name]
         arguments = self._exact(sp + 4, argc * 4, "import-arguments")
         args = struct.unpack("<" + "I" * argc, arguments.data)
+        reads = [word, caller, iat, arguments]
         gaps = list(snapshot.gaps)
         if name == READ:
             if args[4]:
                 gaps.append("overlapped-unsupported")
             if not isinstance(synchronous_file_basis, str) or not synchronous_file_basis.strip():
                 gaps.append("synchronous-handle-unproven")
-        enriched = Snapshot(dict(snapshot.registers), (*snapshot.memory, word, caller, iat, arguments),
-                            tuple(gaps))
+        before = None
+        if name in FILE_TIME_NAMES:
+            file_time_name = FILE_TIME_NAMES[name]
+            try:
+                before = file_time_observe.read_output(self.read, file_time_name, args, "before")
+                reads.append(before)
+            except ValueError:
+                gaps.append("invalid-output-range")
+            self._observe_file_time_input(file_time_name, args, find_pattern_size, reads, gaps)
+        enriched = Snapshot(dict(snapshot.registers), (*snapshot.memory, *reads), tuple(gaps))
         invocation = self.observer.entry(
             tid, scope[1], name, enriched, generation=generation, return_site=site,
             return_sp=sp + 4 + 4 * argc,
-            return_sp_basis="Win32 documented stdcall for selected HeapAlloc/ReadFile; "
+            return_sp_basis=f"Win32 documented stdcall for {name}; "
                             "live CALL [verified IAT] and return word retained; RET path untraced")
         if invocation is not None:
             # Retain handle provenance supplied by the owner, never infer it from
             # NULL lpOverlapped. This evidence is not independently authenticated.
-            self.entries[invocation] = (name, args, synchronous_file_basis)
+            self.entries[invocation] = _Entry(name, args, synchronous_file_basis, before)
         self._drain()
         return invocation
 
@@ -155,13 +177,17 @@ class RecorderImportObserver:
                    and r["state"] == "pending"]
         candidate = records[-1] if records else None
         reads, gaps = (), ()
+        file_time_info = None
         if (not snapshot.report()["gaps"] and candidate is not None and candidate["return_site"] == address
                 and candidate["return_sp"] == snapshot.registers.get("esp")
                 and snapshot.registers.get("eip") == address and candidate["breakpoint_ready"]):
-            name, args, _ = self.entries[candidate["invocation"]]
+            entry = self.entries[candidate["invocation"]]
             eax = snapshot.registers["eax"]
             try:
-                reads, gaps = self._outputs(name, args, eax)
+                if entry.name in FILE_TIME_NAMES:
+                    reads, gaps, file_time_info = self._file_time_result(entry, eax)
+                else:
+                    reads, gaps = self._outputs(entry.name, entry.args, eax)
             except ValueError as exc:
                 # Invalid ranges cannot become valid API output by truncation.
                 reads, gaps = (), ("invalid-output-range", str(exc))
@@ -169,19 +195,55 @@ class RecorderImportObserver:
             tid, address, Snapshot(dict(snapshot.registers), (*snapshot.memory, *reads),
                                    (*snapshot.gaps, *gaps)),
             generation=generation)
+        if invocation is not None and file_time_info is not None:
+            self.file_time_outputs[invocation] = file_time_info
         self._drain()
         return invocation
 
     def report(self):
         report = self.observer.report()
         for record in report["invocations"]:
-            record["synchronous_file_basis"] = self.entries[record["invocation"]][2]
+            invocation = record["invocation"]
+            entry = self.entries[invocation]
+            record["synchronous_file_basis"] = entry.synchronous_file_basis
+            if entry.name in FILE_TIME_NAMES:
+                record["output_classification"] = deepcopy(self.file_time_outputs.get(invocation))
         report["step_recovery"] = json.loads(json.dumps(self.step_recovery))
         report["pending_step"] = dict(self.stepping) if self.stepping is not None else None
         report["cleanup_complete"] &= self.stepping is None
         report["effects_complete"] = False
         report["recorder_wired"] = False
         return report
+
+    def _observe_file_time_input(self, name, args, find_pattern_size, reads, gaps):
+        if name == "FindNextFileA":
+            return  # The first argument is a handle. It is retained in the stack sample.
+        size = 8
+        if name == "FindFirstFileA":
+            if type(find_pattern_size) is not int or not 0 < find_pattern_size <= 4096:
+                gaps.append("search-pattern-bound-unproven")
+                return
+            size = find_pattern_size
+        try:
+            read = file_time_observe.read_range(self.read, args[0], size, f"{name}.input")
+        except ValueError:
+            gaps.append("invalid-input-range")
+            return
+        reads.append(read)
+        if name == "FindFirstFileA" and read.complete and read.data.find(b"\0") != size - 1:
+            gaps.append("search-pattern-bound-does-not-match-terminator")
+
+    def _file_time_result(self, entry, eax):
+        name = FILE_TIME_NAMES[entry.name]
+        after = file_time_observe.read_output(self.read, name, entry.args, "after")
+        before = entry.output_before
+        if before is None or not before.complete or not after.complete:
+            return (after,), ("output-classification-unavailable-partial-read",), None
+        info = file_time_observe.classify_output(name, eax, before.data, after.data)
+        gaps = list(info["gaps"])
+        if info["output_status"] == "undefined-on-failure":
+            gaps.append("undefined-failure-output-storage")
+        return (after,), tuple(gaps), info
 
     def begin_step(self, tid, generation, address, snapshot):
         """Owner calls BEFORE changing context/unpatching for a single step.

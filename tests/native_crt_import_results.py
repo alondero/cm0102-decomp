@@ -16,56 +16,16 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_32
 import pefile
 
 from cmre import capture_record as api, env
+from cmre.file_time_observe import SIZES, classify_output, read_output
 from native_debug_fixture import Unavailable
 from native_import_observer import observe_calls
 from native_import_results import ROOT, NativeResultsProfile, bounded_range
 
-SIZES = {"FindFirstFileA": 320, "FindNextFileA": 320,
-         "FileTimeToLocalFileTime": 8, "FileTimeToSystemTime": 16}
 DOC_ROOT = "https://learn.microsoft.com/en-us/windows/win32/api/"
 DOCS = {name: DOC_ROOT + group + "/nf-" + group + "-" + name.lower()
         for name, group in (("FindFirstFileA", "fileapi"), ("FindNextFileA", "fileapi"),
                             ("FileTimeToLocalFileTime", "fileapi"),
                             ("FileTimeToSystemTime", "timezoneapi"))}
-
-
-def output_ranges(name, args):
-    if name not in SIZES or len(args) != 2:
-        raise ValueError("unsupported two-argument fixture import")
-    if any(type(a) is not int or not 0 <= a <= 0xffffffff for a in args):
-        raise ValueError("invalid raw u32 argument")
-    address, size = args[1], SIZES[name]
-    if address == 0 or address + size > 0x100000000:
-        raise ValueError("invalid fixture output range")
-    return ((address, size),)
-
-
-def classify_output(name, eax, before, after):
-    """Byte equality is not output definedness; failed buffers stay undefined."""
-    if name not in SIZES or type(eax) is not int or not 0 <= eax <= 0xffffffff:
-        raise ValueError("unsupported scalar/prototype")
-    if not isinstance(before, bytes) or not isinstance(after, bytes) or (
-            len(before) != SIZES[name] or len(after) != SIZES[name]):
-        raise ValueError("classification requires exact bounded before/after bytes")
-    success = eax != (0xffffffff if name == "FindFirstFileA" else 0)
-    ranges, gaps = [], ["bounded-storage-only-not-complete-effects"]
-    if success:
-        if name.startswith("Find"):
-            # Fixed public fields through nFileSizeLow, NOT dwReserved0/1,
-            # alternate-name storage, unfilled name tails or trailing padding.
-            ranges.append([0, 36])
-            end = after.find(b"\0", 44, 304)
-            if end < 0:
-                gaps.append("filename-not-terminated")
-            else:
-                ranges.append([44, end + 1])
-        else:
-            ranges.append([0, SIZES[name]])
-    changed = [i for i, (a, b) in enumerate(zip(before, after)) if a != b]
-    return dict(scalar_result=eax, before_hex=before.hex(), after_hex=after.hex(),
-                output_status="selected-defined-fields" if success else "undefined-on-failure",
-                defined_ranges=ranges, changed_offsets=changed,
-                unchanged_count=len(before) - len(changed), gaps=gaps, replayable=False)
 
 
 def verify_caller(name, fields, exact, imports):
@@ -301,8 +261,7 @@ class NativeCrtResultsProfile(NativeResultsProfile):
         if not raw.complete:
             raise RuntimeError("unreadable selected arguments")
         args = list(struct.unpack("<2I", raw.data))
-        out, size = output_ranges(name, args)[0]
-        before = bounded_range(memory, out, size, name + ".output-before", limit=512)
+        before = read_output(memory, name, args, "before")
         reads = [memory(ctx.Esp, 4, "return-word"), raw, before,
                  memory(binding["iat"], 4, "resolved-IAT-slot")]
         if name == "FindFirstFileA":
@@ -325,8 +284,7 @@ class NativeCrtResultsProfile(NativeResultsProfile):
 
     def outputs(self, fact, ctx, memory):
         name = fact["name"]
-        out, size = output_ranges(name, fact["args"])[0]
-        after = bounded_range(memory, out, size, name + ".output-after", limit=512)
+        after = read_output(memory, name, fact["args"], "after")
         gaps = ["bounded-storage-only-not-complete-effects"]
         if fact["before"]["complete"] and after.complete:
             classification = classify_output(
