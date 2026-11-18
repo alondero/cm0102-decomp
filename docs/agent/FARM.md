@@ -319,6 +319,20 @@ gate, and any prior review or operand proof. Worker/model pass claims are not
 acceptance evidence. Completed collection is
 recorded only after terminal status; interrupted collection remains resumable.
 
+Acceptance requests use schema 2 and name the controller's write-once
+`dispatch/JOB/receipt.json`, created before launch or explicit adoption admission.
+Acceptance derives prior hints from that snapshot and verifies the originating
+audit's function, input identity, verdict and findings again after the fresh gate.
+Schema-2 review claims retain their audit authority; fresh manual claims identify
+inputs only and do not claim a machine audit verdict. These files are controller
+authority, outside worker write scopes; hashes do not authenticate an arbitrary
+local process with permission to rewrite the controller's evidence.
+
+Historical schema-1 requests/claims and pending jobs without dispatch authority
+fail closed. Preserve them; obtain a fresh explicit claim/adoption or redispatch
+the candidate. Acceptance never manufactures a dispatch snapshot from already
+installed inputs. Uncertain post-write outcomes still require ledger review.
+
 Restart restores only bytes whose ownership is proven. After an interrupted
 acceptance, matching authoritative acceptance evidence may complete bookkeeping;
 only explicit authoritative **nonacceptance** permits rollback. Unavailable,

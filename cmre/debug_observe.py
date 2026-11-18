@@ -12,12 +12,20 @@ import ctypes
 import struct
 import time
 import uuid
+from typing import Any, TypedDict, cast
 
 from . import capture_record as api
 from .import_observe import ImportObserver, MemoryRead, Snapshot, ThreadInstance
 
 
 SINGLE_STEP = (0x80000004, 0x4000001e)
+
+
+class _PhysicalStep(TypedDict):
+    owner: ThreadInstance
+    address: int
+    original_flags: int
+    executed: bool
 BREAKPOINT = (api.STATUS_BREAKPOINT, api.STATUS_WX86_BREAKPOINT)
 TF = 0x100
 DBG_REPLY_LATER = 0x40010001
@@ -90,12 +98,16 @@ def run_session(client, *, detach_at: str | None = None,
     process, event_process, pending = None, None, None
     attached, exited, ready, early = False, False, False, False
     main_tid, attach_tid, command_released = None, None, False
-    threads, originals, armed, facts = {}, {}, set(), {}
-    generations = {}
-    suspended = {}
-    exit_waiting, reply_expected = {}, {}
+    threads: dict[int, Any] = {}
+    originals, armed = {}, set()
+    facts: dict[int, dict] = {}
+    generations: dict[int, int] = {}
+    suspended: dict[int, dict] = {}
+    exit_waiting: dict[ThreadInstance | None, dict] = {}
+    reply_expected: dict[ThreadInstance | None, int] = {}
     exit_wait_deadline, unsafe_stop_reason = None, None
-    stepping, stopped_hit = None, None
+    stepping: _PhysicalStep | None = None
+    stopped_hit = None
     manifest = {}
     entry_addresses = set()
     obs = ImportObserver(enabled=True, source={**client.source, "session": result["run_id"]})
@@ -383,7 +395,7 @@ def run_session(client, *, detach_at: str | None = None,
         event = api._DebugEvent()
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            if exit_waiting and time.monotonic() >= exit_wait_deadline:
+            if exit_waiting and time.monotonic() >= cast(float, exit_wait_deadline):
                 unsafe_stop_reason = "terminating peer exit event not confirmed within 1s"
                 raise TimeoutError(unsafe_stop_reason)
             if not k.WaitForDebugEvent(ctypes.byref(event), 50):
@@ -399,7 +411,7 @@ def run_session(client, *, detach_at: str | None = None,
             pending = (client.pid, tid)
             if exit_waiting:
                 received_at = time.monotonic()
-                if received_at >= exit_wait_deadline:
+                if received_at >= cast(float, exit_wait_deadline):
                     unsafe_stop_reason = "terminating peer exit event not confirmed within 1s"
                     result["received_after_peer_exit_deadline"] = dict(
                         pid=client.pid, tid=tid, generation=generations.get(tid), code=code,
@@ -451,7 +463,7 @@ def run_session(client, *, detach_at: str | None = None,
                         tid=tid, generation=event_generation, handle=threads[tid],
                         exit_code=struct.unpack_from("<I", bytes(event.u.raw))[0])
                     del exit_waiting[event_owner]
-                obs.thread_exit(tid, generation=event_generation,
+                obs.thread_exit(tid, generation=cast(int, event_generation),
                                 exit_code=struct.unpack_from("<I", bytes(event.u.raw))[0])
                 lease = suspended.pop(tid, None)
                 if lease is not None:
@@ -545,7 +557,7 @@ def run_session(client, *, detach_at: str | None = None,
                         # target (fixture depth==0 bypasses the recursive CALL).
                         # Keep the rejected endpoint raw; never fabricate a pair.
                         obs.return_hit(tid, address, snapshot(ctx, ip=address, reads=reads, gaps=gaps),
-                                       generation=event_generation)
+                                       generation=cast(int, event_generation))
                         drain_requests()
                     prepare_step(tid, event_generation, address, ctx)
                     if detach_at == "step-prepared" or fail_at == "step-prepared":
@@ -572,7 +584,7 @@ def run_session(client, *, detach_at: str | None = None,
                         client.release()
                         command_released = True
                 else:
-                    obs.exception(tid, generation=event_generation, code=exception, address=address,
+                    obs.exception(tid, generation=cast(int, event_generation), code=exception, address=address,
                                   first_chance=bool(event.u.Exception.dwFirstChance),
                                   snapshot=snapshot(context(tid)))
                     status = api.DBG_EXCEPTION_NOT_HANDLED

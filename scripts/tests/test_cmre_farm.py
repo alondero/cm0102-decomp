@@ -1062,6 +1062,7 @@ def prepared_candidate(root):
     source = root / 'candidate.c'
     source.write_text(GOOD)
     job.update(source=str(source), _snap={'c': canonical.read_bytes(), 'hint': None})
+    f._register_dispatch(job)  # synthetic fixture models the real pre-launch boundary
     f.save()
     return f, cmre, job, canonical
 

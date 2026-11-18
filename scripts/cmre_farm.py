@@ -667,6 +667,9 @@ class Farm:
         self.counter = sum(len(v) for v in self.state['attempts'].values())
         events, _ = _read_events(self.run_dir / 'events.jsonl', 0)
         self.counter = max([self.counter, *(e.get('n', 0) for e in events)])
+        registered = [int(path.name) for path in (self.run_dir / 'dispatch').glob('*')
+                      if path.is_dir() and path.name.isdigit()]
+        self.counter = max([self.counter, *registered])
         for kind in ('audit', 'fix'):
             retained = [int(path.name) for path in (self.run_dir / kind / 'snapshots').glob('*')
                         if path.is_dir() and path.name.isdigit()]
@@ -767,7 +770,8 @@ class Farm:
                                         '_finding_identity', '_origin_review') if k in job}
             again = self._new_job('fix', job['fn'], job['model'], job['rung'], **extra)
         else:
-            again = {k: v for k, v in job.items() if k not in ('_snap', '_seed_bytes')}
+            extra = {k: job[k] for k in ('bytes', 'module', 'hold', 'prior') if k in job}
+            again = self._new_job(job['kind'], job['fn'], job['model'], job['rung'], **extra)
         again['_seed'] = job.get('_seed_bytes')
         self.pending.insert(0, again)
 
@@ -1223,6 +1227,8 @@ class Farm:
         if detail:
             self._invalidate_fix(job, detail)
             return False
+        if job['kind'] != 'audit':
+            self._register_dispatch(job)
         handle = launcher.start(job, prompt, worker_config(self.root, job))
         self.running.append((job, handle, self.clock()))
         self._event('dispatch', fn=job['fn'], kind=job['kind'], model=job['model'], n=job['n'])
@@ -1282,6 +1288,7 @@ class Farm:
                         'c': _read(self.root / 'recovery/c' / f'{item.fn}.c'),
                         'hint': _read(self.root / 'recovery/hints' / f'{item.fn}.json')}
                     self._event('recheck', fn=item.fn, n=job['n'], coverage_was=retained.get('coverage'))
+                    self._register_dispatch(job)
                     self.save()
                     self._verify(job, False)
                     translators.append(job)
@@ -1302,6 +1309,7 @@ class Farm:
                     Path(job['source']).parent.mkdir(parents=True, exist_ok=True)
                     Path(job['source']).write_bytes(seed)
                     job['_resume_collect'] = hashlib.sha256(seed).hexdigest()
+                    self._register_dispatch(job)
                     self._event('resume-collect', fn=item.fn, n=job['n'])
                     self.save()
                     self._verify(job, False)
@@ -1787,6 +1795,8 @@ class Farm:
 
     def _write_acceptance_request(self, job, data):
         fn, number = job['fn'], job['n']
+        if '_dispatch_authority' not in job:
+            raise ValueError('Historical pending job has no immutable dispatch authority; explicit redispatch required')
         proof_path = self._x87_evidence_path(job, data['identity']['c'])
         gate = data.get('canonical_gate')
         if gate is None:
@@ -1799,24 +1809,12 @@ class Farm:
             _durable_json(path, report)
             gate = _acceptance_pin(path)
             self._transaction(job, canonical_gate=gate)
-        reviews = []
-        if job['kind'] == 'fix':
-            reviews = self._acceptance_review_artifacts(job)
-        elif job['kind'] == 'adopt':
-            review = Path(job['review_receipt'])
-            expected = job['expected_identity']
-            reviews = [
-                _acceptance_pin(review, job['review_receipt_sha256']),
-                _acceptance_pin(review.with_name('source.c'), expected['c']),
-                _acceptance_pin(review.with_name('hints.json'), expected['hint']),
-            ]
         if _identity(self._inputs(fn)) != data['identity']:
             raise ValueError('Canonical inputs changed while preparing farm acceptance')
         request = {'schema': acceptance_request.SCHEMA, 'fn': fn, 'job': number, 'kind': job['kind'],
                    'source_sha256': data['identity']['c'], 'hint_sha256': data['identity']['hint'],
-                   'prior_hint': data['prior']['hint'], 'canonical_gate': gate,
-                   'operand_proof': _acceptance_pin(proof_path) if proof_path.is_file() else None,
-                   'reviews': list({row['path']: row for row in reviews}.values())}
+                   'dispatch': job['_dispatch_authority'], 'canonical_gate': gate,
+                   'operand_proof': _acceptance_pin(proof_path) if proof_path.is_file() else None}
         path = self.run_dir / 'acceptance' / f'{number:08d}-{acceptance_request.digest_json(request)[:16]}.json'
         if not path.exists():
             _durable_json(path, request)
@@ -1824,29 +1822,15 @@ class Farm:
             raise ValueError('Retained farm acceptance request changed')
         return path
 
-    def _acceptance_review_artifacts(self, job):
-        identity, origin = job['_finding_identity'], job['_origin_review']
-        paths, metadata, first = _bound_audit_reviews(self.run_dir, self.root, job['fn'], identity, origin)
-        dispatch = job['_fix_dispatch']
-        dispatched, _ = _review_input_artifacts(self.run_dir, self.root, job['fn'], identity, dispatch)
-
-        def bind(files, authority):
-            directory = Path(files['source_snapshot']).parent
-            pins = [
-                _acceptance_pin(directory / 'identity.json', authority['snapshot_metadata_sha256']),
-                _acceptance_pin(files['source_snapshot'], identity['c']),
-                _acceptance_pin(files['hints_snapshot'], identity['hint']),
-            ]
-            if files.get('audit_path'):
-                pins.append(_acceptance_pin(files['audit_path'], authority['verdict_sha256']))
-            if files.get('bundle'):
-                pins.append(_acceptance_pin(files['bundle'], authority['bundle_sha256']))
-            return pins
-
-        pins = bind(paths, origin) + bind(dispatched, dispatch)
-        if first:
-            pins.extend(bind(first, metadata['audit_state']['review']))
-        return pins
+    def _register_dispatch(self, job):
+        origin = None
+        if job['kind'] == 'fix':
+            origin = {'review': job['_origin_review'], 'findings': job['findings']}
+        elif job['kind'] == 'adopt':
+            origin = {'receipt': _acceptance_pin(job['review_receipt'], job['review_receipt_sha256']),
+                      'findings': job['reviewed_findings']}
+        job['_dispatch_authority'] = acceptance_request.register_dispatch(
+            self.run_dir, self.root, job['fn'], job['n'], job['kind'], job['_snap'], origin=origin)
 
     def _accept(self):
         waiting = []
@@ -2008,6 +1992,7 @@ class Farm:
                 job['source'] = request['source']
                 job['_request'] = str(path)
                 job['_snap'] = snapshot
+                self._register_dispatch(job)
                 self._event('adopt', fn=fn, source=request['source'])
                 self._verify(job, False)
 
@@ -2320,8 +2305,15 @@ def claim_review(run_dir, root, fn, name):
                 stream.flush()
                 os.fsync(stream.fileno())
     receipt = directory / 'receipt.json'
-    _durable_json(receipt, {'schema': 'cmre-farm-review/1', 'fn': fn,
-                            'identity': view['identity'], 'review': view})
+    authority = None
+    if view['status'] == 'bound':
+        audit = json.loads((run_dir / 'state.json').read_bytes())['audits'][fn]
+        if audit['identity'] != view['identity'] or audit['verdict'] != view['verdict']:
+            raise ValueError('Audit changed while claiming review inputs')
+        authority = audit['review']
+    _durable_json(receipt, {'schema': 'cmre-farm-review/2', 'fn': fn,
+                            'identity': view['identity'], 'review': view,
+                            'verdict': view.get('verdict', 'input-claim'), 'audit_origin': authority})
     view.update(review_receipt=str(receipt), source=str(directory / 'source.c'),
                 hints=str(directory / 'hints.json'))
     return view
@@ -2334,14 +2326,21 @@ def read_review_receipt(path, run_dir, root, fn):
         raise ValueError('expected an explicitly claimed RUN/reviews/NAME/receipt.json')
     raw = path.read_bytes()
     receipt = json.loads(raw)
-    if receipt.get('schema') != 'cmre-farm-review/1' or receipt.get('fn') != fn:
+    if (not isinstance(receipt, dict) or receipt.get('schema') != 'cmre-farm-review/2'
+            or receipt.get('fn') != fn):
         raise ValueError('review receipt schema/function mismatch')
     snapshot = {'c': _read(path.parent / 'source.c'), 'hint': _read(path.parent / 'hints.json')}
     if snapshot['c'] is None or receipt.get('identity', {}).get('c') is None:
         raise ValueError('review receipt has no C source; fresh review of actual source is required')
     if _identity(snapshot) != receipt['identity']:
         raise ValueError('review snapshot changed; fresh review required')
-    return snapshot, hashlib.sha256(raw).hexdigest(), receipt.get('review', {}).get('open_findings', [])
+    digest = hashlib.sha256(raw).hexdigest()
+    findings = receipt.get('review', {}).get('open_findings', [])
+    acceptance_request.check_origin(Path(run_dir).resolve(), Path(root).resolve(), fn,
+                                    receipt['identity'], 'adopt',
+                                    {'receipt': {'path': str(path), 'sha256': digest},
+                                     'findings': findings})
+    return snapshot, digest, findings
 
 
 def review_request_data(receipt, run_dir, root, fn):
