@@ -18,6 +18,54 @@ checks, differential gates and serial acceptance. Terra is also the default
 auditor, confirmation worker and defect fixer while the other quotas are scarce.
 Confirmation remains a separate worker run, including when both auditors use Terra.
 
+## Live pipeline dashboard
+
+From the authoritative checkout, run `py -3.13 scripts/cmre_farm_dashboard.py serve`
+and open [127.0.0.1:8042](http://127.0.0.1:8042/). The read-only browser page
+discovers local farm runs, defaults to a live run when available, and refreshes
+every five seconds. Use `serve --run RUN` to include a run directory outside
+the default farm folder. `--port` changes the local port.
+
+- **Pipeline flow and assignments** show the selected run's frontier, retries,
+  active model workers by role and provider/model, gate re-tests, serial
+  acceptance, and queued audits. Each assignment includes its function ID.
+- **Capacity & scaling** shows applied worker limits and filters, pending control
+  settings, the latest settings change, provider cooldowns, and when a frontier
+  scan becomes eligible.
+  An eligible scan still needs the dispatcher to look for work. An empty frontier
+  plus idle translation slots indicates a supply constraint. Compare that with
+  the gate, writer, and audit queues before changing concurrency. Use the farm's
+  `set RUN` command to tune a running farm. Settings apply at the start of the
+  next scheduler tick, which can be delayed by serial acceptance.
+- **Supply inventory** shows workspace-wide authored, lifted, and unlifted body
+  bytes and the largest evidence and harness blocker families. It refreshes
+  independently every minute. The selected run's frontier also reflects its
+  filters, claims, and parked work, so it can be empty with a large inventory.
+- **Run activity** includes historical dispatches, provider changes, accepted
+  functions, and supply transitions. The throughput chart uses original body
+  bytes from translation acceptances. The workspace coverage cards report
+  accepted C/legacy and lift-inclusive recovery separately.
+
+The farm writes `RUN/live.json` under ignored local analysis storage while it
+dispatches, ticks, and enters serial acceptance. Older runs show history or
+dispatch-to-result records. The detailed stage data starts the next time the
+updated farm runs. A stale signal keeps its last observations visibly marked
+with their timestamp.
+
+Expert sessions outside the farm can report their assignments at start and when
+switching tasks. Reuse the same ID to renew an assignment and finish it at
+handoff. Reports expire automatically after 30 minutes by default and appear
+across all runs. Use a short label with function IDs or a blocker family.
+
+```powershell
+py -3.13 scripts/cmre_farm_dashboard.py report fixture-worker --model gpt-6.2-sol --work "Author fixtures for x87-live-stack" --minutes 45
+py -3.13 scripts/cmre_farm_dashboard.py finish fixture-worker
+```
+
+The default role is `supply`. Use `--role coordinator` or
+`--role "defect review"` for those assignments. External sessions without a
+current report do not contribute to the reported count.
+
 ## Session rules (every orchestrating agent)
 
 The farm runs for the whole session and the agent works the supply lane beside

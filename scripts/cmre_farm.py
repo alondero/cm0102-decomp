@@ -637,6 +637,8 @@ class Farm:
         self.verifier = verifier or InlineExecutor()
         self.verifying = []        # (job, future)
         self.supply_empty = False
+        self.monitor = None        # enabled only by the live dispatcher
+        self.lease_waits = set()   # job numbers for the operator display
         # cmre lets only the claim owner run --source diagnostics on a claimed function;
         # the farm's re-tests and its workers (inherited env) test as this owner.
         os.environ['CMRE_CLAIM_OWNER'] = config.owner
@@ -938,6 +940,62 @@ class Farm:
         tmp.write_text(json.dumps(self.state, indent=1), encoding='utf-8')
         tmp.replace(self.state_path)
 
+    def observe(self, *, accepting=None, acceptance_queue=None):
+        """Publish operator telemetry without touching the scheduler or its journal."""
+        if self.monitor is None:
+            return
+        now, tick = time.time(), self.clock()
+
+        def row(job, stage, since=None):
+            return {key: job[key] for key in ('n', 'fn', 'kind', 'model', 'confirm', 'module', 'bytes')
+                    if key in job} | {'stage': stage, 'since': since}
+
+        jobs = [row(job, 'model', now - (tick - started)) for job, _, started in self.running]
+        jobs += [row(job, 'gate complete' if future.done() else 'gating' if future.running() else 'gate queue')
+                 for job, future in self.verifying]
+        queue = self.accept_queue if acceptance_queue is None else acceptance_queue
+        jobs += [row(job, 'awaiting writer' if job['n'] in self.lease_waits else 'accept queue') for job in queue]
+        if accepting is not None:
+            jobs.append(row(accepting, 'accepting', now))
+
+        frontier = [item for item in (self.frontier or []) if item.fn not in self.seen]
+        scan = self.last_scan
+        next_scan = None
+        if scan is not None and self.frontier is not None and (self.config.continuous or not self.frontier):
+            next_scan = now + scan - tick + self.config.rescan_seconds * (5 if self.frontier else 1)
+        accepted = self.state['accepted']
+        inputs = self.state.get('input_needed', {})
+        payload = {
+            'schema': 'cmre-farm-live/1', 'pid': os.getpid(), 'at': now, **self.monitor,
+            'stopping': self.stopping(),
+            'settings': {key: getattr(self.config, key) for key in CONTROL_KEYS},
+            'counts': {'accepted_functions': len(accepted), 'accepted_bytes': sum(a['bytes'] for a in accepted.values()),
+                       'parked': len(self.state['parked']), 'input_needed': len(inputs),
+                       'input_bytes': sum(a.get('bytes', 0) for a in inputs.values()),
+                       'defects': len(self.state['defects']), 'quarantined': len(self.state.get('quarantined', {}))},
+            'scheduler': {
+                'frontier': len(frontier) if self.frontier is not None else None,
+                'frontier_bytes': sum(item.bytes for item in frontier) if self.frontier is not None else None,
+                'pending': len(self.pending), 'audit_queue': len(self.audit_queue),
+                'last_scan': now - (tick - scan) if scan is not None else None,
+                'next_scan': next_scan, 'deadline': self.state.get('deadline_at'),
+                'supply_empty_since': self.state.get('supply_empty_since') if self.supply_empty else None,
+                'unavailable': sorted(self.state['unavailable_models']),
+                'limited': {p: data['until'] for p, data in self.state['limited_providers'].items()
+                            if data['until'] > now},
+                'translation_model': self._rung_model(0)[0],
+                'audit_model': self._audit_model(self.config.audit_model) if self.config.audit_model else None,
+            },
+            'jobs': jobs,
+        }
+        path = self.run_dir / 'live.json'
+        tmp = path.with_suffix('.tmp')
+        try:
+            tmp.write_text(json.dumps(payload), encoding='utf-8')
+            tmp.replace(path)
+        except OSError:
+            pass  # Sharing violations or telemetry I/O must never stop recovery.
+
     def stopping(self):
         return (self.run_dir / 'STOP').exists() or (self.deadline is not None and self.clock() >= self.deadline)
 
@@ -1231,7 +1289,9 @@ class Farm:
             self._register_dispatch(job)
         handle = launcher.start(job, prompt, worker_config(self.root, job))
         self.running.append((job, handle, self.clock()))
-        self._event('dispatch', fn=job['fn'], kind=job['kind'], model=job['model'], n=job['n'])
+        self._event('dispatch', fn=job['fn'], kind=job['kind'], model=job['model'], n=job['n'],
+                    confirm=bool(job.get('confirm')), bytes=job.get('bytes'))
+        self.observe()
         self.save()  # large first dispatch must not look dead to the event monitor
         return True
 
@@ -1834,7 +1894,7 @@ class Farm:
 
     def _accept(self):
         waiting = []
-        for job in self.accept_queue:
+        for index, job in enumerate(self.accept_queue):
             fn = job['fn']
             detail = self._fix_evidence_error(job)
             if detail:
@@ -1875,10 +1935,12 @@ class Farm:
                 self._fail(job, f'Farm acceptance evidence unavailable: {exc}')
                 continue
             self._transaction(job, 'accepting')
+            self.observe(accepting=job, acceptance_queue=[*waiting, *self.accept_queue[index + 1:]])
             code, output = self.cmre.accept(fn, request=request)
             if code == 2:
                 self._transaction(job, 'waiting-lease', acceptance_result={'code': code, 'output': output})
                 waiting.append(job)   # another writer holds the lease; try next tick
+                self.lease_waits.add(job['n'])
                 continue
             if code == 3:
                 self._fail(job, f'Farm acceptance refused before ledger write: {output[-600:]}')
@@ -1903,6 +1965,7 @@ class Farm:
             self._transaction(job, 'accepted', acceptance_result={'code': code, 'output': output})
             self._accepted(job)
         self.accept_queue = waiting
+        self.lease_waits.intersection_update(job['n'] for job in waiting)
 
     def _accepted(self, job):
         fn = job['fn']
@@ -2006,12 +2069,15 @@ class Farm:
         self._requests()  # admit requests unblocked by acceptance before deciding the run drained
         self._dispatch()
         self.save()
+        self.observe()
 
-    def run(self, poll=10.0):
+    def run(self, poll=10.0, verifier_slots=1):
         self.save()
         self._event('farm-start', pid=os.getpid(), workers=self.config.workers,
                     audit_workers=self.config.audit_workers, ladder=self.config.ladder,
                     continuous=self.config.continuous)
+        self.monitor = {'poll_seconds': poll, 'verifier_slots': verifier_slots}
+        self.observe()
         try:
             while True:
                 self.tick()
@@ -2019,6 +2085,7 @@ class Farm:
                     break
                 time.sleep(poll)
         finally:
+            self.monitor = None
             self.cmre.release(self.config.owner, None)
             self.save()
             self._event('farm-exit', status=status_line(self.summary()))
@@ -3087,7 +3154,7 @@ def main(argv=None):
         (run_dir / 'farm.pid').write_text(f'{os.getpid()}\n', encoding='utf-8')
         f = Farm(run_dir, ROOT, CmreAdapter(),
                  make_launcher(a.opencode, ROOT, run_dir), config, verifier=verifier)
-        f.run(poll=a.poll)
+        f.run(poll=a.poll, verifier_slots=max(1, a.verify_threads))
     print(status_line(f.summary()))
     return 0
 
