@@ -6,21 +6,22 @@ import uuid
 import pytest
 
 from cmre.import_observe import MemoryRead
+from cmre.file_time_observe import output_span
 from native_crt_import_results import (
     ROOT, NativeCrtResultsProfile, Unavailable, build_native_crt_results, classify_output,
-    observe_native_crt_results, output_ranges, verify_caller,
+    observe_native_crt_results, verify_caller,
 )
 
 
 def test_fixed_ranges_do_not_follow_native_handles_or_unknown_prototypes():
-    assert output_ranges("FindFirstFileA", [0x1000, 0x2000]) == ((0x2000, 320),)
-    assert output_ranges("FindNextFileA", [0xffffffff, 0x2000]) == ((0x2000, 320),)
-    assert output_ranges("FileTimeToLocalFileTime", [0x1000, 0x2000]) == ((0x2000, 8),)
-    assert output_ranges("FileTimeToSystemTime", [0x1000, 0x2000]) == ((0x2000, 16),)
+    assert output_span("FindFirstFileA", [0x1000, 0x2000]) == (0x2000, 320)
+    assert output_span("FindNextFileA", [0xffffffff, 0x2000]) == (0x2000, 320)
+    assert output_span("FileTimeToLocalFileTime", [0x1000, 0x2000]) == (0x2000, 8)
+    assert output_span("FileTimeToSystemTime", [0x1000, 0x2000]) == (0x2000, 16)
     for name, args in [("Other", [1, 2]), ("FindNextFileA", [1]),
                        ("FindNextFileA", [1, 0]), ("FindNextFileA", [1, 0xffffff00])]:
         with pytest.raises(ValueError):
-            output_ranges(name, args)
+            output_span(name, args)
 
 
 def test_find_success_does_not_define_padding_reserved_or_filename_tail():

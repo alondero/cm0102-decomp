@@ -151,6 +151,98 @@ def test_heap_cap_keeps_requested_size_and_null_does_not_read():
             assert not any(purpose == "HeapAlloc.buffer" for _, _, purpose in io.reads)
 
 
+@pytest.mark.parametrize("name,size,result", [
+    ("FindFirstFileA", 320, 51), ("FindNextFileA", 320, 1),
+    ("FileTimeToLocalFileTime", 8, 1), ("FileTimeToSystemTime", 16, 1),
+])
+def test_crt_output_observation_retains_exact_32_bit_storage(name, size, result):
+    obs, io = adapter("KERNEL32.dll!" + name)
+    generation = scope(obs)
+    before = b"\xa5" * size
+    after = bytearray(before)
+    expected_ranges = [[0, size]]
+    if name.startswith("Find"):
+        after[44:50] = b"a.bin\0"
+        expected_ranges = [[0, 36], [44, 50]]
+    else:
+        after[0] = 0x35
+    io.prepare([0x7000, 0x5000])
+    io.put(0x7000, b"b*.bin\0\x90")
+    io.put(0x5000, before)
+    keywords = {"find_pattern_size": 7} if name == "FindFirstFileA" else {}
+    assert obs.import_entry(10, generation, snapshot(), iat_slot=SLOT, **keywords) == 1
+    io.put(0x5000, after)
+    assert obs.return_hit(10, generation, SITE, snapshot(SITE, SP + 16, result)) is None
+    assert (0x5000, size, name + ".output-after") not in io.reads
+    assert obs.return_hit(10, generation, SITE, snapshot(SITE, SP + 12, result)) == 1
+    record = obs.report()["invocations"][0]
+    assert record["state"] == "returned-incomplete"
+    assert record["return"]["registers"]["eax"] == result
+    assert record["output_classification"]["defined_ranges"] == expected_ranges
+    assert record["output_classification"]["before_hex"] == before.hex()
+    assert record["output_classification"]["after_hex"] == after.hex()
+    assert record["replayable"] is False
+    record["output_classification"]["defined_ranges"].clear()
+    assert obs.report()["invocations"][0]["output_classification"]["defined_ranges"] == expected_ranges
+    assert (0x5000, size, name + ".output-before") in io.reads
+    assert (0x5000, size, name + ".output-after") in io.reads
+    if name.startswith("FileTime"):
+        assert (0x7000, 8, name + ".input") in io.reads
+    if name == "FindFirstFileA":
+        assert (0x7000, 7, name + ".input") in io.reads
+    if name == "FindNextFileA":
+        assert not any(address == 0x7000 for address, _, _ in io.reads)
+
+
+@pytest.mark.parametrize("failure", ["api-failure", "partial", "invalid-range"])
+def test_findnext_invalid_or_failed_output_cannot_be_reported_as_defined(failure):
+    name = "FindNextFileA"
+    obs, io = adapter("KERNEL32.dll!" + name)
+    generation = scope(obs)
+    address = 0xffffff00 if failure == "invalid-range" else 0x5000
+    io.prepare([17, address])
+    if failure != "invalid-range":
+        io.put(address, b"\xa5" * (19 if failure == "partial" else 320))
+    obs.import_entry(10, generation, snapshot(), iat_slot=SLOT)
+    obs.return_hit(10, generation, SITE, snapshot(SITE, SP + 12, int(failure != "api-failure")))
+    record = obs.report()["invocations"][0]
+    if failure == "api-failure":
+        assert record["output_classification"]["defined_ranges"] == []
+        assert "undefined-failure-output-storage" in record["gaps"]
+    elif failure == "partial":
+        assert record["output_classification"] is None
+        assert record["return"]["memory"][0]["data_hex"] == (b"\xa5" * 19).hex()
+    else:
+        assert record["output_classification"] is None
+        assert "invalid-output-range" in record["gaps"]
+        assert not any(read[0] == address for read in io.reads)
+    assert record["state"] == "returned-incomplete"
+
+
+def test_findfirst_does_not_probe_unbounded_pattern():
+    obs, io = adapter("KERNEL32.dll!FindFirstFileA")
+    generation = scope(obs)
+    io.prepare([0x7000, 0x5000])
+    io.put(0x5000, b"x" * 320)
+    obs.import_entry(10, generation, snapshot(), iat_slot=SLOT)
+    obs.return_hit(10, generation, SITE, snapshot(SITE, SP + 12, 0xffffffff))
+    record = obs.report()["invocations"][0]
+    assert "search-pattern-bound-unproven" in record["gaps"]
+    assert not any(address == 0x7000 for address, _, _ in io.reads)
+
+
+def test_findfirst_marks_a_bound_that_includes_bytes_after_the_terminator():
+    obs, io = adapter("KERNEL32.dll!FindFirstFileA")
+    generation = scope(obs)
+    io.prepare([0x7000, 0x5000])
+    io.put(0x7000, b"a\0x")
+    io.put(0x5000, b"x" * 320)
+    obs.import_entry(10, generation, snapshot(), iat_slot=SLOT, find_pattern_size=3)
+    obs.return_hit(10, generation, SITE, snapshot(SITE, SP + 12, 0xffffffff))
+    record = obs.report()["invocations"][0]
+    assert "search-pattern-bound-does-not-match-terminator" in record["gaps"]
+
+
 @pytest.mark.parametrize("fault", ["no-scope", "stale", "call", "iat", "word", "disabled"])
 def test_unverified_or_unscoped_import_cannot_arm_return_breakpoint(fault):
     obs, io = adapter(enabled=fault != "disabled")
