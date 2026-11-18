@@ -279,8 +279,12 @@ Coordinator procedure:
    candidate in `RUN/src/`, and lists it with `py -3.13 scripts/cmre_farm.py
    inputs RUN`. When that function's canonical hints change, the farm re-gates
    the retained candidate without a model call (`input-arrived`, `recheck`) and
-   accepts it on a pass. `retry RUN fn_X --reason "<what changed>"` returns any
-   other parked function to the queue, for example after a harness release.
+   accepts it on a pass. Rechecks can run while all model providers are
+   unavailable and stay eligible across restarts and temporary claim conflicts.
+   A differential mismatch on the new corpus starts at the first available
+   model rung. `retry RUN fn_X --reason "<what changed>"` requests a fresh
+   gate for an input-bound candidate or queues a translation for other parked
+   functions, for example after a harness release.
 
    Options: `--include-held` also takes held functions (each prompt carries
    the hold reason; the audit checks it). `--min-bytes/--max-bytes` bound the

@@ -663,6 +663,7 @@ class Farm:
         self.frontier = None
         self.last_scan = None      # clock() of the last frontier fetch
         self.last_input_check = None
+        self.recheck_ready = set()  # parked work stays durable until its verification finishes
         self.retried = {}          # fn -> parked record of a function returned to the queue
         self.state['deadline_at'] = None if config.hours is None else time.time() + config.hours * 3600
         self.seen = set(self.state['accepted']) | set(self.state['parked']) | set(self.state['skipped'])
@@ -1052,7 +1053,7 @@ class Farm:
         by_model = {}
         for rows in self.state['attempts'].values():
             for row in rows:
-                if row.get('kind') == 'audit':   # verdicts are not translation attempts
+                if row.get('kind') == 'audit' or row.get('recheck'):
                     continue
                 m = by_model.setdefault(row['model'], {'attempts': 0, 'passes': 0})
                 m['attempts'] += 1
@@ -1092,27 +1093,36 @@ class Farm:
             return age >= self.config.rescan_seconds
         return self.config.continuous and age >= 5 * self.config.rescan_seconds
 
-    def _next_item(self):
+    def _next_item(self, *, recheck_only=False):
         include_held = self.config.include_held
         if self._scan_due():
             self.last_scan = self.clock()
             items = self.cmre.frontier(FRONTIER_LIMIT, self.config.min_bytes, self.config.max_bytes,
                                        include_held, self.config.owner)
-            items = [i for i in items if i.fn not in self.seen and not _skipped(i.fn, self.config.skip_ranges)]
+            items = [i for i in items if (i.fn not in self.seen or i.fn in self.recheck_ready)
+                     and not _skipped(i.fn, self.config.skip_ranges)]
             held = self.cmre.held([i.fn for i in items]) if include_held else set()
-            # Bytes are the goal: unheld first, then callee-ready, then largest.
-            self.frontier = sorted(items, key=lambda i: (i.fn in held, not i.ready, -i.bytes, i.fn))
+            # Reuse retained work first, then prefer unheld, callee-ready, larger items.
+            self.frontier = sorted(items, key=lambda i: (i.fn not in self.recheck_ready,
+                                                        i.fn in held, not i.ready, -i.bytes, i.fn))
         while self.frontier:
+            if recheck_only and self.frontier[0].fn not in self.recheck_ready:
+                return None
             item = self.frontier.pop(0)
-            if item.fn in self.seen:
+            recheck = item.fn in self.recheck_ready
+            if (item.fn in self.seen and not recheck) or self._writer_busy(item.fn):
                 continue
             self.seen.add(item.fn)
             try:
                 self.cmre.claim(item.fn, self.config.owner, max(self.config.hours or 24, 1),
                                 include_held=include_held)
             except ValueError as exc:
-                self.state['skipped'][item.fn] = str(exc)[:300]
-                self._event('skipped', fn=item.fn, reason=str(exc)[:300])
+                if recheck:
+                    # Keep the parked record discoverable across rescans and restarts.
+                    self._event('recheck-deferred', fn=item.fn, reason=str(exc)[:300])
+                else:
+                    self.state['skipped'][item.fn] = str(exc)[:300]
+                    self._event('skipped', fn=item.fn, reason=str(exc)[:300])
                 continue
             return item
         return None
@@ -1317,12 +1327,14 @@ class Farm:
         if self.launcher is None or self.stopping():
             return
         translators = [j for j, _, _ in self.running if j['kind'] != 'audit']
+        translators.extend(job for job, _ in self.verifying if job.get('_recheck'))
         while len(translators) < self.config.workers:
             job = self._next_pending()
             if job is None:
-                if self._rung_model(0)[0] is None:
+                model, rung = self._rung_model(0)
+                if model is None and not self.recheck_ready:
                     break
-                item = self._next_item()
+                item = self._next_item(recheck_only=model is None)
                 if item is None:
                     if not self.supply_empty and not self.pending:
                         self.supply_empty = True
@@ -1336,22 +1348,11 @@ class Farm:
                     self._event('supply-resumed', fn=item.fn,
                                 dry_minutes=round((time.time() - since) / 60, 1) if since else None)
                 hold = self.cmre.hold(item.fn) if self.config.include_held else None
-                model, rung = self._rung_model(0)
                 job = self._new_job('translate', item.fn, model, rung, bytes=item.bytes,
                                     module=item.module, hold=hold)
-                retained = self.state.get('input_needed', {}).get(item.fn)
-                if retained and Path(retained['source']) == Path(job['source']) and Path(job['source']).exists():
-                    # Its inputs changed since it parked: gate the candidate the farm already
-                    # paid for before spending another model attempt on the function.
-                    job.update(model=retained['model'], _recheck=True)
-                    job['_snap'] = {
-                        'c': _read(self.root / 'recovery/c' / f'{item.fn}.c'),
-                        'hint': _read(self.root / 'recovery/hints' / f'{item.fn}.json')}
-                    self._event('recheck', fn=item.fn, n=job['n'], coverage_was=retained.get('coverage'))
-                    self._register_dispatch(job)
-                    self.save()
-                    self._verify(job, False)
-                    translators.append(job)
+                if item.fn in self.recheck_ready:
+                    if self._start_recheck(job):
+                        translators.append(job)
                     continue
                 previous, candidate = self.retried.pop(item.fn, None), _read(Path(job['source']))
                 if previous and candidate is not None:
@@ -1414,16 +1415,20 @@ class Farm:
 
     # -- results
     def _record(self, job, outcome, detail):
+        recheck = {'recheck': True} if job.get('_recheck') else {}
         self.state['attempts'].setdefault(job['fn'], []).append(
-            {'model': job['model'], 'kind': job['kind'], 'outcome': outcome, 'detail': detail[:600], 'at': time.time()})
+            {'model': job['model'], 'kind': job['kind'], 'outcome': outcome,
+             'detail': detail[:600], 'at': time.time(), **recheck})
         self._event('result', fn=job['fn'], kind=job['kind'], model=job['model'], n=job['n'],
-                    outcome=outcome, detail=detail[:300])
+                    outcome=outcome, detail=detail[:300], **recheck)
 
     def _fail(self, job, detail):
         safe = self._rollback(job) if '_transaction' in job else True
         self._terminal(job, 'failed' if safe else 'conflict')
         self._record(job, 'fail', detail)
         fn = job['fn']
+        if job['kind'] == 'translate':
+            self.state.get('input_needed', {}).pop(fn, None)
         if job.get('_hint_evidence_needed'):
             self.state.setdefault('hint_proposals', {})[fn] = job['_hint_evidence_needed']
             self._event('hint-evidence-needed', fn=fn, n=job['n'], **job['_hint_evidence_needed'])
@@ -1451,14 +1456,15 @@ class Farm:
             # The candidate ran without a mismatch; the test inputs do not reach enough of the
             # function. A stronger model cannot change that, so the next rung is not spent: the
             # candidate stays in RUN/src and the supply lane owns the missing inputs.
+            tested = self._transaction(job)['identity']
             self.state.setdefault('input_needed', {})[fn] = {
                 'bytes': job.get('bytes', 0), 'coverage': job['_input_bound'], 'source': job['source'],
                 'model': job['model'], 'at': time.time(),
-                'hints_sha256': _identity(self._inputs(fn))['hint']}
+                'hints_sha256': tested['hint'], 'source_sha256': tested['c']}
             self._event('input-needed', fn=fn, coverage=job['_input_bound'], bytes=job.get('bytes', 0), n=job['n'])
             self._park(fn, detail)
             return
-        model, rung = self._rung_model(job['rung'] + 1)
+        model, rung = self._rung_model(0 if job.get('_recheck') else job['rung'] + 1)
         if model is not None and not self.stopping():
             source = Path(job['source'])
             prior_source = source.read_bytes() if source.exists() else None
@@ -1467,6 +1473,7 @@ class Farm:
                                 prior={'model': job['model'], 'detail': detail})
             nxt['_seed'] = prior_source
             self.pending.append(nxt)
+            self.state['parked'].pop(fn, None)
         else:
             self._park(fn, detail)
 
@@ -1480,18 +1487,50 @@ class Farm:
         self._event(event_name, fn=fn, **data)
 
     def _input_arrivals(self):
-        """A parked candidate that failed on inputs alone goes back in the queue when its canonical
-        hints change, so supply work reaches acceptance without an operator or a restart."""
+        """Prioritize rechecking parked candidates when their tested input identity changes."""
         now = self.clock()
         if self.last_input_check is not None and now - self.last_input_check < self.config.rescan_seconds:
             return
         self.last_input_check = now
+        ready = set()
         for fn, row in self.state.get('input_needed', {}).items():
-            if fn not in self.state['parked']:
+            if fn in self.state['accepted'] or self._writer_busy(fn):
                 continue
-            current = _identity(self._inputs(fn))['hint']
-            if current != row.get('hints_sha256'):
-                self._unpark(fn, 'input-arrived', hints_sha256=current)
+            hint = _read(self.root / 'recovery/hints' / f'{fn}.json')
+            current = _identity({'hint': hint})['hint']
+            if current == row.get('hints_sha256') and not row.get('retry_requested'):
+                continue
+            ready.add(fn)
+            if fn not in self.recheck_ready:
+                self._event('input-arrived', fn=fn, hints_sha256=current)
+        if ready:
+            self.frontier, self.last_scan = None, None
+        self.recheck_ready = ready
+
+    def _start_recheck(self, job):
+        fn = job['fn']
+        self.recheck_ready.discard(fn)
+        row = self.state['input_needed'][fn]
+        snap = self._inputs(fn)
+        if _identity(snap)['hint'] == row.get('hints_sha256') and not row.get('retry_requested'):
+            self._park(fn, 'hints returned to the previously tested identity')
+            return False
+        source = Path(job['source']).resolve()
+        retained = (self.root / row['source']).resolve()
+        candidate = _read(source) if retained == source and source.is_relative_to(self.run_dir.resolve()) else None
+        digest = _identity({'c': candidate})['c']
+        if candidate is None or row.get('source_sha256', digest) != digest:
+            self.state['input_needed'].pop(fn)
+            detail = 'retained candidate missing or changed; explicit retry required'
+            self._event('recheck-refused', fn=fn, reason=detail)
+            self._park(fn, detail)
+            return False
+        job.update(model=row['model'], _recheck=True, _snap=snap, expected_source_sha256=digest)
+        self._event('recheck', fn=fn, n=job['n'], coverage_was=row.get('coverage'))
+        self._register_dispatch(job)
+        self.save()
+        self._verify(job, False)
+        return True
 
     def _park(self, fn, detail):
         self.seen.add(fn)
@@ -1602,6 +1641,9 @@ class Farm:
         if report.get('status') != 'pass':
             coverage = input_bound(report)
             if coverage is not None and job['kind'] == 'translate':
+                tested = {'c': _read(source), 'hint': self._inputs(fn)['hint']}
+                if tested['c'] != text_bytes or _identity(tested) != self._transaction(job)['identity']:
+                    return 'candidate inputs changed during verification'
                 job['_input_bound'] = coverage
                 return 'input-bound: ' + report_detail(report)
             return report_detail(report)
@@ -1969,6 +2011,7 @@ class Farm:
 
     def _accepted(self, job):
         fn = job['fn']
+        self.state['parked'].pop(fn, None)
         if self.state['accepted'].get(fn, {}).get('transaction_n') != job['n']:
             self._record(job, 'pass', 'accepted')
             was_held = bool(job.get('hold')) or bool(self.state['accepted'].get(fn, {}).get('was_held'))
@@ -2014,7 +2057,14 @@ class Farm:
                 continue
             if request.get('kind') == 'retry':
                 if fn in self.state['parked'] and fn not in self.state.get('quarantined', {}):
-                    self._unpark(fn, 'retry', reason=request.get('reason', '')[:300])
+                    reason = request.get('reason', '')[:300]
+                    retained = self.state.get('input_needed', {}).get(fn)
+                    if retained is None:
+                        self._unpark(fn, 'retry', reason=reason)
+                    else:
+                        retained['retry_requested'] = True
+                        self.last_input_check = None
+                        self._event('retry', fn=fn, reason=reason)
                     self.save()
                 path.unlink(missing_ok=True)
                 continue
@@ -2061,12 +2111,12 @@ class Farm:
 
     def tick(self):
         self._control()
-        self._input_arrivals()
         self._reap()
         self._requests()
         self._collect()
         self._accept()
         self._requests()  # admit requests unblocked by acceptance before deciding the run drained
+        self._input_arrivals()
         self._dispatch()
         self.save()
         self.observe()
@@ -2477,7 +2527,7 @@ def reclassify(run_dir, root=ROOT, cmre=None, threads=8):
     """Re-gate the candidates a stopped run retains for its parked functions: counts by class.
 
     An input-bound candidate is registered so the farm re-gates it when its hints change; one
-    that passes now is registered with no hints identity, so the next farm tick re-gates and
+    that passes now gets a recheck request, so the next farm tick re-gates and
     accepts it through the normal transaction. Nothing is unparked, installed or accepted here."""
     from concurrent.futures import ThreadPoolExecutor
     run_dir, root = Path(run_dir), Path(root)
@@ -2498,14 +2548,20 @@ def reclassify(run_dir, root=ROOT, cmre=None, threads=8):
                 counts['no-candidate'] += 1
 
         def gate(entry):
+            fn, source = entry
+            hint = root / 'recovery/hints' / f'{fn}.json'
             try:
-                return cmre.test(entry[0], str(entry[1]))
+                identity = _identity({'c': _read(source), 'hint': _read(hint)})
+                report = cmre.test(fn, str(source))
+                if identity != _identity({'c': _read(source), 'hint': _read(hint)}):
+                    return {'status': 'error', 'problems': ['inputs changed during reclassification']}, None
+                return report, identity
             except Exception as exc:   # one slow or broken candidate must not lose the others
-                return {'status': 'error', 'problems': [str(exc)[:200]]}
+                return {'status': 'error', 'problems': [str(exc)[:200]]}, None
 
         with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
             reports = list(pool.map(gate, todo))
-        for (fn, source), report in zip(todo, reports):
+        for (fn, source), (report, identity) in zip(todo, reports):
             coverage = input_bound(report)
             passes = report.get('status') == 'pass'
             if coverage is None and not passes:
@@ -2514,10 +2570,11 @@ def reclassify(run_dir, root=ROOT, cmre=None, threads=8):
                 continue
             counts['passes-now' if passes else 'input-bound'] += 1
             models = state['parked'][fn].get('models') or ['hand']
-            hints = _read(root / 'recovery/hints' / f'{fn}.json')
             known[fn] = {'bytes': sizes.get(fn, 0), 'coverage': coverage, 'source': str(source),
                          'model': models[-1], 'at': time.time(),
-                         'hints_sha256': 'regate-requested' if passes else _identity({'hint': hints})['hint']}
+                         'hints_sha256': identity['hint'], 'source_sha256': identity['c']}
+            if passes:
+                known[fn]['retry_requested'] = True
         tmp = (run_dir / 'state.json').with_suffix('.tmp')
         tmp.write_text(json.dumps(state, indent=1), encoding='utf-8')
         tmp.replace(run_dir / 'state.json')

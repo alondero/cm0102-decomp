@@ -3340,6 +3340,74 @@ def test_unchanged_inputs_leave_an_input_bound_candidate_parked(root):
     assert cmre.accepted == [] and len(cmre.tests) == tests and len(launcher.started) == 1
 
 
+def test_resumed_recheck_resolves_legacy_relative_source(root, monkeypatch):
+    f, cmre, launcher = park_input_bound(root)
+    fn = 'fn_00401000'
+    row = f.state['input_needed'][fn]
+    row['source'] = str(Path(row['source']).relative_to(root))
+    row.pop('source_sha256', None)  # historical state
+    f.save()
+    monkeypatch.chdir(root.parent)
+    (root / f'recovery/hints/{fn}.json').write_text('{"arg_count": 1, "fixtures": [{}]}')
+    resumed = farm.Farm(f.run_dir, root, cmre, launcher, f.config, clock=f.clock)
+    drain(resumed)
+    assert cmre.accepted == [fn]
+    assert len(launcher.started) == 1
+    assert fn not in resumed.state['parked']
+
+
+def test_new_inputs_regate_while_every_model_is_unavailable(root):
+    f, cmre, launcher = park_input_bound(root)
+    fn = 'fn_00401000'
+    f.state['unavailable_models'].update(dict.fromkeys(f.config.ladder, 'unavailable'))
+    (root / f'recovery/hints/{fn}.json').write_text('{"arg_count": 1, "fixtures": [{}]}')
+    drain(f)
+    assert cmre.accepted == [fn]
+    assert len(launcher.started) == 1
+
+
+def test_recheck_claim_contention_survives_restart(root):
+    f, cmre, launcher = park_input_bound(root)
+    fn = 'fn_00401000'
+    claim = cmre.claim
+    def claimed_elsewhere(*args, **kwargs):
+        raise ValueError('claimed by another worker')
+    cmre.claim = claimed_elsewhere
+    (root / f'recovery/hints/{fn}.json').write_text('{"arg_count": 1, "fixtures": [{}]}')
+    f.tick()
+    assert fn in f.state['parked']
+    assert cmre.accepted == []
+    cmre.claim = claim
+    resumed = farm.Farm(f.run_dir, root, cmre, launcher, f.config, clock=f.clock)
+    drain(resumed)
+    assert cmre.accepted == [fn]
+    assert len(launcher.started) == 1
+
+
+def test_changed_retained_source_requires_explicit_retry(root):
+    f, cmre, launcher = park_input_bound(root)
+    fn = 'fn_00401000'
+    path = Path(f.state['input_needed'][fn]['source'])
+    path.write_bytes(path.read_bytes() + b'\n/* drift */\n')
+    (root / f'recovery/hints/{fn}.json').write_text('{"arg_count": 1, "fixtures": [{}]}')
+    drain(f)
+    assert cmre.accepted == []
+    assert len(launcher.started) == 1
+    assert 'retained candidate' in f.state['parked'][fn]['detail']
+
+
+def test_recheck_mismatch_starts_with_cheapest_rung_and_is_not_rechecked_again(root):
+    f, cmre, launcher = park_input_bound(root)
+    fn = 'fn_00401000'
+    cmre.test = lambda fn, source=None: {'status': 'fail', 'problems': ['mismatch']}
+    launcher.behaviour = writes(lambda job: f'u32 cm_fn_00401000(u32 a) {{ return a + {job["n"]}; }}\n')
+    (root / f'recovery/hints/{fn}.json').write_text('{"arg_count": 1, "fixtures": [{}]}')
+    drain(f)
+    assert [job['model'] for job, _, _ in launcher.started] == ['m/cheap', 'm/cheap', 'm/strong']
+    assert [e['fn'] for e in events(f.run_dir) if e['event'] == 'recheck'] == [fn]
+    assert fn in f.state['parked']
+
+
 def test_new_inputs_that_still_fall_short_park_again_without_looping(root):
     f, cmre, launcher = park_input_bound(root)
     cmre.test = lambda fn, source=None: input_bound_report()
