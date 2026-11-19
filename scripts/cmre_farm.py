@@ -1050,18 +1050,20 @@ class Farm:
         return (self.run_dir / 'STOP').exists() or (self.deadline is not None and self.clock() >= self.deadline)
 
     def finished(self):
-        return self.stopping() and not self.running and not self.accept_queue and not self.verifying
+        return (self.stopping() and not self.running and not self.accept_queue
+                and not self.verifying and self.lift_proc is None)
 
     def drained(self):
         """The run is over. A continuous farm ends only on STOP or its deadline: with no supply
-        it idles and rescans, so work that arrives later starts without a restart."""
+        it idles and rescans, so work that arrives later starts without a restart.
+        Both modes wait for an active lift pass to finish and report its result."""
         if self.finished():
             return True
         if self.config.continuous:
             return False
         supply_done = self.frontier == [] or self.config.workers == 0
         return (not self.running and not self.pending and not self.accept_queue
-                and not self.verifying and not self.audit_queue and supply_done)
+                and not self.verifying and not self.audit_queue and self.lift_proc is None and supply_done)
 
     # -- live control
     def _control(self):
