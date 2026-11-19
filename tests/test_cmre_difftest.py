@@ -124,3 +124,83 @@ def test_arena_templates_are_process_constants():
     first = difftest.arena_templates()
     assert difftest.arena_templates() is first  # generated once per process, from a fixed seed
     assert len(first) == difftest.ARENA_TEMPLATES
+
+
+def _slow_faithful(tmp_path, delay):
+    """The faithful lift with `delay` NOPs at entry: same behaviour, more instructions."""
+    lifted = lift.discover(LEAP)
+    text = lift.render(lifted)
+    entry = f"{lifted.symbol}:\n"
+    assert entry in text
+    src = tmp_path / "slow.S"
+    src.write_text(text.replace(entry, entry + "    nop\n" * delay, 1), encoding="utf-8")
+    return lifted, build.build(src, lifted.symbol, tmp_path)
+
+
+@pytest.mark.parametrize("profile", ["abi", "semantic"])
+def test_slower_faithful_candidate_gets_a_bounded_extension(tmp_path, profile):
+    # ADR 0012: C that needs more steps than the shared budget, on a case the original
+    # finished, is re-run once with RECOVERED_BUDGET_FACTOR times the budget and compared.
+    lifted, built = _slow_faithful(tmp_path, 300)
+    opts = difftest.Options.for_function(LEAP, {"cases": 4, "budget": 64})
+    assert 300 < 64 * difftest.RECOVERED_BUDGET_FACTOR
+    result = difftest.run(LEAP, (lifted.va, lifted.region_end), set(lifted.insns), built, {}, opts, profile)
+    assert result["mismatches"] == [] and result["inconclusive"] == 0
+    assert result["recovered_budget_extended"] == 4
+    assert result["recovered_budget_factor"] == difftest.RECOVERED_BUDGET_FACTOR
+
+
+@pytest.mark.parametrize("profile", ["abi", "semantic"])
+def test_extension_is_bounded_and_still_catches_a_slow_candidate(tmp_path, profile):
+    lifted, built = _slow_faithful(tmp_path, 64 * difftest.RECOVERED_BUDGET_FACTOR + 50)
+    opts = difftest.Options.for_function(LEAP, {"cases": 2, "budget": 64})
+    result = difftest.run(LEAP, (lifted.va, lifted.region_end), set(lifted.insns), built, {}, opts, profile)
+    assert result["mismatches"] and result["mismatches"][0]["kind"] == "budget-asymmetry"
+    assert result["mismatches"][0]["recovered_budget"] == 64 * difftest.RECOVERED_BUDGET_FACTOR
+
+
+def test_explain_uses_the_same_extension(tmp_path):
+    lifted, built = _slow_faithful(tmp_path, 300)
+    opts = difftest.Options.for_function(LEAP, {"cases": 4, "budget": 64})
+    out = difftest.explain(LEAP, (lifted.va, lifted.region_end), set(lifted.insns), built, {}, opts,
+                           "semantic", case_index=1)
+    assert out["recovered"]["outcome"] == "return"
+    assert out["recovered"]["budget_extended"] is True
+
+
+@pytest.mark.parametrize("profile", ["abi", "semantic"])
+def test_a_failed_extension_is_not_repeated_on_later_cases(tmp_path, profile):
+    # Review of ADR 0012: re-running every case of a never-finishing candidate at 20x made it
+    # ~10x slower to fail. One extended run that still exhausts settles it for the function.
+    lifted = lift.discover(LEAP)
+    src = tmp_path / "loop.S"
+    src.write_text(f".intel_syntax noprefix\n.text\n.globl {lifted.symbol}\n"
+                   f"{lifted.symbol}:\n jmp {lifted.symbol}\n", encoding="utf-8")
+    built = build.build(src, lifted.symbol, tmp_path)
+    opts = difftest.Options.for_function(LEAP, {"cases": 6, "budget": 128})
+    result = difftest.run(LEAP, (lifted.va, lifted.region_end), set(lifted.insns), built, {}, opts, profile)
+    assert result["mismatches"][0]["kind"] == "budget-asymmetry"
+    assert result["recovered_budget_extended"] == 1 and result["inconclusive"] == 6
+
+
+@pytest.mark.parametrize("profile", ["abi", "semantic"])
+def test_mutual_exhaustion_is_not_extended(tmp_path, profile):
+    lifted, built = _slow_faithful(tmp_path, 300)
+    opts = difftest.Options.for_function(LEAP, {"cases": 4, "budget": 1})
+    result = difftest.run(LEAP, (lifted.va, lifted.region_end), set(lifted.insns), built, {}, opts, profile)
+    assert result["inconclusive"] == 4 and "recovered_budget_extended" not in result
+
+
+def test_extended_runs_compare_memory_and_imports_like_fresh_runs(tmp_path):
+    # A caller with imports and memory effects: a re-run on the same machine must start clean.
+    lifted = lift.discover(CALLER)
+    text = lift.render(lifted)
+    entry = f"{lifted.symbol}:\n"
+    src = tmp_path / "slow_caller.S"
+    src.write_text(text.replace(entry, entry + "    nop\n" * 2000, 1), encoding="utf-8")
+    built = build.build(src, lifted.symbol, tmp_path)
+    opts = difftest.Options.for_function(CALLER, {"cases": 60, "budget": 1500})
+    result = difftest.run(CALLER, (lifted.va, lifted.region_end), set(lifted.insns), built,
+                          recover._call_returns(lifted, built), opts, "semantic")
+    assert result["mismatches"] == []
+    assert result.get("recovered_budget_extended", 0) > 0 and result["import_calls"] > 0

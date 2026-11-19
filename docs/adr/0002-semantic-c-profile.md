@@ -66,6 +66,9 @@ Investigate or increase the budget for both sides with retained evidence. Mutual
 exhaustion remains inconclusive under the existing aggregate acceptance limit.
 The change has real-runner regression tests for a nonterminating candidate and
 faithful candidates at both sufficient and insufficient budgets.
+Since 2026-11-19 ([ADR 0012](0012-bounded-recovered-budget-extension.md)) a
+C-only exhaustion first re-runs that C case at 20 times the budget; only C
+that still has not finished is a `budget-asymmetry` mismatch.
 
 - Plain C passes when it preserves observable behaviour. Original bugs, integer
   widths, signedness, call order to imports and every heap or global write stay

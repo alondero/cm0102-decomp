@@ -227,7 +227,10 @@ Remove `auto` when claiming the file. After changing shared hints, test both the
 lift and any accepted C tier; a C pass alone does not renew lifted evidence.
 
 Asymmetric instruction-budget exhaustion blocks acceptance, including when the
-original returns and C exhausts its budget. Investigate the exact case or raise
+original returns and C exhausts its budget. The gate first re-runs such a C case
+at 20 times the budget ([ADR 0012](../adr/0012-bounded-recovered-budget-extension.md)),
+so a remaining asymmetry means C that ran far longer than the original: look for a
+loop that does not exit. Investigate the exact case or raise
 both execution budgets through evidenced hints; do not treat an inconclusive
 case as a match. Both sides exhausting the budget remains inconclusive and the
 existing aggregate limit still applies.
