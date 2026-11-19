@@ -96,9 +96,9 @@ drained eight times in 19 hours and then sat idle for nine.
    whole held queue again.
 6. **Validation budget.** Run `cmre_session.py check` once at the handoff after
    the final `stop`. Scope each harness release using the
-   [validation budget](PLAYBOOK.md#validation-budget). Adam's 2026-11-16
-   authorization covers the resulting release checks at the batch boundary.
-   Other full revalidation and composition runs require Adam's request.
+   [validation budget](PLAYBOOK.md#validation-budget). The session decides when a
+   full revalidation or composition run is warranted and records why
+   ([ADR 0011](../adr/0011-engineering-decision-rights.md)).
 7. **Write `docs/NEXT-SESSION-PROMPT.md` once**, at the handoff. It records
    state, not a live log.
 8. **Report byte movement per supply item.** A lane that moves no bytes into
@@ -658,8 +658,9 @@ model repeats the recorded failure. Sessions build these releases themselves
 (Adam, 2026-11-16): an ADR, the change in a worktree with failing regression
 tests first ([HARNESS.md](HARNESS.md), [ADR 0007](../adr/0007-harness-releases.md)),
 the release's [validation gate](HARNESS.md#validation-scope) at a batch boundary,
-then `retry` of the family. Adam reviews the finished release before it merges to `main`; the
-session does not wait for him to start one. The fidelity rules still bound
+then `retry` of the family. An independent reviewer clears the finished release before it
+merges to `main` ([ADR 0011](../adr/0011-engineering-decision-rights.md)); nobody waits for
+Adam to start or merge one. The fidelity rules still bound
 every release: plain C calls original code across the boundary, and nothing
 invents API results or engine behaviour. Expert sessions work this list in
 order while the farm runs, and never coordinate the farm:
