@@ -1192,6 +1192,145 @@ def test_restart_requeues_terminal_audit_without_current_identity(root, identity
     assert fn in resumed.audit_queue
 
 
+def failed_cheap_attempt(root, **cfg):
+    f, cmre, _ = make(root, [], writes(GOOD), workers=1, ladder=['a/cheap', 'b/strong'], **cfg)
+    job = f._new_job('translate', 'fn_00401000', 'a/cheap', 0, bytes=200)
+    return f, cmre, job
+
+
+def test_failed_attempt_waits_for_a_rate_limited_higher_rung(root):
+    f, _, job = failed_cheap_attempt(root)
+    f.state['limited_providers']['b'] = {'until': time.time() + 3600, 'message': 'usage limit'}
+    f._fail(job, 'timeout after 30 min')
+    assert 'fn_00401000' not in f.state['parked']
+    assert [(j['fn'], j['rung']) for j in f.pending] == [('fn_00401000', 1)]
+    assert f._next_pending() is None   # waits while the provider is limited
+    f.state['limited_providers'].clear()
+    assert f._next_pending()['model'] == 'b/strong'
+
+
+def test_failed_attempt_parks_when_higher_rungs_are_retired(root):
+    f, _, job = failed_cheap_attempt(root)
+    f.state['unavailable_models']['b/strong'] = 'auth'
+    f._fail(job, 'timeout after 30 min')
+    assert 'fn_00401000' in f.state['parked']
+    assert not f.pending
+
+
+def test_failed_attempt_during_stop_is_left_for_the_next_run(root):
+    f, _, job = failed_cheap_attempt(root)
+    (f.run_dir / 'STOP').write_text('')
+    f._fail(job, 'timeout after 30 min')
+    assert 'fn_00401000' not in f.state['parked']
+    assert not f.pending
+    resumed = farm.Farm(f.run_dir, root, f.cmre, None, f.config)
+    assert 'fn_00401000' not in resumed.seen
+
+
+def flaky_replace(monkeypatch, failures):
+    """os.replace denied while another process holds the target open (Windows readers)."""
+    real, calls = os.replace, []
+    def replace(src, dst):
+        calls.append(dst)
+        if len(calls) <= failures:
+            raise PermissionError(13, 'Access is denied')
+        return real(src, dst)
+    monkeypatch.setattr(farm.os, 'replace', replace)
+    monkeypatch.setattr(farm.time, 'sleep', lambda s: None)
+    return calls
+
+
+def test_save_waits_out_a_reader_holding_state_open(root, monkeypatch):
+    f, _, _ = make(root, [], writes(GOOD), workers=0)
+    f.state['accepted']['fn_00401000'] = {'bytes': 200}
+    calls = flaky_replace(monkeypatch, 3)
+    f.save()
+    assert len(calls) == 4
+    assert json.loads(f.state_path.read_text())['accepted'] == {'fn_00401000': {'bytes': 200}}
+
+
+def test_save_still_fails_when_the_target_stays_locked(root, monkeypatch):
+    f, _, _ = make(root, [], writes(GOOD), workers=0)
+    flaky_replace(monkeypatch, 10**6)
+    with pytest.raises(PermissionError):
+        f.save()
+
+
+def test_journal_and_request_writes_wait_out_readers(root, monkeypatch):
+    f, _, _ = make(root, [], writes(GOOD), workers=0)
+    flaky_replace(monkeypatch, 2)
+    farm._durable_json(f.run_dir / 'journal.json', {'phase': 'x'})
+    assert json.loads((f.run_dir / 'journal.json').read_text()) == {'phase': 'x'}
+    flaky_replace(monkeypatch, 2)
+    path = farm._request(f.run_dir, 'fn_00401000', 'retry', reason='r')
+    assert json.loads(path.read_text())['kind'] == 'retry'
+
+
+def legacy_bound_accept(root, verdict):
+    """An accept recorded before identities existed, with a later audit bound to current inputs."""
+    f, cmre, _ = make(root, [], writes(GOOD), workers=0, audit_workers=1)
+    fn = 'fn_00401000'
+    (root / f'recovery/c/{fn}.c').write_text(GOOD)
+    f.state['accepted'][fn] = {'bytes': 200, 'identity': farm._identity(f._inputs(fn))}
+    cmre.brief = lambda fn: 'dispatch listing'
+    job = f._new_job('audit', fn, 'm/a', bytes=200)
+    f._launch(job)
+    Path(job['audit_path']).write_text(json.dumps({'verdict': verdict, 'findings': ['concern']}))
+    f._audit_result(job, False)
+    del f.state['accepted'][fn]['identity']
+    f.save()
+    return f, cmre, fn
+
+
+@pytest.mark.parametrize('verdict', ['ok', 'defect'])
+def test_restart_keeps_bound_audit_of_legacy_accept_proven_by_ledger(root, verdict):
+    f, cmre, fn = legacy_bound_accept(root, verdict)
+    cmre.ledger = {fn: farm._identity(f._inputs(fn))['c']}
+    before = f.state['audits'][fn]
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert fn not in resumed.audit_queue
+    assert resumed.state['audits'][fn] == before
+    assert resumed.state['accepted'][fn]['identity'] == farm._identity(f._inputs(fn))
+    assert farm.review_paths(f.run_dir, root, fn)['status'] == 'bound'
+    assert [e['fn'] for e in events(f.run_dir) if e['event'] == 'identity-backfilled'] == [fn]
+
+
+@pytest.mark.parametrize('ledger', ['absent', 'other-source'])
+def test_restart_reaudits_legacy_accept_without_ledger_proof(root, ledger):
+    f, cmre, fn = legacy_bound_accept(root, 'defect')
+    if ledger == 'other-source':
+        cmre.ledger = {fn: 'f' * 64}
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert fn in resumed.audit_queue
+    assert resumed.state['audits'][fn]['fresh_review_required']
+    assert 'identity' not in resumed.state['accepted'][fn]
+    assert resumed.state['defects'][fn] == ['concern']
+
+
+def test_restart_reaudits_legacy_accept_whose_audit_evidence_drifted(root):
+    f, cmre, fn = legacy_bound_accept(root, 'ok')
+    cmre.ledger = {fn: farm._identity(f._inputs(fn))['c']}
+    (Path(f.state['audits'][fn]['review']['snapshot']) / 'source.c').write_bytes(b'drift')
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert fn in resumed.audit_queue
+    assert 'identity' not in resumed.state['accepted'][fn]
+
+
+def test_cmre_adapter_reads_accepted_c_hash_from_ledger(root):
+    ledger = root / 'recovery/ledger'
+    ledger.mkdir(parents=True)
+    (ledger / 'fn_00401000.json').write_text(json.dumps(
+        {'c': {'source': 'recovery/c/fn_00401000.c', 'source_sha256': 'a' * 64}}))
+    (ledger / 'fn_00401100.json').write_text(json.dumps(
+        {'c': {'source': 'recovery/c/fn_00409999.c', 'source_sha256': 'b' * 64}}))
+    (ledger / 'fn_00401200.json').write_text(json.dumps({'lifted': {}}))
+    adapter = farm.CmreAdapter(root)
+    assert adapter.ledger_c_sha256('fn_00401000') == 'a' * 64
+    assert adapter.ledger_c_sha256('fn_00401100') is None
+    assert adapter.ledger_c_sha256('fn_00401200') is None
+    assert adapter.ledger_c_sha256('fn_00401300') is None
+
+
 def test_offline_adopt_accepts_without_dispatch_from_persistent_controls(root, monkeypatch):
     f, cmre, job, canonical = prepared_candidate(root)
     cmre.items = [item('fn_00401100')]
@@ -1544,6 +1683,7 @@ class FakeCmre:
         self.holds = dict(holds or {})
         self.accept_codes = list(accept_codes or [])
         self.claimed, self.accepted, self.retried, self.tests = [], [], [], []
+        self.ledger = {}
         self.root = None
 
     def frontier(self, limit, min_bytes, max_bytes, include_held, owner):
@@ -1578,6 +1718,9 @@ class FakeCmre:
         # This fake's complete ledger is accepted[]. Absence is authoritative
         # here, unlike an unavailable production ledger query.
         return {'status': 'not-accepted'} if fn not in self.accepted else None
+
+    def ledger_c_sha256(self, fn):
+        return self.ledger.get(fn)
 
     def current_execution_identity(self):
         return json.loads(json.dumps(X87_EXECUTION_IDENTITY))

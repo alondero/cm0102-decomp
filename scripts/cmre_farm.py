@@ -515,6 +515,17 @@ def _read(path):
     return path.read_bytes() if path.exists() else None
 
 
+def _replace(tmp, target, attempts=50, delay=0.1):
+    """os.replace that waits up to ~5 s for readers: on Windows an open handle denies it."""
+    for attempt in range(attempts):
+        try:
+            return os.replace(tmp, target)
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
 def _durable_json(path, data):
     """Replace one journal record only after its complete contents reach the OS."""
     path = Path(path)
@@ -524,7 +535,7 @@ def _durable_json(path, data):
         json.dump(data, stream, indent=1)
         stream.flush()
         os.fsync(stream.fileno())
-    tmp.replace(path)
+    _replace(tmp, path)
 
 
 def _acceptance_pin(path, expected=...):
@@ -559,7 +570,7 @@ def _restore(path, data):
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        tmp.replace(path)
+        _replace(tmp, path)
 
 
 def _gate_summary(diff):
@@ -681,6 +692,10 @@ class Farm:
             self._reconcile_transactions()
         changed_audits = False
         for fn in self.state['accepted'] if reconcile and config.audit_workers else ():
+            changed_audits = self._backfill_accepted_identity(fn) or changed_audits
+        if changed_audits:
+            self.save()   # review_paths below reads the saved state
+        for fn in self.state['accepted'] if reconcile and config.audit_workers else ():
             audit = self.state['audits'].get(fn, {})
             invalid = audit.get('identity') != _identity(self._inputs(fn))
             if audit.get('verdict') in ('ok', 'defect'):
@@ -692,6 +707,30 @@ class Farm:
                     self.audit_queue.append(fn)
         if changed_audits:
             self.save()
+
+    def _backfill_accepted_identity(self, fn):
+        """Bind an accept recorded before identities existed, when the ledger proves it.
+
+        The ledger's accepted C hash must equal the current source, and the latest audit must
+        still be bound to intact snapshot evidence of the current source and hints. Without
+        both, the record stays unbound and the function is audited afresh."""
+        accepted, audit = self.state['accepted'][fn], self.state['audits'].get(fn, {})
+        if ('identity' in accepted or not audit.get('review')
+                or audit.get('verdict') not in ('ok', 'defect', 'unconfirmed')):
+            return False
+        identity = _identity(self._inputs(fn))
+        if identity.get('c') is None or audit.get('identity') != identity:
+            return False
+        try:
+            if getattr(self.cmre, 'ledger_c_sha256', lambda fn: None)(fn) != identity['c']:
+                return False
+            _bound_audit_reviews(self.run_dir, self.root, fn, identity, audit['review'])
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+        accepted['identity'] = identity
+        accepted['identity_source'] = 'ledger c.source_sha256 and bound audit snapshot'
+        self._event('identity-backfilled', fn=fn)
+        return True
 
     def _inputs(self, fn):
         return {'c': _read(self.root / 'recovery/c' / f'{fn}.c'),
@@ -939,7 +978,7 @@ class Farm:
     def save(self):
         tmp = self.state_path.with_suffix('.tmp')
         tmp.write_text(json.dumps(self.state, indent=1), encoding='utf-8')
-        tmp.replace(self.state_path)
+        _replace(tmp, self.state_path)
 
     def observe(self, *, accepting=None, acceptance_queue=None):
         """Publish operator telemetry without touching the scheduler or its journal."""
@@ -1464,8 +1503,16 @@ class Farm:
             self._event('input-needed', fn=fn, coverage=job['_input_bound'], bytes=job.get('bytes', 0), n=job['n'])
             self._park(fn, detail)
             return
-        model, rung = self._rung_model(0 if job.get('_recheck') else job['rung'] + 1)
-        if model is not None and not self.stopping():
+        start = 0 if job.get('_recheck') else job['rung'] + 1
+        model, rung = self._rung_model(start)
+        # A rung paused by a usage limit is not exhausted: the job waits in pending for it.
+        paused = model is None and any(self._limited_until(m) for m in self.config.ladder[start:]
+                                       if m not in self.state['unavailable_models'])
+        if (model is not None or paused) and self.stopping():
+            # The ladder is not exhausted; the next run's frontier scan dispatches it again.
+            self.cmre.release(self.config.owner, [fn])
+        elif model is not None or paused:
+            model, rung = (model, rung) if model is not None else (self.config.ladder[start], start)
             source = Path(job['source'])
             prior_source = source.read_bytes() if source.exists() else None
             nxt = self._new_job('translate', fn, model, rung, bytes=job['bytes'],
@@ -2577,7 +2624,7 @@ def reclassify(run_dir, root=ROOT, cmre=None, threads=8):
                 known[fn]['retry_requested'] = True
         tmp = (run_dir / 'state.json').with_suffix('.tmp')
         tmp.write_text(json.dumps(state, indent=1), encoding='utf-8')
-        tmp.replace(run_dir / 'state.json')
+        _replace(tmp, run_dir / 'state.json')
         with (run_dir / 'events.jsonl').open('a', encoding='utf-8') as out:
             out.write(json.dumps({'at': time.time(), 'event': 'reclassified', **counts}) + '\n')
     return counts
@@ -2600,7 +2647,7 @@ def _request(run_dir, fn, kind, **data):
                     source_sha256=hashlib.sha256(raw).hexdigest())
     tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps({'fn': fn, 'kind': kind, **data}), encoding='utf-8')
-    tmp.replace(path)
+    _replace(tmp, path)
     return path
 
 
@@ -2700,6 +2747,17 @@ class CmreAdapter:
         """Read actual current gate inputs locally, without a recovery/inventory run."""
         from cmre import recover
         return recover.execution_identity()
+
+    def ledger_c_sha256(self, fn):
+        """The C source hash the cmre ledger accepted for fn, or None."""
+        try:
+            record = json.loads((self.root / 'recovery/ledger' / f'{fn}.json').read_text(encoding='utf-8'))
+            c = record['c']
+            if Path(c['source']).as_posix() != f'recovery/c/{fn}.c':
+                return None
+            return c['source_sha256']
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
 
     def acceptance_identity(self, fn):
         """No controller-level ledger proof is currently exposed by this adapter.
@@ -3247,7 +3305,7 @@ def set_control(run_dir, a):
         control.setdefault('add_hours', []).append({'id': str(time.time_ns()), 'hours': a.add_hours})
     tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(control, indent=1), encoding='utf-8')
-    tmp.replace(path)
+    _replace(tmp, path)
     print(json.dumps({'control': str(path), **values,
                       **({'add_hours': a.add_hours} if a.add_hours is not None else {}),
                       'applies': 'next farm tick' if farm_live(run_dir) else 'when a farm runs this directory'}))
