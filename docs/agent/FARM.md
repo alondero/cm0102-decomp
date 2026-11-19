@@ -568,6 +568,14 @@ instruction VA for every finding:
    its budget, so C that never terminates can pass; the gate does not compare
    stack memory or the ECX passed to callees.
 10. A held function: the accepted source resolves the recorded hold reason.
+11. Unproven consumption (Adam, 2026-11-19): upper bits or register residue that
+    differ from the original (a zero-extended byte where the original pushes a
+    whole register; ECX/EDX/EDI left by an earlier call) are a finding only when
+    listing VAs show the consumer reads those bits. Otherwise list the item under
+    `"boundaries"` in the verdict: an explicit unknown boundary, kept out of the
+    open-defect count and shown as `boundaries N` in `status`. Accepted functions
+    audited before this rule are re-judged with `py -3.13 scripts/cmre_farm.py
+    reaudit RUN fn_X... --reason "..."`.
 
 Audit workers do not run `cmre mutate` (it outlives the worker shell's 2-minute
 timeout). When triaging an open defect by hand, `cmre mutate fn_X` shows operator
