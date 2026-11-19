@@ -168,6 +168,8 @@ Coordinator procedure:
    - `model-limited`: a provider usage limit (OpenCode Go: 5 hours, shared by every
      DeepSeek model) paused that provider until the time `status` shows. The farm
      requeues without spending attempts and falls through to an available provider.
+     A failed attempt whose remaining rungs are all paused waits for them instead of
+     parking, and a failure while the farm stops is left for the next run's scan.
      Audits and confirmations also use an available ladder model; they wait only
      when all their lanes are unavailable. Tell Adam once, since Extra Usage is his call.
    - `farm-crash-loop`: the supervisor gave up after five restarts in an hour.
@@ -468,7 +470,12 @@ This does not grant extra automatic fix rounds beyond the existing run budget.
 
 On a supervised restart with audit workers, retained terminal verdict,
 snapshot and dispatch-bound bundle evidence is checked for the functions in
-**that run**. Missing/hash-drift evidence is requeued for fresh audit. Legacy
+**that run**. Missing/hash-drift evidence is requeued for fresh audit.
+An accept recorded before the farm stored identities is bound once, when the
+ledger's `c.source_sha256` equals the current source and the latest audit is
+still bound to intact snapshots of the current source and hints
+(`identity-backfilled` event). Without that proof it is audited afresh; on
+19 Nov, 25 such records had caused 362 repeat audits across restarts. Legacy
 unbound findings stay OPEN as unresolved concerns until actually reviewed;
 stale findings cannot authorize a fix or silently dismiss a backlog item.
 Fresh auditors receive the unresolved concerns explicitly; a result for an older
