@@ -83,9 +83,10 @@ drained eight times in 19 hours and then sat idle for nine.
    `--audit-model`, `--confirm-model`, `--include-held`, `--max-bytes`,
    `--add-hours`) applies on the next tick. Running jobs finish on their old
    model; new jobs use the new setting. A drain costs 15–35 minutes.
-3. **`SUPPLY EMPTY` or `idle N` in `status` means: add supply now.** Launch or
-   continue supply-lane work (below) in the same turn. Supply work runs in
-   parallel with the queue from the first minute, not after the queue empties.
+3. **`SUPPLY EMPTY` or `idle N` in `status` means: add supply now.** Run
+   `lanes RUN` ([Lanes](#lanes-who-moves-work-the-farm-cannot-move)) and work
+   its largest lane you own in the same turn. Supply work runs in parallel with
+   the queue from the first minute, not after the queue empties.
 4. **Apply fixes and inputs while the farm runs.** `adopt`, `dismiss` and `retry`
    are requests the running farm applies. A reviewed hint proposal is applied
    with `scripts/cmre_hint_apply.py` once its function is parked (no job in
@@ -109,6 +110,47 @@ drained eight times in 19 hours and then sat idle for nine.
    do the same at a quiet point while the farm keeps running. Adam's standing
    authorization covers this, so the session finishes with its work on
    `origin/main`.
+
+## Lanes: who moves work the farm cannot move
+
+The farm drives one stage by itself: lifted function → C candidate → gate →
+accept → audit → fix. On 19 Nov its status read "0" for days while 317
+functions sat parked and 952 unlifted functions waited for steps nobody owned.
+Every state the farm cannot leave by itself now has a named lane:
+
+```
+py -3.13 scripts/cmre_farm.py lanes RUN          # --json for the full lists
+```
+
+It prints each lane's functions and original bytes, largest first, with the
+owner, the next action and its five largest items (the parked detail's first
+failing case for mismatches). Work the lane with the most bytes that you own:
+
+| Lane | Owner | Moves by |
+|---|---|---|
+| `lift` | lift lane (automatic) | farm runs it; low coverage needs more captures |
+| `gate-mismatch`, `contract` | expert session | `cm-decompile` from the retained `RUN/src` candidate, then `cmre accept fn_X --c` |
+| `input-needed`, `hint-evidence` | input lane | evidenced hints; the farm re-gates by itself |
+| `budget-bound` | Adam | C exhausts the 200k budget; a raised budget changes shared hints of an accepted lift |
+| `safeguard-blocker` | `cm-triage` | resolve the declared blocker, then `retry` |
+| `worker-failure` | coordinator | `retry RUN fn_X --reason ...` |
+| `open-defect` | defect lane | [Defect subagent](#defect-subagent) |
+| `boundary` | none | explicit unknown; a defect only with consumer evidence |
+
+### Lift lane
+
+`scripts/cmre_lift_lane.py once` takes every function with stored captures
+(ADR 0009) and no accepted record whose capture set changed since its last
+pass. It runs `cmre capture expand`, `cmre capture apply` (the unchanged
+lifted gate) and `cmre accept` for each pass. The farm launches one pass every
+`--lift-lane-minutes` (default 60; `set RUN --lift-lane-minutes 0` disables)
+and rescans its frontier when a pass accepts, so new overnight captures reach
+the C translators without an expert session. A busy writer lease leaves the
+accept for the next pass; a refused accept and gate results stay until the
+captures change; tool errors retry three times. State and the per-pass summary
+are local evidence under `CM0102/Analysis/cmre/lift-lane/` and `RUN/lift-lane/`
+(`lift-lane-start` / `lift-lane-done` events); never publish them.
+`py -3.13 scripts/cmre_lift_lane.py status` shows the last pass.
 
 ## OpenCode coordinator (default)
 

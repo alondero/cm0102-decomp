@@ -4243,3 +4243,134 @@ def test_x87_unbound_gate_reports_are_not_treated_as_operand_proof(root):
     detail = f.state['parked']['fn_00401000']['detail']
     assert detail.startswith('BLOCKER:')
     assert 'not bound' in detail
+
+
+# --- lift lane (captures -> accepted lifts, without an expert session) -------
+
+class FakeLiftProc:
+    def __init__(self, command):
+        self.command, self.code = command, None
+
+    def poll(self):
+        return self.code
+
+
+def lift_farm(root, minutes=60):
+    clock = {'now': 0.0}
+    f, cmre, launcher = make(root, [], writes(GOOD), lift_lane_minutes=minutes, continuous=True, hours=None)
+    f.clock = lambda: clock['now']
+    procs = []
+    f.lift_launch = lambda command: procs.append(FakeLiftProc(command)) or procs[-1]
+    return f, clock, procs
+
+
+def finish_lift(f, procs, summary, code=0):
+    out = Path(procs[-1].command[procs[-1].command.index('--output') + 1])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(summary))
+    procs[-1].code = code
+
+
+def test_lift_lane_runs_one_pass_at_a_time_on_its_interval(root):
+    f, clock, procs = lift_farm(root)
+    f.tick()
+    assert len(procs) == 1 and 'once' in procs[0].command
+    clock['now'] = 7200
+    f.tick()
+    assert len(procs) == 1                          # the first pass is still running
+    finish_lift(f, procs, {'accepted': [], 'accepted_bytes': 0, 'processed': 3})
+    f.tick()
+    assert len(procs) == 1                          # finished now: the interval starts again
+    clock['now'] = 7200 + 3600
+    f.tick()
+    assert len(procs) == 2
+    names = [e['event'] for e in events(f.run_dir)]
+    assert names.count('lift-lane-start') == 2 and names.count('lift-lane-done') == 1
+
+
+def test_new_lifts_trigger_an_immediate_frontier_rescan(root):
+    f, clock, procs = lift_farm(root)
+    f.tick()
+    f.frontier, f.last_scan = [item('fn_00401000')], 0.0
+    finish_lift(f, procs, {'accepted': ['fn_00402000'], 'accepted_bytes': 512, 'processed': 1})
+    clock['now'] = 1
+    f._lift_lane()
+    assert f.frontier is None and f.last_scan is None
+    done = [e for e in events(f.run_dir) if e['event'] == 'lift-lane-done'][0]
+    assert done['accepted'] == ['fn_00402000'] and done['accepted_bytes'] == 512
+
+
+def test_a_failed_pass_is_reported_and_the_lane_continues(root):
+    f, clock, procs = lift_farm(root)
+    f.tick()
+    procs[-1].code = 1                              # crashed before writing a summary
+    f.tick()
+    done = [e for e in events(f.run_dir) if e['event'] == 'lift-lane-done'][0]
+    assert done['code'] == 1 and 'detail' in done
+    clock['now'] = 3600
+    f.tick()
+    assert len(procs) == 2
+
+
+def test_lift_lane_is_off_at_zero(root):
+    f, clock, procs = lift_farm(root, minutes=0)
+    f.tick()
+    assert procs == []
+
+
+def test_lift_lane_does_not_start_while_stopping(root):
+    f, clock, procs = lift_farm(root)
+    (f.run_dir / 'STOP').write_text('stop')
+    f.tick()
+    assert procs == []
+
+
+def test_set_changes_the_lift_lane_interval(root):
+    run = root / 'run'
+    assert farm.main(['set', str(run), '--lift-lane-minutes', '0']) == 0
+    assert json.loads((run / 'control.json').read_text())['lift_lane_minutes'] == 0
+
+
+# --- lanes board: every dead end has an owner, a byte backlog and a next action ---
+
+def lanes_state():
+    budget = ('fail | -O0 fail: 3 mismatches, coverage 0.69, first: {"case": 1, "kind": "budget-asymmetry", '
+              '"original": "fault", "recovered": "budget"}')
+    mismatch = 'fail | -O0 fail: 2 mismatches, coverage 0.9, first: {"case": 7, "field": "eax"}'
+    return {
+        'parked': {
+            'fn_00401000': {'detail': mismatch}, 'fn_00402000': {'detail': budget},
+            'fn_00403000': {'detail': 'input-bound: fail | -O0 fail:  | -O2 fail: '},
+            'fn_00404000': {'detail': 'BLOCKER: candidate self-declares UNVALIDATED'},
+            'fn_00405000': {'detail': 'timeout after 30 min'},
+            'fn_00406000': {'detail': 'fail | callers read EAX beyond the declared u8'},
+            'fn_00407000': {'detail': 'private hint proposal requires parent validation'},
+            'fn_00408000': {'detail': 'fail | -O0 fail: 9 mismatches, coverage 1.0, first: {"case": 2}'},
+        },
+        'input_needed': {'fn_00403000': {'bytes': 300}},
+        'defects': {'fn_00409000': [{'detail': 'x'}]},
+        'boundaries': {'fn_0040a000': [{'detail': 'y'}]},
+    }
+
+
+def test_parked_details_map_to_owned_lanes():
+    s = lanes_state()
+    got = {fn: farm.parked_lane(fn, row['detail'], s) for fn, row in s['parked'].items()}
+    assert got == {'fn_00401000': 'gate-mismatch', 'fn_00402000': 'budget-bound',
+                   'fn_00403000': 'input-needed', 'fn_00404000': 'safeguard-blocker',
+                   'fn_00405000': 'worker-failure', 'fn_00406000': 'contract',
+                   'fn_00407000': 'hint-evidence', 'fn_00408000': 'gate-mismatch'}
+
+
+def test_lanes_board_orders_the_expert_queue_by_bytes_and_names_each_owner():
+    sizes = {'fn_00401000': 100, 'fn_00408000': 900}
+    board = farm.lanes_board(lanes_state(), lambda fn: sizes.get(fn, 50))
+    mismatch = board['gate-mismatch']
+    assert mismatch['count'] == 2 and mismatch['bytes'] == 1000
+    assert [row['fn'] for row in mismatch['top']] == ['fn_00408000', 'fn_00401000']
+    assert mismatch['top'][0]['first'] == '{"case": 2}'
+    assert board['open-defect']['count'] == 1 and board['boundary']['count'] == 1
+    for name, lane in board.items():
+        assert lane['owner'] and lane['next'], name
+    text = farm.lanes_text(board)
+    assert 'gate-mismatch' in text and 'fn_00408000' in text and 'cm-decompile' in text
