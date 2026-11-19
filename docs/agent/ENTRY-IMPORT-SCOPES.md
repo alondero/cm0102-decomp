@@ -103,6 +103,6 @@ harness release, not an exporter that silently substitutes guessed outputs.
 
 New recorder-only tooling module, test helper/tests, and an additive authored
 fixture manifest/label change; no `HARNESS_MODULES` edits or production execution
-path changes. Independent owner review and the parent's session gate are still
+path changes. Independent review ([ADR 0011](../adr/0011-engineering-decision-rights.md)) and the parent's session gate are still
 required. No full pytest, inventory revalidation, game integration, acceptance,
 merge, commit or push is claimed by this isolated worker.

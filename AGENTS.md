@@ -43,6 +43,15 @@ and runtime checkpoints follow [docs/agent/CAMPAIGN.md](docs/agent/CAMPAIGN.md).
 Report accepted C/legacy bytes, lift-inclusive recovery, composed calls and live
 integration separately. Reuse unchanged evidence; add checks for a named gap.
 
+## Decision rights
+
+Adam is the product owner, not an engineering approver
+([ADR 0011](docs/adr/0011-engineering-decision-rights.md)). Agents decide and
+ship engineering changes, including harness releases, gate policy, tooling and
+these rules. Every such change needs an independent review and mechanical
+evidence. Ask Adam only about product scope, spending money, use of his
+desktop and publication.
+
 ## Fidelity rules (non-negotiable)
 
 - Recover behaviour from original instructions only. Never invent engine logic,

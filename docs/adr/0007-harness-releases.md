@@ -44,6 +44,9 @@ Harness modules change only through a release.
 5. The release record keeps the old and new harness identities, the change
    list, the scope decision, and the relevant regression, revalidation and
    pytest receipts.
+6. (Amended 2026-11-19 by [ADR 0011](0011-engineering-decision-rights.md).)
+   An independent agent review, not the project owner, clears a release for
+   merge. The record keeps that review.
 
 ## Consequences
 
