@@ -89,6 +89,11 @@ AUDIT_AUTHORITY = (
     'cite original instructions at preferred-image VAs and the pinned CM0102 3.9.68 binary SHA-256 '
     '0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.',
     'A bound target review is not callee composition or runtime proof; callee reads introduce no automatic global dependency.',
+    'Unproven consumption (Adam, 2026-11-19): a value whose upper bits or register residue differ from the original '
+    '(a zero-extended byte where the original pushes a whole register, ECX/EDX/EDI left by an earlier call) is a '
+    'finding only when listing VAs show its consumer reads those bits. Without that evidence, list it under '
+    '"boundaries" with the same line/detail/evidence fields, not under "findings"; it is an explicit unknown '
+    'boundary, not a defect. An open concern of this kind is covered by moving it to "boundaries".',
 )
 
 
@@ -471,7 +476,7 @@ def audit_prompt(root, job):
         'never establish a signature or ABI. ' + ('Apart from the bundle, do' if job.get('bundle') else 'Do')
         + ' not read farm run files, the ledger, transcripts or directories.',
         f'3. Write {out} as JSON: {{"verdict": "ok"|"defect", "findings": '
-        '[{"line": N, "detail": "...", "evidence": "listing VA and instruction"}]}',
+        '[{"line": N, "detail": "...", "evidence": "listing VA and instruction"}], "boundaries": [same shape]}',
         '   Report a defect only with concrete listing evidence. Style, naming and comments are not defects.',
         '',
         'Finish with exactly one line: FARM-AUDIT: ok | FARM-AUDIT: defect <count>',
@@ -501,7 +506,8 @@ def confirm_prompt(root, job):
             f'1. {PY} -m cmre brief {fn}   (it includes the listing) and read {job.get("review_source", f"recovery/c/{fn}.c")}']),
         '2. For each finding, confirm it with the listing VA and instruction, or reject it.',
         f'3. Write {out} as JSON: {{"verdict": "defect"|"ok", "findings": [only the confirmed findings, '
-        'each with "line", "detail" and "evidence"]}. "ok" when none is confirmed.',
+        'each with "line", "detail" and "evidence"], "boundaries": [unproven-consumption items, same shape]}. '
+        '"ok" when none is confirmed.',
         '',
         'Findings to verify:', findings, '',
         'Finish with exactly one line: FARM-AUDIT: ok | FARM-AUDIT: defect <count>',
@@ -1115,6 +1121,7 @@ class Farm:
                 'audits_disputed': sum(a.get('verdict') == 'ok' and bool(a.get('disputed') or a.get('dismissed'))
                                        for a in self.state['audits'].values()),
                  'open_defects': sorted(self.state['defects']),
+                 'boundaries': sorted(self.state.get('boundaries', {})),
                  'quarantined': dict(self.state.get('quarantined', {})),
                 'unavailable_models': dict(self.state['unavailable_models']),
                 'limited': {p: v['until'] for p, v in self.state.get('limited_providers', {}).items()
@@ -1752,8 +1759,11 @@ class Farm:
                 raise ValueError('audit verdict must be an object')
             verdict = data.get('verdict')
             findings = data.get('findings') or []
+            boundaries = data.get('boundaries') or []
+            if not isinstance(boundaries, list):
+                raise ValueError('boundaries must be a list')
         except (OSError, ValueError):
-            verdict, findings = 'error', ['timeout' if timed_out else 'no audit file']
+            verdict, findings, boundaries = 'error', ['timeout' if timed_out else 'no audit file'], []
         if verdict not in ('ok', 'defect'):
             verdict = 'error'
         identity = _identity(job['_snap'])
@@ -1811,7 +1821,9 @@ class Farm:
             audit.pop('unbound_findings', None)
             audit['review'] = review
         if job.get('confirm'):
-            return self._confirm_result(job, audit, verdict, findings)
+            return self._confirm_result(job, audit, verdict, findings, boundaries)
+        if verdict in ('ok', 'defect'):
+            self._set_boundaries(fn, boundaries)   # a fresh first review replaces earlier ones
         audit.update(verdict=verdict, findings=findings, model=job['model'])
         audit['rounds'] += 1
         self._record(job, verdict, json.dumps(findings)[:600])
@@ -1827,8 +1839,19 @@ class Farm:
         else:
             self._defect(fn, findings)
 
-    def _confirm_result(self, job, audit, verdict, findings):
+    def _set_boundaries(self, fn, items):
+        """Unproven-consumption items: explicit unknown boundaries, never open defects."""
+        boundaries = self.state.setdefault('boundaries', {})
+        if items:
+            boundaries[fn] = items
+        else:
+            boundaries.pop(fn, None)
+
+    def _confirm_result(self, job, audit, verdict, findings, boundaries=()):
         fn = job['fn']
+        if verdict in ('ok', 'defect') and boundaries:
+            known = self.state.setdefault('boundaries', {}).get(fn, [])
+            self._set_boundaries(fn, known + [b for b in boundaries if b not in known])
         audit['confirm_rounds'] = audit.get('confirm_rounds', 0) + 1
         self._record(job, f'confirm-{verdict}', json.dumps(findings)[:600])
         if verdict == 'error':   # stays unconfirmed; retried once
@@ -2101,6 +2124,16 @@ class Farm:
                 continue   # still being written; next tick
             fn = request.get('fn', '')
             if self._writer_busy(fn):
+                continue
+            if request.get('kind') == 'reaudit':
+                # A fresh audit under the current rules; open concerns stay until it covers them.
+                if fn in self.state['accepted'] and fn not in self.state.get('quarantined', {}):
+                    self._reset_audit(fn)
+                    if self.config.audit_workers and fn not in self.audit_queue:
+                        self.audit_queue.append(fn)
+                    self._event('reaudit', fn=fn, reason=request.get('reason', '')[:300])
+                    self.save()
+                path.unlink(missing_ok=True)
                 continue
             if request.get('kind') == 'retry':
                 if fn in self.state['parked'] and fn not in self.state.get('quarantined', {}):
@@ -2660,7 +2693,7 @@ def status_line(s):
             f"audits ok {s['audits_ok']} defect {s['audits_defect']} "
             f"error {s.get('audit_errors', 0)} unconfirmed {s.get('audits_unconfirmed', 0)} "
             f"disputed {s.get('audits_disputed', 0)} "
-            f"open {len(s['open_defects'])} | models {models}"
+            f"open {len(s['open_defects'])} boundaries {len(s.get('boundaries', []))} | models {models}"
             + ''.join(f' | UNAVAILABLE {m}: {e[:80]}' for m, e in s.get('unavailable_models', {}).items())
              + ''.join(f" | LIMITED {p} until {time.strftime('%H:%M', time.localtime(until))}"
                        for p, until in s.get('limited', {}).items())
@@ -3087,6 +3120,10 @@ def main(argv=None):
     rt.add_argument('run_dir')
     rt.add_argument('fns', nargs='+', metavar='fn_XXXXXXXX')
     rt.add_argument('--reason', required=True, help='what changed since they parked (harness release, new inputs)')
+    ra = sub.add_parser('reaudit', help='audit accepted functions afresh under the current audit rules')
+    ra.add_argument('run_dir')
+    ra.add_argument('fns', nargs='+', metavar='fn_XXXXXXXX')
+    ra.add_argument('--reason', required=True, help='which rule changed')
     w = sub.add_parser('wait', help='block until a notable event, a dead farm, or --minutes')
     w.add_argument('run_dir')
     w.add_argument('--minutes', type=float, default=60)
@@ -3152,6 +3189,15 @@ def main(argv=None):
         except RuntimeError as exc:
             print(f'reclassify needs a stopped run: {exc}', file=sys.stderr)
             return 2
+        return 0
+    if a.action == 'reaudit':
+        accepted = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))['accepted']
+        for fn in a.fns:
+            if fn in accepted:
+                _request(run_dir, fn, 'reaudit', reason=a.reason)
+                print(f'{fn}: queued for a fresh audit')
+            else:
+                print(f'{fn}: not accepted in this run; nothing queued')
         return 0
     if a.action == 'retry':
         parked = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))['parked']

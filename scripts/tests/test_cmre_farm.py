@@ -1192,6 +1192,99 @@ def test_restart_requeues_terminal_audit_without_current_identity(root, identity
     assert fn in resumed.audit_queue
 
 
+RESIDUE = {'line': 436, 'detail': 'zero-extended byte where the original pushes all of ECX',
+           'evidence': '0x006fab50 push ecx'}
+
+
+def audited(f, cmre, verdict, *, confirm=False):
+    fn = 'fn_00401000'
+    cmre.brief = lambda fn: 'dispatch listing'
+    job = f._new_job('audit', fn, 'm/a', bytes=200, **({'confirm': True} if confirm else {}))
+    f._launch(job)
+    Path(job['audit_path']).write_text(json.dumps(verdict))
+    f._audit_result(job, False)
+    return fn
+
+
+def boundary_farm(root, **cfg):
+    f, cmre, _ = make(root, [], writes(GOOD), workers=0, audit_workers=1, **cfg)
+    (root / 'recovery/c/fn_00401000.c').write_text(GOOD)
+    f.state['accepted']['fn_00401000'] = {'bytes': 200, 'identity': farm._identity(f._inputs('fn_00401000'))}
+    return f, cmre
+
+
+def test_audit_boundaries_are_recorded_without_opening_a_defect(root):
+    f, cmre = boundary_farm(root)
+    fn = audited(f, cmre, {'verdict': 'ok', 'findings': [], 'boundaries': [RESIDUE]})
+    assert f.state['audits'][fn]['verdict'] == 'ok'
+    assert fn not in f.state['defects']
+    assert f.state['boundaries'][fn] == [RESIDUE]
+    assert not f.pending
+
+
+def test_reaudit_moving_open_residue_to_boundaries_closes_the_defect(root):
+    f, cmre = boundary_farm(root)
+    fn = 'fn_00401000'
+    f.state['defects'][fn] = [RESIDUE]
+    f.state['audits'][fn] = {'rounds': 0, 'fresh_review_required': True, 'unbound_findings': [RESIDUE]}
+    job_findings = audited(f, cmre, {'verdict': 'ok', 'findings': [], 'boundaries': [RESIDUE]})
+    assert fn not in f.state['defects']
+    assert f.state['boundaries'][job_findings] == [RESIDUE]
+
+
+def test_confirmer_may_move_a_finding_to_boundaries(root):
+    f, cmre = boundary_farm(root, confirm_model='m/confirm')
+    fn = audited(f, cmre, {'verdict': 'defect', 'findings': [RESIDUE]})
+    assert f.state['audits'][fn]['verdict'] == 'unconfirmed'
+    audited(f, cmre, {'verdict': 'ok', 'findings': [], 'boundaries': [RESIDUE]}, confirm=True)
+    assert f.state['audits'][fn]['verdict'] == 'ok'
+    assert fn not in f.state['defects']
+    assert f.state['boundaries'][fn] == [RESIDUE]
+
+
+def test_defect_with_boundaries_keeps_both_separately(root):
+    f, cmre = boundary_farm(root)
+    real = {'line': 9, 'detail': 'call order', 'evidence': '0x401009 call'}
+    fn = audited(f, cmre, {'verdict': 'defect', 'findings': [real], 'boundaries': [RESIDUE]})
+    assert f.state['defects'][fn] == [real]
+    assert f.state['boundaries'][fn] == [RESIDUE]
+
+
+def test_audit_prompts_route_unproven_consumption_to_boundaries(root):
+    job = {'fn': 'fn_00401000', 'audit_path': str(root / 'run/audit/fn_00401000-1.json')}
+    for prompt in (farm.audit_prompt(root, job), farm.confirm_prompt(root, job)):
+        assert '"boundaries"' in prompt
+        assert 'reads those bits' in prompt
+
+
+def test_reaudit_request_requeues_an_accepted_function_keeping_its_concerns(root):
+    f, cmre = boundary_farm(root)
+    fn = 'fn_00401000'
+    f.state['defects'][fn] = [RESIDUE]
+    f.state['audits'][fn] = {'rounds': 1, 'verdict': 'defect', 'findings': [RESIDUE]}
+    farm._request(f.run_dir, fn, 'reaudit', reason='boundary policy 2026-11-19')
+    f._requests()
+    assert fn in f.audit_queue
+    assert f.state['audits'][fn]['fresh_review_required']
+    assert f.state['defects'][fn] == [RESIDUE]
+    assert not list((f.run_dir / 'requests').glob('*.json'))
+    assert any(e['event'] == 'reaudit' and e['fn'] == fn for e in events(f.run_dir))
+
+
+def test_reaudit_request_ignores_unaccepted_functions(root):
+    f, cmre = boundary_farm(root)
+    farm._request(f.run_dir, 'fn_00409999', 'reaudit', reason='x')
+    f._requests()
+    assert 'fn_00409999' not in f.audit_queue
+
+
+def test_status_reports_boundaries_separately(root):
+    f, cmre = boundary_farm(root)
+    audited(f, cmre, {'verdict': 'ok', 'findings': [], 'boundaries': [RESIDUE]})
+    line = farm.status_line(f.summary())
+    assert 'open 0' in line and 'boundaries 1' in line
+
+
 def failed_cheap_attempt(root, **cfg):
     f, cmre, _ = make(root, [], writes(GOOD), workers=1, ladder=['a/cheap', 'b/strong'], **cfg)
     job = f._new_job('translate', 'fn_00401000', 'a/cheap', 0, bytes=200)
