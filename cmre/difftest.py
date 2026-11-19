@@ -736,6 +736,23 @@ def _classify(na, nb, original: emu.Result, amap, region, data_spans, *, fault_m
     return "mismatch", difference
 
 
+# ADR 0012: the shared budget stops code that never finishes; it is not a speed contest.
+# When the C exhausts it on a case the original finished, that C case runs once more with
+# this many times the budget. Results are then compared as usual; C still running is a
+# budget-asymmetry mismatch, so a real hang still fails.
+RECOVERED_BUDGET_FACTOR = 20
+
+
+def _run_recovered(recovered, entry, case, budget, original_outcome, profile, allow=True):
+    """(result, extended): the C run, extended once under ADR 0012 when only the C ran out.
+    `allow` is False after an extended run of the same function still ran out: the verdict is
+    settled, and extending every later case would make a hanging candidate ~10x slower to fail."""
+    b = recovered.run(entry, case, budget)
+    if allow and profile in ("abi", "semantic") and b.outcome == "budget" and original_outcome != "budget":
+        return recovered.run(entry, case, budget * RECOVERED_BUDGET_FACTOR), True
+    return b, False
+
+
 CODE_AS_DATA_LIMIT = 0.02  # fraction of cases; above it the function is blocked for review
 
 
@@ -754,6 +771,8 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
     outcomes: dict[str, int] = {}
     mismatches = []
     inconclusive = 0
+    extended_cases = 0
+    extension_failed = False
     covered: set[int] = set()
     import_calls = 0
     code_as_data = []
@@ -767,7 +786,10 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
         a = original.run(va, case, opts.budget)
         fp_a = x87_transport.snapshot(original.uc) if compare_fp else None
         sem_a = semantic_fp(original.uc, returns) if profile == "semantic" else ()
-        b = recovered.run(built.entry, case, opts.budget)
+        b, extended = _run_recovered(recovered, built.entry, case, opts.budget, a.outcome, profile,
+                                     allow=not extension_failed)
+        extended_cases += extended
+        extension_failed = extension_failed or (extended and b.outcome == "budget")
         fp_b = x87_transport.snapshot(recovered.uc) if compare_fp else None
         sem_b = semantic_fp(recovered.uc, returns) if profile == "semantic" else ()
         if index < opts.discovery:
@@ -789,6 +811,8 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
             if a.outcome != b.outcome and len(mismatches) < 5:
                 mismatches.append({"case": index, "kind": "budget-asymmetry",
                                    "original": a.outcome, "recovered": b.outcome,
+                                   **({"recovered_budget": opts.budget * RECOVERED_BUDGET_FACTOR}
+                                      if extended else {}),
                                    "note": "Unresolved execution budget; investigate or raise the budget for both runs."})
             continue
         verdict, difference = _classify(na, nb, a, amap, region, data_spans,
@@ -816,6 +840,8 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
            if getattr(recovered, 'logical_budget', False) else {}),
         "outcomes": dict(sorted(outcomes.items())),
         "inconclusive": inconclusive,
+        **({"recovered_budget_factor": RECOVERED_BUDGET_FACTOR, "recovered_budget_extended": extended_cases}
+           if extended_cases else {}),
         "mismatches": mismatches,
         "coverage": round(coverage, 4),
         "uncovered": sorted(f"{x:#010x}" for x in insn_starts - covered)[:40],
@@ -886,7 +912,7 @@ def explain(va: int, region, insn_starts, built, call_returns, opts: Options, pr
         fp_a = x87_transport.snapshot(original.uc) if compare_fp else None
         sem_a = semantic_fp(original.uc, returns) if profile == "semantic" else ()
         recovered.attribute_reads = True
-        b = recovered.run(built.entry, case, opts.budget)
+        b, extended = _run_recovered(recovered, built.entry, case, opts.budget, a.outcome, profile)
         sem_b = semantic_fp(recovered.uc, returns) if profile == "semantic" else ()
         na = _normalize(a, None, profile, returns, sem_a)
         nb = _normalize(b, amap, profile, returns, sem_b, stop_shape(a))
@@ -895,7 +921,8 @@ def explain(va: int, region, insn_starts, built, call_returns, opts: Options, pr
             fp_b = x87_transport.snapshot(recovered.uc)
             d = x87_transport.difference(fp_a, fp_b) or d
             out['original']['fp'] = fp_a
-        out["recovered"] = {"outcome": b.outcome, "detail": str(b.detail), "regs": [hex(r) for r in b.regs]}
+        out["recovered"] = {"outcome": b.outcome, "detail": str(b.detail), "regs": [hex(r) for r in b.regs],
+                            **({"budget_extended": True} if extended else {})}
         if b.fault_mapping is not None:
             out['recovered']['fault_mapping'] = b.fault_mapping
             out['recovered']['mapping_relation_used'] = (
