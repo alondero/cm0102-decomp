@@ -63,7 +63,8 @@ NOTABLE_EVENTS = ('farm-exit', 'open-defect', 'model-unavailable', 'model-limite
                   'request-failed', 'acceptance-quarantined', 'hint-evidence-needed', 'fix-evidence-needed')
 # Settings `set` may change on a running farm (RUN/control.json), applied on the next tick.
 CONTROL_KEYS = ('workers', 'audit_workers', 'min_bytes', 'max_bytes', 'ladder', 'audit_model',
-                'confirm_model', 'include_held', 'skip_ranges', 'attempt_minutes', 'stall_minutes')
+                'confirm_model', 'include_held', 'skip_ranges', 'attempt_minutes', 'stall_minutes',
+                'lift_lane_minutes')
 SUPPLY_KEYS = ('min_bytes', 'max_bytes', 'include_held', 'skip_ranges')   # changes that reselect the frontier
 RESTART_SECONDS = 30         # supervisor pause before relaunching a farm that died
 MAX_RESTARTS_PER_HOUR = 5    # more than this is a crash loop: stop and wake the coordinator
@@ -123,6 +124,7 @@ class FarmConfig:
     skip_ranges: tuple = ()
     continuous: bool = False       # idle and rescan on empty supply; only STOP or the deadline ends the run
     rescan_seconds: float = 120    # how often an empty frontier is fetched again
+    lift_lane_minutes: float = 0   # captures -> accepted lifts pass (scripts/cmre_lift_lane.py); 0 disables
 
 
 def parse_ranges(text):
@@ -680,6 +682,8 @@ class Farm:
         self.frontier = None
         self.last_scan = None      # clock() of the last frontier fetch
         self.last_input_check = None
+        self.lift_launch = None     # callable(command) -> process with poll(); None: subprocess.Popen
+        self.lift_proc, self.last_lift = None, None
         self.recheck_ready = set()  # parked work stays durable until its verification finishes
         self.retried = {}          # fn -> parked record of a function returned to the queue
         self.state['deadline_at'] = None if config.hours is None else time.time() + config.hours * 3600
@@ -2197,9 +2201,55 @@ class Farm:
         self._accept()
         self._requests()  # admit requests unblocked by acceptance before deciding the run drained
         self._input_arrivals()
+        self._lift_lane()
         self._dispatch()
         self.save()
         self.observe()
+
+    def _lift_lane(self):
+        """Run one lift-lane pass at a time: stored captures -> expand -> apply -> cmre accept.
+
+        Before 19 Nov these steps ran only when an expert session remembered them; 145 captured
+        functions had never been expanded. New lifts enter the C frontier through a rescan."""
+        out = self.run_dir / 'lift-lane' / 'last.json'
+        if self.lift_proc is not None:
+            code = self.lift_proc.poll()
+            if code is None:
+                return
+            self.lift_proc, self.last_lift = None, self.clock()
+            try:
+                summary = json.loads(out.read_text(encoding='utf-8')) if code == 0 else None
+            except (OSError, ValueError):
+                summary = None
+            if summary is None:
+                self._event('lift-lane-done', code=code,
+                            detail=f'pass exited {code} without a summary; see {self.run_dir / "lift-lane" / "lane.err"}')
+                return
+            self._event('lift-lane-done', code=code, processed=summary.get('processed', 0),
+                        statuses=summary.get('statuses', {}), accepted=summary.get('accepted', []),
+                        accepted_bytes=summary.get('accepted_bytes', 0),
+                        accept_waiting=summary.get('accept_waiting', []))
+            if summary.get('accepted'):
+                self.frontier, self.last_scan = None, None
+            return
+        minutes = self.config.lift_lane_minutes or 0
+        if minutes <= 0 or self.stopping():
+            return
+        if self.last_lift is not None and self.clock() - self.last_lift < minutes * 60:
+            return
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.unlink(missing_ok=True)
+        command = [sys.executable, str(Path(__file__).resolve().parent / 'cmre_lift_lane.py'), 'once',
+                   '--jobs', '4', '--output', str(out)]
+        self.lift_proc = (self.lift_launch or self._popen_lift)(command)
+        self.last_lift = self.clock()
+        self._event('lift-lane-start')
+
+    def _popen_lift(self, command):
+        logs = self.run_dir / 'lift-lane'
+        return subprocess.Popen(command, cwd=self.root, stdin=subprocess.DEVNULL,
+                                stdout=(logs / 'lane.out').open('ab'), stderr=(logs / 'lane.err').open('ab'),
+                                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 
     def run(self, poll=10.0, verifier_slots=1):
         self.save()
@@ -2219,6 +2269,109 @@ class Farm:
             self.cmre.release(self.config.owner, None)
             self.save()
             self._event('farm-exit', status=status_line(self.summary()))
+
+
+# --- lanes board ---------------------------------------------------------------
+# Every state the farm cannot leave by itself, with the lane that owns it and its next action.
+# Before 19 Nov these were one "parked" count; nothing said who moved them, so they piled up.
+LANES = {
+    'lift': ('lift lane (automatic; farm runs scripts/cmre_lift_lane.py)',
+             'low-coverage: record more captures (CAPTURE.md) or add c-independent hints; '
+             'py -3.13 scripts/cmre_lift_lane.py status'),
+    'input-needed': ('input lane (farm re-gates by itself when hints change)',
+                     'py -3.13 scripts/cmre_farm.py inputs RUN; add evidenced hints'),
+    'budget-bound': ('Adam: shared budget hints for accepted lifts',
+                     'C exhausts the 200k budget; re-gate with --budget 800000 and decide on a shared budget hint'),
+    'gate-mismatch': ('expert hand translation (cm-decompile skill)',
+                      'cmre explain fn_X --c --case N on the retained RUN/src candidate, fix, accept'),
+    'contract': ('expert hand translation (cm-decompile skill)',
+                 'fix the declared return width or build/preprocessing problem, then retry RUN fn_X'),
+    'safeguard-blocker': ('triage (cm-triage skill)', 'resolve the declared blocker; then retry RUN fn_X'),
+    'hint-evidence': ('parent input lane', 'review RUN/hints proposal; scripts/cmre_hint_apply.py'),
+    'harness-blocker': ('harness release (ADR, worktree, Adam review): largest blocker group first',
+                        'py -3.13 -m cmre work list --state harness-blocker; release the group holding most bytes'),
+    'evidence-needed': ('triage (cm-triage skill): largest blocker group first',
+                        'establish the named ABI/layout/consumer evidence, then cmre work retry fn_X --changed'),
+    'worker-failure': ('coordinator', 'retry RUN fn_X --reason "transient worker failure"'),
+    'other': ('coordinator', 'read the parked detail in RUN/state.json'),
+    'open-defect': ('defect lane (FARM.md "Defect subagent")', 'fix or dismiss with evidence'),
+    'boundary': ('none: explicit unknown (unproven callee consumption)',
+                 'becomes a defect only when a consumer is shown to read the bits'),
+}
+_FIRST = re.compile(r'first: (\{.*?\})(?: \||$)')
+
+
+def parked_lane(fn, detail, state):
+    detail = detail or ''
+    if fn in state.get('input_needed', {}) or detail.startswith('input-bound'):
+        return 'input-needed'
+    if detail.startswith('BLOCKER') or detail.startswith('acceptance blocked'):
+        return 'safeguard-blocker'
+    if detail.startswith('private hint proposal'):
+        return 'hint-evidence'
+    if re.match(r'(timeout after|stalled:|worker |mechanical:)', detail):
+        return 'worker-failure'
+    first = _FIRST.search(detail)
+    if first and '"kind": "budget-asymmetry"' in first.group(1) and '"recovered": "budget"' in first.group(1):
+        return 'budget-bound'
+    if re.search(r'fail: \d+ mismatches', detail):
+        return 'gate-mismatch'
+    if detail.startswith('fail |'):
+        return 'contract'
+    return 'other'
+
+
+def lanes_board(state, size_of, lift_state=None, top=10, work_of=None):
+    """work_of(fn) -> the function's `cmre work` record or None. A recorded harness or evidence
+    blocker owns a parked gate failure: on 19 Nov 185 of 196 parked mismatches (260 KB) carried
+    one, in 81 groups, so hand translation was the wrong lane for nearly all of them."""
+    board = {name: {'owner': owner, 'next': nxt, 'count': 0, 'bytes': 0, 'top': [], 'groups': {}}
+             for name, (owner, nxt) in LANES.items()}
+
+    def add(lane, fn, group=None, **extra):
+        size = size_of(fn)
+        board[lane]['count'] += 1
+        board[lane]['bytes'] += size
+        board[lane]['top'].append({'fn': fn, 'bytes': size, **extra})
+        if group is not None:
+            row = board[lane]['groups'].setdefault(group, [0, 0])
+            row[0] += 1
+            row[1] += size
+
+    for fn, row in sorted(state.get('parked', {}).items()):
+        detail = row.get('detail') or ''
+        first = _FIRST.search(detail)
+        lane, group = parked_lane(fn, detail, state), None
+        record = (work_of(fn) if work_of else None) or {}
+        if lane in ('gate-mismatch', 'contract') and record.get('state') in ('harness-blocker', 'evidence-needed'):
+            lane, group = record['state'], record.get('blocker') or '(unnamed)'
+        add(lane, fn, group, first=first.group(1) if first else detail[:120])
+    for fn in sorted(state.get('defects', {})):
+        add('open-defect', fn)
+    for fn in sorted(state.get('boundaries', {})):
+        add('boundary', fn)
+    for fn, row in sorted(((lift_state or {}).get('functions') or {}).items()):
+        if row.get('status') != 'pass':
+            add('lift', fn, first=f"{row.get('status')} coverage {row.get('coverage')}")
+    for lane in board.values():
+        lane['top'] = sorted(lane['top'], key=lambda r: (-r['bytes'], r['fn']))[:top]
+    return board
+
+
+def lanes_text(board):
+    lines = []
+    for name, lane in sorted(board.items(), key=lambda kv: -kv[1]['bytes']):
+        if not lane['count']:
+            continue
+        lines.append(f"{name:<18} {lane['count']:>4} fn {lane['bytes']:>8} B  owner: {lane['owner']}")
+        lines.append(f"{'':<18} next: {lane['next']}")
+        groups = sorted(lane.get('groups', {}).items(), key=lambda kv: -kv[1][1])
+        if groups:
+            lines.append(f"{'':<18} {len(groups)} groups; largest: " + ', '.join(
+                f'{name} {n} fn/{size} B' for name, (n, size) in groups[:6]))
+        for row in lane['top'][:5]:
+            lines.append(f"{'':<20}{row['fn']} {row['bytes']:>6} B  {str(row.get('first', ''))[:90]}")
+    return '\n'.join(lines)
 
 
 def running_from_events(path):
@@ -3094,6 +3247,8 @@ def main(argv=None):
     r.add_argument('--exit-when-empty', action='store_true',
                    help='end the run when supply is exhausted (default: idle, rescan and take new supply)')
     r.add_argument('--rescan-minutes', type=float, default=2, help='how often an empty queue is fetched again')
+    r.add_argument('--lift-lane-minutes', type=float, default=60,
+                   help='run scripts/cmre_lift_lane.py (captures -> accepted lifts) this often; 0 disables')
     st = sub.add_parser('start', help='run the farm detached under a restart supervisor; args as for run')
     st.add_argument('run_dir')
     st.add_argument('run_args', nargs=argparse.REMAINDER)
@@ -3113,7 +3268,11 @@ def main(argv=None):
     se.add_argument('--skip-ranges')
     se.add_argument('--attempt-minutes', type=float)
     se.add_argument('--stall-minutes', type=float)
+    se.add_argument('--lift-lane-minutes', type=float, help='lift-lane pass interval; 0 disables')
     se.add_argument('--add-hours', type=float, help='extend the deadline')
+    ln = sub.add_parser('lanes', help='every state the farm cannot leave by itself: owner, bytes, next action')
+    ln.add_argument('run_dir')
+    ln.add_argument('--json', action='store_true')
     ip = sub.add_parser('inputs', help='parked functions whose candidate ran clean but needs more test inputs')
     ip.add_argument('run_dir')
     rt = sub.add_parser('retry', help='return parked functions to the running farm after something changed')
@@ -3189,6 +3348,20 @@ def main(argv=None):
         except RuntimeError as exc:
             print(f'reclassify needs a stopped run: {exc}', file=sys.stderr)
             return 2
+        return 0
+    if a.action == 'lanes':
+        from cmre import inventory
+        functions = inventory.load().functions
+        state = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))
+        try:
+            lift = json.loads((ROOT / 'CM0102/Analysis/cmre/lift-lane/state.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            lift = None
+        from cmre import work
+        records = work.read()['functions']
+        board = lanes_board(state, lambda fn: getattr(functions.get(int(fn[3:], 16)), 'body_bytes', 0), lift,
+                            work_of=records.get)
+        print(json.dumps(board, indent=1) if a.json else lanes_text(board))
         return 0
     if a.action == 'reaudit':
         accepted = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))['accepted']
@@ -3309,7 +3482,8 @@ def main(argv=None):
                         max_bytes=a.max_bytes, include_held=a.include_held,
                         owner=a.owner or f'farm-{run_dir.name}', stall_minutes=a.stall_minutes,
                         confirm_model=a.confirm_model or None, skip_ranges=tuple(parse_ranges(a.skip_ranges)),
-                        continuous=not a.exit_when_empty, rescan_seconds=a.rescan_minutes * 60)
+                        continuous=not a.exit_when_empty, rescan_seconds=a.rescan_minutes * 60,
+                        lift_lane_minutes=a.lift_lane_minutes)
     from concurrent.futures import ThreadPoolExecutor
     with RunLock(run_dir), ThreadPoolExecutor(max_workers=max(1, a.verify_threads)) as verifier:
         (run_dir / 'STOP').unlink(missing_ok=True)
