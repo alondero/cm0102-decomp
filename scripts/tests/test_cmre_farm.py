@@ -4374,3 +4374,16 @@ def test_lanes_board_orders_the_expert_queue_by_bytes_and_names_each_owner():
         assert lane['owner'] and lane['next'], name
     text = farm.lanes_text(board)
     assert 'gate-mismatch' in text and 'fn_00408000' in text and 'cm-decompile' in text
+
+
+def test_recorded_blockers_route_parked_mismatches_to_harness_and_evidence_lanes():
+    records = {'fn_00401000': {'state': 'harness-blocker', 'blocker': 'x87-live-stack'},
+               'fn_00408000': {'state': 'evidence-needed', 'blocker': 'unproved-format'},
+               'fn_00406000': {'state': 'harness-blocker', 'blocker': 'x87-live-stack'}}
+    sizes = {'fn_00401000': 100, 'fn_00408000': 900, 'fn_00406000': 50}
+    board = farm.lanes_board(lanes_state(), lambda fn: sizes.get(fn, 10), work_of=records.get)
+    assert board['gate-mismatch']['count'] == 0 and board['contract']['count'] == 0
+    assert board['harness-blocker']['count'] == 2
+    assert board['harness-blocker']['groups'] == {'x87-live-stack': [2, 150]}
+    assert board['evidence-needed']['groups'] == {'unproved-format': [1, 900]}
+    assert 'x87-live-stack' in farm.lanes_text(board)

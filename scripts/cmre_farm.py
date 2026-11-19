@@ -2288,6 +2288,10 @@ LANES = {
                  'fix the declared return width or build/preprocessing problem, then retry RUN fn_X'),
     'safeguard-blocker': ('triage (cm-triage skill)', 'resolve the declared blocker; then retry RUN fn_X'),
     'hint-evidence': ('parent input lane', 'review RUN/hints proposal; scripts/cmre_hint_apply.py'),
+    'harness-blocker': ('harness release (ADR, worktree, Adam review): largest blocker group first',
+                        'py -3.13 -m cmre work list --state harness-blocker; release the group holding most bytes'),
+    'evidence-needed': ('triage (cm-triage skill): largest blocker group first',
+                        'establish the named ABI/layout/consumer evidence, then cmre work retry fn_X --changed'),
     'worker-failure': ('coordinator', 'retry RUN fn_X --reason "transient worker failure"'),
     'other': ('coordinator', 'read the parked detail in RUN/state.json'),
     'open-defect': ('defect lane (FARM.md "Defect subagent")', 'fix or dismiss with evidence'),
@@ -2317,20 +2321,31 @@ def parked_lane(fn, detail, state):
     return 'other'
 
 
-def lanes_board(state, size_of, lift_state=None, top=10):
-    board = {name: {'owner': owner, 'next': nxt, 'count': 0, 'bytes': 0, 'top': []}
+def lanes_board(state, size_of, lift_state=None, top=10, work_of=None):
+    """work_of(fn) -> the function's `cmre work` record or None. A recorded harness or evidence
+    blocker owns a parked gate failure: on 19 Nov 185 of 196 parked mismatches (260 KB) carried
+    one, in 81 groups, so hand translation was the wrong lane for nearly all of them."""
+    board = {name: {'owner': owner, 'next': nxt, 'count': 0, 'bytes': 0, 'top': [], 'groups': {}}
              for name, (owner, nxt) in LANES.items()}
 
-    def add(lane, fn, **extra):
+    def add(lane, fn, group=None, **extra):
         size = size_of(fn)
         board[lane]['count'] += 1
         board[lane]['bytes'] += size
         board[lane]['top'].append({'fn': fn, 'bytes': size, **extra})
+        if group is not None:
+            row = board[lane]['groups'].setdefault(group, [0, 0])
+            row[0] += 1
+            row[1] += size
 
     for fn, row in sorted(state.get('parked', {}).items()):
         detail = row.get('detail') or ''
         first = _FIRST.search(detail)
-        add(parked_lane(fn, detail, state), fn, first=first.group(1) if first else detail[:120])
+        lane, group = parked_lane(fn, detail, state), None
+        record = (work_of(fn) if work_of else None) or {}
+        if lane in ('gate-mismatch', 'contract') and record.get('state') in ('harness-blocker', 'evidence-needed'):
+            lane, group = record['state'], record.get('blocker') or '(unnamed)'
+        add(lane, fn, group, first=first.group(1) if first else detail[:120])
     for fn in sorted(state.get('defects', {})):
         add('open-defect', fn)
     for fn in sorted(state.get('boundaries', {})):
@@ -2350,6 +2365,10 @@ def lanes_text(board):
             continue
         lines.append(f"{name:<18} {lane['count']:>4} fn {lane['bytes']:>8} B  owner: {lane['owner']}")
         lines.append(f"{'':<18} next: {lane['next']}")
+        groups = sorted(lane.get('groups', {}).items(), key=lambda kv: -kv[1][1])
+        if groups:
+            lines.append(f"{'':<18} {len(groups)} groups; largest: " + ', '.join(
+                f'{name} {n} fn/{size} B' for name, (n, size) in groups[:6]))
         for row in lane['top'][:5]:
             lines.append(f"{'':<20}{row['fn']} {row['bytes']:>6} B  {str(row.get('first', ''))[:90]}")
     return '\n'.join(lines)
@@ -3338,7 +3357,10 @@ def main(argv=None):
             lift = json.loads((ROOT / 'CM0102/Analysis/cmre/lift-lane/state.json').read_text(encoding='utf-8'))
         except (OSError, ValueError):
             lift = None
-        board = lanes_board(state, lambda fn: getattr(functions.get(int(fn[3:], 16)), 'body_bytes', 0), lift)
+        from cmre import work
+        records = work.read()['functions']
+        board = lanes_board(state, lambda fn: getattr(functions.get(int(fn[3:], 16)), 'body_bytes', 0), lift,
+                            work_of=records.get)
         print(json.dumps(board, indent=1) if a.json else lanes_text(board))
         return 0
     if a.action == 'reaudit':
