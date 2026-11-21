@@ -177,7 +177,11 @@ Coordinator procedure:
 2. Use the run named in `docs/NEXT-SESSION-PROMPT.md`: leave it alone when its
    `status` shows it running, otherwise start it again with the same directory
    (a first run uses `RUN` = `CM0102/Analysis/cmre/farm/<UTC yyyymmddThhmmZ>`):
-   `py -3.13 scripts/cmre_farm.py start RUN --workers 16 --audit-workers 4 --include-held --hours 10`.
+   `py -3.13 scripts/cmre_farm.py start RUN --workers 16 --audit-workers 4 --include-held --hours 0 --ladder opencode-go/hy4-flash-free,minimax-coding-plan/MiniMax-M3.1-Flash,openai/gpt-6.1-terra`.
+   `--hours 0` keeps it running across sessions; a deadline left it idle for hours
+   between sessions (20 Nov: exit 04:00, restart 07:49). Run 20261115T1250Z
+   translate pass rates: Hy4 Flash 32%, MiniMax plan 23%, Terra 9% (later rung,
+   harder functions); Hy4 Flash is free, so it leads.
    For every earlier run the handoff names, `py -3.13 scripts/cmre_farm.py defects OLD_RUN`
    lists its open defects; handle each as an `open-defect` event below with `OLD_RUN`.
    `adopt` and `dismiss` apply at once on a run with no live farm.
@@ -297,7 +301,7 @@ Coordinator procedure:
    (OpenCode console for OpenCode Go keys, `opencode auth login` for OpenAI). The farm also retires a model on its first auth
    error and moves to the next rung, without spending an attempt.
 3. Start the farm detached and leave it running:
-   `py -3.13 scripts/cmre_farm.py start RUN --workers 16 --audit-workers 4 --include-held --hours 10`.
+   `py -3.13 scripts/cmre_farm.py start RUN --workers 16 --audit-workers 4 --include-held --hours 0 --ladder opencode-go/hy4-flash-free,minimax-coding-plan/MiniMax-M3.1-Flash,openai/gpt-6.1-terra`.
    A supervisor (`RUN/supervisor.pid`) runs the farm (`RUN/farm.pid`) in a hidden
    console and relaunches it 30 seconds after an unexpected exit (`farm-restart`
    event), keeping the original deadline. It leaves the caller's job object, through
@@ -623,6 +627,30 @@ Audit workers do not run `cmre mutate` (it outlives the worker shell's 2-minute
 timeout). When triaging an open defect by hand, `cmre mutate fn_X` shows operator
 mutants that survive the corpus; a surviving mutant on a line the listing proves
 is a weak test, not a defect by itself.
+
+## Session throughput rules (measured 2026-11-21)
+
+Review of the five coordinator sessions of 20–21 Nov: about 23 hours produced
++25 accepted C functions (12.7 KB). Run 20261115T1250Z was supply-empty for 47 of
+its 131 hours; sessions spent most turns on single-function probes, reviews and
+evidence edits. 70% of the remaining bytes are unlifted and need inputs, not
+translation. So:
+
+1. The farm never stops for the session: `--hours 0`, no stop for preflight,
+   tests, tooling or reviews. Make `cmre/` changes in a worktree while a writer
+   holds the lease.
+2. Expert turns go to byte pools: inputs for unlifted and low-coverage
+   functions (capture rounds, expander improvements, fixtures) and one harness
+   family release per session. Hand-repair a single function only when it is
+   the largest lane in `lanes RUN --actionable`.
+3. Measure work in bytes moved by `py -3.13 -m cmre pipeline survey`. After
+   about 45 minutes without bytes moved, record the blocker in one line and
+   switch lanes.
+4. Write the evidence note once at the handoff, not after each step.
+5. When Adam is away, run a capture round ([CAPTURE.md](CAPTURE.md)): recorder
+   at the main menu, a new game with every league selected (21 Nov: Brazil
+   2002 start), then holiday with the stall-only driver. The lift lane picks up
+   new captures by itself.
 
 ## Supply lane (Codex / GPT)
 

@@ -34,8 +34,16 @@ reach more of a function.
    playing for 30 minutes reaches far more code than scripted clicks.
    The recorder freezes the game for about 70 ms per hit; early stutter is
    expected and fades as functions reach their capture limit.
-4. The recorder detaches at `--seconds` and leaves the game running. Read
-   `SESSION.json`: `reached` and `reached_bytes` say what the session touched.
+4. The recorder detaches at `--seconds`, or earlier once no new target function
+   has been reached for `--plateau-minutes` (default 30; `0` disables), and
+   leaves the game running. A plateau stop sets `stopped` in the summary: switch
+   activity (a holiday saturates; an earlier round ran two seasons of holiday for
+   little new code) and attach a new round with a fresh status path. Never kill
+   the recorder: its entry breakpoints stay written into the game and the next
+   hit crashes it. Read `SESSION.json`: `reached` and `reached_bytes` say what
+   the session touched. On 21 Nov, 30 minutes of interactive play (a signing,
+   a staff contract, a watched match) reached +37 functions and +231 KB, more than
+   the preceding holiday hour.
 
 Completion: a session summary with reached functions and bytes, and capture
 files under `local/captures/`.
@@ -81,6 +89,18 @@ append-only proposal for review and supported hint application instead.
 Accepted lifts need C-only additions; accepted C needs explicit parent input
 maintenance and fresh identity-bound review. Additional stored captures alone
 authorize neither changing an accepted corpus nor dropping a failing case.
+
+`expand` first runs **comparison-guided** mutation (input-to-state): it traces
+the operands of every `cmp`/`test` the original executes, finds the input
+position that supplied each operand (the exact address for a memory operand;
+registers, stack words and earlier input reads with the same value otherwise),
+and writes the value that flips the comparison (the other operand, ±1, every
+case of a small `switch` bound, or the tested bits set/cleared). Random edits
+use the remaining iterations. Derived captures from this phase carry
+`"strategy": "compare"`. Code, constants, harness stack/arena memory and import
+slots are never edited. `scripts/cmre_lift_lane.py` keys each function on
+`EXPANDER_VERSION` plus its capture set, so an expander upgrade re-runs every
+captured, unrecovered function once.
 
 By default `expand` changes only captured registers, stack words and memory
 bytes. `--mutate-import-seed` opts into also mutating the u32

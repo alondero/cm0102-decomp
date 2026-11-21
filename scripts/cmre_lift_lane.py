@@ -33,8 +33,13 @@ def _fn(va):
     return f'fn_{va:08x}'
 
 
+# Bump when the expander finds more coverage on the same captures: every
+# captured, unrecovered function then gets one more pass (2: comparison-guided).
+EXPANDER_VERSION = 'expand-2-compare'
+
+
 def capture_key(names):
-    return hashlib.sha256('\n'.join(sorted(names)).encode()).hexdigest()
+    return hashlib.sha256('\n'.join([EXPANDER_VERSION, *sorted(names)]).encode()).hexdigest()
 
 
 class CmreOps:

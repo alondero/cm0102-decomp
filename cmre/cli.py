@@ -394,7 +394,7 @@ def cmd_capture(a) -> int:
             targets = [va for va in inv.entries_sorted if va not in done and inv.functions[va].body_bytes]
         recorder = capture_record.Recorder(a.pid, targets, per_function=a.per_function,
                                            log=lambda text: print(text, file=sys.stderr))
-        print(json.dumps(recorder.run(a.seconds, a.status), indent=1))
+        print(json.dumps(recorder.run(a.seconds, a.status, plateau_seconds=a.plateau_minutes * 60), indent=1))
         return 0
     vas = [_va(f) for f in a.functions] if a.functions else capture_expand.stored()
     if a.action == 'status':
@@ -749,6 +749,8 @@ def main(argv=None) -> int:
     s.add_argument('functions', nargs='*', help='fn_XXXXXXXX IDs; default: unrecovered (record) or stored (others)')
     s.add_argument('--pid', type=int, help='record: the running pinned cm0102.exe process')
     s.add_argument('--seconds', type=float, default=600, help='record: session length')
+    s.add_argument('--plateau-minutes', type=float, default=30,
+                   help='record: detach early after this long with no new target function reached (0 = never)')
     s.add_argument('--per-function', type=int, default=24, help='record: coverage-adding captures kept per function')
     s.add_argument('--status', type=Path, help='record: live JSON progress file')
     s.add_argument('--iterations', type=int, default=1500, help='expand: mutation attempts per function')
