@@ -351,6 +351,37 @@ def test_a_paid_usage_limit_leaves_free_models_usable(tmp_path):
     assert not l._available('q/other-free')
 
 
+class WorkingLauncher(Launcher):
+    """The worker writes a new spec, then its stream ends with a limit (job 31, 2026-11-21:
+    5.5 minutes of work, a passing spec, then provider.no-route)."""
+
+    def start(self, job, prompt, agent):
+        handle = super().start(job, prompt, agent)
+        Path(job['spec']).write_text('{"fixtures": [{"new": 1}]}\n')
+        return handle
+
+
+def test_a_limit_after_real_work_still_gates_the_written_spec(tmp_path):
+    l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1,
+                                        gate={'fn_00401000': {'status': 'pass', 'coverage': 0.7}})
+    l.launcher = WorkingLauncher(tmp_path, limit=('Model unavailable: p/cheap', 3600))
+    l.tick()
+    l.drain_gates()
+    assert ops.gates == [('fn_00401000', 'p/cheap')]
+    assert ops.applies and l.state['functions']['fn_00401000']['status'] == 'accepted'
+    assert not l._available('p/cheap')
+
+
+def test_a_no_route_pauses_only_that_model_and_spends_no_attempt(tmp_path):
+    l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1,
+                                        limit=('Model unavailable: p/cheap', 3600))
+    l.tick()
+    l.tick()
+    assert ops.gates == [] and l.state['functions']['fn_00401000'].get('attempts', []) == []
+    assert not l._available('p/cheap') and l._available('p/other')
+    assert [job['model'] for job, _, _ in launcher.started][-1] == 'q/strong'
+
+
 def test_a_busy_writer_leaves_the_pass_for_a_later_apply(tmp_path):
     l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, apply='busy',
                                         gate={'fn_00401000': {'status': 'pass', 'coverage': 0.7}})

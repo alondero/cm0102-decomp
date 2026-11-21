@@ -3552,6 +3552,36 @@ def test_a_free_models_limit_pauses_only_the_free_tier(root, monkeypatch):
     assert f._limited_until('go/paid') is None
 
 
+NO_ROUTE_LINE = json.dumps({'type': 'error', 'sessionID': 'ses_x', 'error': {
+    'type': 'provider.no-route', 'message': 'Model unavailable: opencode-go/hy4-flash-free'}})
+
+
+def test_handle_reads_a_no_route_error_as_a_model_pause(tmp_path):
+    # 2026-11-21 22:58: every hy4-flash-free job died in a second with this error; the input
+    # lane counted each one as an attempt.
+    log = tmp_path / 'w.jsonl'
+    log.write_text(NO_ROUTE_LINE + '\n')
+    message, seconds = farm.OpencodeHandle(None, log).limit_error()
+    assert message == 'provider.no-route: Model unavailable: opencode-go/hy4-flash-free'
+    assert seconds == farm.NO_ROUTE_SECONDS
+    # The pause key reads the message alone: a no-route whose text lacks "model unavailable"
+    # must still pause only that model, not its provider.
+    log.write_text(NO_ROUTE_LINE.replace('Model unavailable: opencode-go/hy4-flash-free', 'No route') + '\n')
+    message, _ = farm.OpencodeHandle(None, log).limit_error()
+    assert farm._limit_key('opencode-go/hy4-flash-free', message) == 'opencode-go/hy4-flash-free'
+
+
+def test_a_no_route_model_pauses_only_that_model(root, monkeypatch):
+    monkeypatch.setattr(farm.time, 'time', lambda: 1000.0)
+    f, _, _ = make(root, [], writes(GOOD), workers=0)
+    job = f._new_job('translate', 'fn_00401000', 'go/hy4-flash-free#low', bytes=200)
+    f._launch(job)
+    f._limited(job, 'Model unavailable: go/hy4-flash-free', 3600)
+    assert f._limited_until('go/hy4-flash-free') == 4600
+    assert f._limited_until('go/other-free') is None and f._limited_until('go/paid') is None
+    assert 'LIMITED go/hy4-flash-free until' in farm.status_line(f.summary())
+
+
 def test_a_generic_provider_limit_still_pauses_free_models(root, monkeypatch):
     monkeypatch.setattr(farm.time, 'time', lambda: 1000.0)
     f, _, _ = make(root, [], writes(GOOD), workers=0)

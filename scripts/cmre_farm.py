@@ -78,6 +78,12 @@ DEFAULT_LIMIT_SECONDS = 900
 FREE_EXEMPT = re.compile(r'switch to a free model', re.I)
 
 
+# A provider that no longer routes one model (2026-11-21 22:58: "provider.no-route: Model
+# unavailable: opencode-go/hy4-flash-free") pauses that model only; it is retried after this long.
+NO_ROUTE = re.compile(r'provider\.no-route|model unavailable', re.I)
+NO_ROUTE_SECONDS = 3600
+
+
 def _is_free_model(model):
     return model.split('#', 1)[0].endswith('-free')
 
@@ -89,8 +95,11 @@ def _limit_labels(limits, now):
             for key, data in limits.items() if data['until'] > now}
 
 
-def _limit_key(model):
-    """limited_providers key: the provider, or provider:free for its free tier."""
+def _limit_key(model, message=''):
+    """limited_providers key: the provider, provider:free for its free tier, or the model itself
+    when the provider stopped routing just that model."""
+    if NO_ROUTE.search(message or ''):
+        return model.split('#', 1)[0]
     provider = model.split('/', 1)[0]
     return f'{provider}:free' if _is_free_model(model) else provider
 
@@ -1219,7 +1228,7 @@ class Farm:
         A paid-usage limit whose message exempts free models does not pause the free tier."""
         provider = model.split('/', 1)[0]
         limits = self.state['limited_providers']
-        found = [limits.get(_limit_key(model))]
+        found = [limits.get(_limit_key(model)), limits.get(model.split('#', 1)[0])]
         if _is_free_model(model):
             paid = limits.get(provider)
             found.append(None if paid and FREE_EXEMPT.search(paid.get('message', '')) else paid)
@@ -1646,7 +1655,7 @@ class Farm:
         if detail:
             self._invalidate_fix(job, detail)
         safe = not detail and (job['kind'] == 'audit' or self._running_inputs_match(job))
-        provider = _limit_key(job['model'])
+        provider = _limit_key(job['model'], message)
         until = time.time() + max(60, seconds)
         self.state['limited_providers'][provider] = {'until': until, 'message': message[:300]}
         self._event('model-limited', provider=provider, model=job['model'], until=until,
@@ -3561,6 +3570,8 @@ class OpencodeHandle:
                 continue
             message = str(data.get('message') or (data.get('data') or {}).get('message') or '')
             body = str((data.get('response') or {}).get('body') or '')
+            if NO_ROUTE.search(f"{data.get('type', '')} {message}"):
+                return f"provider.no-route: {message}"[:300], NO_ROUTE_SECONDS
             if data.get('status') == 429 or LIMIT_ERROR.search(f"{data.get('type', '')} {message}"):
                 if data.get('retryAfterMs'):
                     return message[:300], int(data['retryAfterMs']) // 1000

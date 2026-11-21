@@ -273,12 +273,15 @@ class Lane:
         provider = model.split('/', 1)[0]
         tier = 'free' if cmre_farm._is_free_model(model) else 'paid'
         limited = self.state['limited']
-        return max(limited.get(provider, 0), limited.get(f'{provider}:{tier}', 0)) <= self.clock()
+        return max(limited.get(provider, 0), limited.get(f'{provider}:{tier}', 0),
+                   limited.get(model.split('#', 1)[0], 0)) <= self.clock()
 
     def _pause(self, model, message, seconds):
         import cmre_farm
         provider = model.split('/', 1)[0]
-        if cmre_farm._is_free_model(model):
+        if cmre_farm.NO_ROUTE.search(message or ''):
+            key = model.split('#', 1)[0]   # the provider stopped routing this model only
+        elif cmre_farm._is_free_model(model):
             key = f'{provider}:free'
         else:   # a limit that says to switch to a free model covers the paid tier only
             key = f'{provider}:paid' if cmre_farm.FREE_EXEMPT.search(message or '') else provider
@@ -368,10 +371,12 @@ class Lane:
             spec.parent.mkdir(parents=True, exist_ok=True)
             best = row.get('best')
             seed = Path(best['spec']).read_bytes() if best and Path(best['spec']).exists() else None
-            spec.write_bytes(seed or (json.dumps(EMPTY_SPEC, indent=1) + '\n').encode())
+            seed = seed or (json.dumps(EMPTY_SPEC, indent=1) + '\n').encode()
+            spec.write_bytes(seed)
             job = {'fn': fn, 'n': n, 'kind': 'inputs', 'model': model, 'bytes': info['bytes'],
                    'coverage': info.get('coverage'), 'threshold': info.get('threshold', 0.6),
-                   'spec': str(spec), 'hints_sha256': info['hints_sha256'], 'key': info['key']}
+                   'spec': str(spec), 'hints_sha256': info['hints_sha256'], 'key': info['key'],
+                   'seed_sha256': hashlib.sha256(seed).hexdigest()}
             if best:
                 job['prior'] = {'model': best.get('model'), 'coverage': best.get('coverage'),
                                 'detail': best.get('detail', '')}
@@ -448,9 +453,16 @@ class Lane:
         self.save()
         return True
 
+    def _spec_changed(self, job):
+        try:
+            return hashlib.sha256(Path(job['spec']).read_bytes()).hexdigest() != job.get('seed_sha256')
+        except OSError:
+            return False
+
     def _worker_done(self, job, handle, interrupted):
-        if self._record_limit(job, handle):
+        if self._record_limit(job, handle) and not self._spec_changed(job):
             return   # not an attempt: the function returns to the queue on the next refresh
+        # A limit that ends a worker after it wrote a new spec still gates that work.
         self._submit_gate(job, self._worker_line(handle), interrupted)
 
     def _submit_gate(self, job, claimed, interrupted):
