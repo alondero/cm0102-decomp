@@ -4168,6 +4168,143 @@ def bind_x87_report(report, path, fn):
 
 
 
+DRAFT_REL = 'CM0102/Analysis/cmre/c-drafts/fn_00401000.c'
+DRAFT = ('#include "cmre.h"\n/* ghidra draft */\n' + ''.join(f'/* listing block {i} */\n' for i in range(20))
+         + 'u32 cm_fn_00401000(u32 a) { return a + extraout_var; }\n')
+
+
+def draft_farm(root, size, behaviour, **cfg):
+    draft = root / DRAFT_REL
+    draft.parent.mkdir(parents=True, exist_ok=True)
+    draft.write_text(DRAFT)
+    f, cmre, launcher = make(root, [item('fn_00401000', size)], behaviour, workers=1, **cfg)
+    cmre.brief = lambda fn: f'listing\ndraft: {DRAFT_REL}  NEEDS-REVIEW: extraout_var\n'
+    return f, cmre, launcher
+
+
+def seen_at_start(seen):
+    def behaviour(job, root):
+        seen.append(Path(job['source']).read_text() if Path(job['source']).exists() else None)
+        writes(GOOD)(job, root)
+    return behaviour
+
+
+def test_a_large_translation_starts_from_the_machine_draft_in_its_source(root):
+    # 2026-11-21: workers asked to retype a 1,000-line draft stalled or wrote stubs;
+    # the drafts themselves had only 2-4 build errors.
+    seen = []
+    f, cmre, launcher = draft_farm(root, farm.DRAFT_SEED_MIN_BYTES, seen_at_start(seen))
+    drain(f)
+    assert seen == [DRAFT]
+    job, prompt, _ = launcher.started[0]
+    assert job['draft_seeded'] is True
+    assert 'machine draft' in prompt and 'do not rewrite' in prompt.lower()
+    bundle = (root / job['bundle']).read_text()
+    assert 'ghidra draft' not in bundle and 'already in your source file' in bundle
+    assert any(e['event'] == 'draft-seeded' for e in events(f.run_dir))
+    assert cmre.accepted == ['fn_00401000']
+
+
+def test_the_next_rung_keeps_repairing_the_draft_lineage(root):
+    # Trial 2026-11-21: Terra, escalated from a draft-seeded MiniMax job, saw the classic prompt and
+    # the full draft again, ignored the source and wrote a 736-token stub.
+    repaired = DRAFT.replace('extraout_var', 'a /* repaired */')
+
+    def behaviour(job, root):
+        writes(repaired if job['model'] == 'm/cheap' else GOOD)(job, root)
+
+    f, cmre, launcher = draft_farm(root, 6000, behaviour)
+    drain(f)
+    first, second = launcher.started[0], launcher.started[1]
+    assert first[0]['draft_seeded'] and second[0]['model'] == 'm/strong'
+    assert second[0]['draft_seeded'] is True and not second[0].get('draft_reseeded')
+    assert 'do not rewrite' in second[1].lower() and 'replaced it with the machine draft' not in second[1]
+    assert 'ghidra draft' not in (root / second[0]['bundle']).read_text()
+    assert cmre.accepted == ['fn_00401000']
+
+
+def test_a_draft_seeded_prompt_allows_a_long_gate(root):
+    f, _, launcher = draft_farm(root, 6000, writes(GOOD))
+    drain(f)
+    prompt = launcher.started[0][1]
+    assert 'timeout of 900000' in prompt
+    # Trial 2026-11-21: Terra quit after the first expected build failure; MiniMax read the
+    # 9,600-line capture hints file and then stalled silently.
+    assert 'a build failure of the seeded draft is not a result' in prompt.lower()
+    assert 'do not read the hints file' in prompt.lower()
+
+
+def test_a_small_translation_is_not_draft_seeded(root):
+    seen = []
+    f, _, launcher = draft_farm(root, farm.DRAFT_SEED_MIN_BYTES - 1, seen_at_start(seen))
+    drain(f)
+    assert seen == [None]
+    job, prompt, _ = launcher.started[0]
+    assert not job.get('draft_seeded') and 'machine draft' not in prompt
+    assert 'ghidra draft' in (root / job['bundle']).read_text()
+
+
+def test_a_retried_self_declared_stub_is_replaced_by_the_draft(root):
+    seen = []
+    f, _, launcher = draft_farm(root, 6000, seen_at_start(seen))
+    stub = '/* UNVALIDATED CANDIDATE: incomplete translation */\n'
+    f.state['parked']['fn_00401000'] = {'detail': 'BLOCKER: candidate self-declares', 'models': ['m/strong']}
+    f.seen.add('fn_00401000')
+    (f.run_dir / 'src').mkdir(parents=True, exist_ok=True)
+    (f.run_dir / 'src/fn_00401000.c').write_text(stub)
+    f._unpark('fn_00401000', 'retry', reason='draft seeding')
+    drain(f)
+    assert seen == [DRAFT]
+    job, prompt, _ = launcher.started[0]
+    assert job['draft_seeded'] is True and job['draft_reseeded'] is True
+    assert job['prior']['model'] == 'm/strong'
+    assert 'replaced it with the machine draft' in prompt
+
+
+def test_a_retried_substantial_candidate_is_kept_over_the_draft(root):
+    seen = []
+    f, _, launcher = draft_farm(root, 6000, seen_at_start(seen))
+    partial = '/* UNVALIDATED CANDIDATE */\n' + DRAFT * 3
+    f.state['parked']['fn_00401000'] = {'detail': 'fail | -O0 fail: 2 mismatches', 'models': ['m/strong']}
+    f.seen.add('fn_00401000')
+    (f.run_dir / 'src').mkdir(parents=True, exist_ok=True)
+    (f.run_dir / 'src/fn_00401000.c').write_text(partial)
+    f._unpark('fn_00401000', 'retry', reason='retry')
+    drain(f)
+    assert seen == [partial]
+    assert not launcher.started[0][0].get('draft_seeded')
+
+
+def test_a_self_declared_unfinished_candidate_escalates_to_the_next_rung(root):
+    unfinished = GOOD.replace('return a + 1;', 'return a + 1; /* UNVALIDATED CANDIDATE: incomplete */')
+
+    def behaviour(job, root):
+        writes(unfinished if job['model'] == 'm/cheap' else GOOD)(job, root)
+
+    f, cmre, launcher = make(root, [item('fn_00401000')], behaviour, workers=1)
+    drain(f)
+    assert [j['model'] for j, _, _ in launcher.started] == ['m/cheap', 'm/strong']
+    assert 'self-declares' in launcher.started[1][0]['prior']['detail']
+    assert cmre.accepted == ['fn_00401000']
+    assert cmre.tests and all(source is None or 'UNVALIDATED' not in Path(source).read_text()
+                              for _, source in cmre.tests)
+
+
+def test_a_declared_blocker_still_parks_without_spending_the_next_rung(root):
+    blocked = GOOD.replace('return a + 1;', 'return a + 1; /* BLOCKER: unproven x87 boundary */')
+    f, cmre, launcher = make(root, [item('fn_00401000')], writes(blocked), workers=1)
+    drain(f)
+    assert [j['model'] for j, _, _ in launcher.started] == ['m/cheap']
+    assert f.state['parked']['fn_00401000']['detail'].startswith('BLOCKER:')
+
+
+def test_run_only_limits_the_frontier_to_named_functions(root):
+    f, cmre, launcher = make(root, [item('fn_00401000'), item('fn_00402000')], writes(GOOD),
+                             workers=2, only=('fn_00402000',))
+    drain(f)
+    assert launcher.started and {j['fn'] for j, _, _ in launcher.started} == {'fn_00402000'}
+
+
 @pytest.mark.parametrize('marker', ['UNVALIDATED CANDIDATE', 'UNVALIDATED candidate',
                                     'BLOCKER: unresolved x87 operand boundary',
                                     'must not be accepted', 'MUST NOT be accepted'])
@@ -4179,8 +4316,10 @@ def test_candidate_self_disclaimer_is_refused_before_the_gate(root, marker):
     assert cmre.tests == []
     assert not (root / 'recovery/c/fn_00401000.c').exists()
     detail = f.state['parked']['fn_00401000']['detail']
-    assert detail.startswith('BLOCKER:')
+    assert detail.startswith('BLOCKER:' if 'BLOCKER' in marker else 'worker self-declared unfinished:')
     assert 'candidate self-declares' in detail
+    assert farm.parked_lane('fn_00401000', detail, f.state) == (
+        'safeguard-blocker' if 'BLOCKER' in marker else 'worker-failure')
 
 
 def x87_gate(root, cmre, outcome, *, drift=None):

@@ -103,6 +103,12 @@ def _limit_key(model, message=''):
     provider = model.split('/', 1)[0]
     return f'{provider}:free' if _is_free_model(model) else provider
 
+# Translations this large start from the machine draft in their source file. 2026-11-21: workers
+# asked to retype 1,000-line drafts stalled silently or wrote stubs, while those drafts had only
+# 2-4 build errors each. A self-disclaimed candidate under 1/DRAFT_STUB_FRACTION of the draft's
+# size is a stub and is replaced by the draft.
+DRAFT_SEED_MIN_BYTES = 2000
+DRAFT_STUB_FRACTION = 4
 STALE_SECONDS = 600   # state.json is saved every tick; older than this means the farm is gone
 HARD_HOLDS = ('harness-blocker', 'evidence-needed')
 MAX_FIX_ROUNDS = 1
@@ -161,6 +167,7 @@ class FarmConfig:
     rescan_seconds: float = 120    # how often an empty frontier is fetched again
     lift_lane_minutes: float = 0   # captures -> accepted lifts pass (scripts/cmre_lift_lane.py); 0 disables
     input_lane_workers: int = 0    # authored-input workers (scripts/cmre_input_lane.py, ADR 0013); 0 disables
+    only: tuple = ()               # restrict the frontier to these functions (trial runs); () takes all
 
 
 def parse_ranges(text):
@@ -405,7 +412,10 @@ def bundle_text(root, job, brief):
             parts += _fenced('Starting hints snapshot',
                              (job.get('_snap', {}).get('hint') or b'').decode('utf-8', errors='replace'), 'json')
         draft = re.search(r'^draft: (\S+)', brief, re.M)
-        if draft:
+        if draft and job.get('_omit_draft'):
+            parts += ['', f'## Draft {draft.group(1)}',
+                      'The draft is already in your source file; it is not repeated here.']
+        elif draft:
             parts += _fenced(f'Draft {draft.group(1)}', _file(root, draft.group(1)), 'c')
     parts += _fenced('Header recovery/include/cmre.h', _file(root, 'recovery/include/cmre.h'), 'c')
     return '\n'.join(parts) + '\n'
@@ -427,6 +437,20 @@ def _hint_steps(root, job):
             'for parent validation/application at an authorized stopped boundary. A proposal is not gate evidence.']
 
 
+DRAFT_SEEDED_LINES = [
+    'Your source file already holds the machine draft: Ghidra pseudocode converted by cmre draft. '
+    'It is translation input, not evidence, and usually does not build yet. Do not rewrite the file. '
+    'Test it first, fix the build errors, then fix mismatches one at a time, checking each edited '
+    'statement against the listing.',
+    'The gate can take several minutes on a function this large: run each cmre test or explain with '
+    'a shell timeout of 900000 ms and wait for its result.',
+    'A build failure of the seeded draft is not a result: fix each reported error from the listing '
+    '(argument counts, receivers, types) and test again.',
+    'Do not read the hints file unless you are proposing inputs: for large functions it holds '
+    'thousands of lines of captured state that you do not need to translate.',
+]
+
+
 def translate_prompt(root, job):
     fn, src = job['fn'], _rel(root, job['source'])
     lines = [
@@ -444,13 +468,18 @@ def translate_prompt(root, job):
         'Everything you need is the brief, the draft it names, the C.md Rules, and the header '
         'recovery/include/cmre.h (types, CM_GLOBAL, CM_THISCALL, CM_FS). Do not search the repository, '
         'list directories or read cmre/ Python sources.',
-        'Write a first complete version within your first few steps and test it early; iterate from test output.',
+        *(DRAFT_SEEDED_LINES if job.get('draft_seeded') else
+          ['Write a first complete version within your first few steps and test it early; '
+           'iterate from test output.']),
         '',
         *_bundle_steps(job, 'the draft, the C.md rules, the worker rules'),
-        f'2. Write {src} from the draft or the starting source below; check every statement against the listing.',
+        (f'2. Repair {src} in place with small edits; do not rewrite the file. Resolve every '
+         'NEEDS-REVIEW construct the brief lists from the listing.' if job.get('draft_seeded') else
+         f'2. Write {src} from the draft or the starting source below; check every statement against the listing.'),
         f'3. {PY} -m cmre test {fn} --c --source {src}',
         f'4. On a mismatch: {PY} -m cmre explain {fn} --c --source {src} --case N   then fix the first difference.',
-        '   Stop after 5 failed tests. Build failures count.',
+        ('   Stop after 5 failed gate runs; build failures of the seeded draft do not count.'
+         if job.get('draft_seeded') else '   Stop after 5 failed tests. Build failures count.'),
         '',
         'Finish with exactly one line: FARM-RESULT: pass | FARM-RESULT: fail <first remaining mismatch> | '
         'FARM-RESULT: evidence-needed <private hint proposal needs parent>',
@@ -458,8 +487,16 @@ def translate_prompt(root, job):
     if job.get('prior'):
         p = job['prior']
         lines += ['', f'Previous attempt ({p["model"]}) failed: {p["detail"][:1500]}']
-        lines.append(f'Its source is already in {src}; start from it.' if job.get('_seed_bytes')
-                     else 'No C source was carried forward; start from the draft and write the C source.')
+        if job.get('draft_reseeded'):
+            lines.append('It left only a self-declared partial stub, so the farm replaced it with the machine '
+                         'draft; start from the draft.')
+        elif job.get('_seed_bytes'):
+            lines.append(f'Its source is already in {src}; start from it.')
+        else:
+            lines.append('No C source was carried forward; start from the draft and write the C source.')
+        if p['detail'].startswith('worker self-declared unfinished'):
+            lines += ['Finish the work it names. Remove its unfinished-work statement only once that work '
+                      'is done and the gate passes.']
     elif job.get('seeded'):
         lines += ['', f'{src} already holds an earlier unaccepted source; start from it.']
     return '\n'.join(lines) + _hold_text(job.get('hold')) + '\n'
@@ -1196,7 +1233,8 @@ class Farm:
             items = self.cmre.frontier(FRONTIER_LIMIT, self.config.min_bytes, self.config.max_bytes,
                                        include_held, self.config.owner)
             items = [i for i in items if (i.fn not in self.seen or i.fn in self.recheck_ready)
-                     and not _skipped(i.fn, self.config.skip_ranges)]
+                     and not _skipped(i.fn, self.config.skip_ranges)
+                     and (not self.config.only or i.fn in self.config.only)]
             held = self.cmre.held([i.fn for i in items]) if include_held else set()
             # Reuse retained work first, then prefer unheld, callee-ready, larger items.
             self.frontier = sorted(items, key=lambda i: (i.fn not in self.recheck_ready,
@@ -1384,6 +1422,15 @@ class Farm:
             source = Path(job['source'])
             source.parent.mkdir(parents=True, exist_ok=True)
             seed = job.pop('_seed', None)
+            draft = _read(self.root / job['_draft_seed']) if job.get('_draft_seed') else None
+            if draft:
+                job['draft_reseeded'] = seed is not None   # a self-declared stub was replaced
+                seed = draft
+                job['draft_seeded'] = True
+                self._event('draft-seeded', fn=job['fn'], n=job['n'], draft=job['_draft_seed'],
+                            bytes=len(draft))
+            elif job.get('_from_draft') and seed is not None:
+                job['draft_seeded'] = True   # the previous rung's repair of the machine draft
             if seed is None and job['kind'] == 'translate' and not job.get('prior') and job['_snap']['c'] is not None:
                 seed = job['_snap']['c']
                 job['seeded'] = True
@@ -1420,11 +1467,41 @@ class Farm:
             return None
         if not text:
             return None
+        if job['kind'] == 'translate':
+            job['_draft_seed'] = self._draft_seed(job, text)
+            # The previous rung's repair of the draft is the source: the draft is not repeated.
+            job['_omit_draft'] = bool(job['_draft_seed'] or job.get('_from_draft'))
         name = f"{job['fn']}-{job['n']}.md" if job['kind'] in ('audit', 'fix') else f"{job['fn']}.md"
         path = self.run_dir / 'bundle' / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(bundle_text(self.root, job, text), encoding='utf-8')
         return path
+
+    def _draft_seed(self, job, brief):
+        """Root-relative machine draft a large translation starts from, or None. The draft is
+        translation input (cmre draft), never evidence; the gate and audit still decide."""
+        if job.get('bytes', 0) < DRAFT_SEED_MIN_BYTES or job['_snap']['c'] is not None:
+            return None
+        match = re.search(r'^draft: (\S+)', brief, re.M)
+        if not match:
+            return None
+        path = (self.root / match.group(1)).resolve()
+        draft = _read(path) if path.is_relative_to(self.root.resolve()) else None
+        if not draft:
+            return None
+        seed = job.get('_seed')
+        if seed is not None:
+            stub = (candidate_disclaimer_problems(seed.decode('utf-8', errors='replace'))
+                    and len(seed) * DRAFT_STUB_FRACTION < len(draft))
+            return match.group(1) if stub else None
+        return None if self._has_resume_candidate(job['fn']) else match.group(1)
+
+    def _has_resume_candidate(self, fn):
+        try:
+            data = json.loads((self.run_dir / 'resume-candidates.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return False
+        return isinstance(data, dict) and bool((data.get('sources') or {}).get(fn))
 
     def _dispatch(self):
         if self.launcher is None or self.stopping():
@@ -1583,6 +1660,7 @@ class Farm:
                                 module=job.get('module'), hold=job.get('hold'),
                                 prior={'model': job['model'], 'detail': detail})
             nxt['_seed'] = prior_source
+            nxt['_from_draft'] = bool(job.get('draft_seeded'))
             self.pending.append(nxt)
             self.state['parked'].pop(fn, None)
         else:
@@ -1745,9 +1823,13 @@ class Farm:
             # (or absence). Do not replace the dispatch snapshot with the edits.
             return f'worker hints rejected: {exc}'
         declared = candidate_disclaimer_problems(text)
-        if declared:
+        if declared and _CANDIDATE_BLOCKER.search(text):
             job['_safeguard_blocker'] = True
             return 'BLOCKER: ' + '; '.join(declared)
+        if declared:
+            # An unfinished-work statement without a BLOCKER: is a failed attempt, not an
+            # evidence gap: the next rung continues from this candidate.
+            return 'worker self-declared unfinished: ' + '; '.join(declared)
         report = self.cmre.test(fn, str(source))
         if report.get('status') != 'pass':
             coverage = input_bound(report)
@@ -3818,6 +3900,7 @@ def main(argv=None):
     r.add_argument('--input-lane-workers', type=int, default=4,
                    help='model workers authoring entry inputs for unlifted functions '
                         '(scripts/cmre_input_lane.py, ADR 0013); 0 disables')
+    r.add_argument('--only', help='comma-separated fn_XXXXXXXX: translate only these (trial runs)')
     st = sub.add_parser('start', help='run the farm detached under a restart supervisor; args as for run')
     st.add_argument('run_dir')
     st.add_argument('run_args', nargs=argparse.REMAINDER)
@@ -4122,7 +4205,8 @@ def main(argv=None):
                         owner=a.owner or f'farm-{run_dir.name}', stall_minutes=a.stall_minutes,
                         confirm_model=a.confirm_model or None, skip_ranges=tuple(parse_ranges(a.skip_ranges)),
                         continuous=not a.exit_when_empty, rescan_seconds=a.rescan_minutes * 60,
-                        lift_lane_minutes=a.lift_lane_minutes, input_lane_workers=a.input_lane_workers)
+                        lift_lane_minutes=a.lift_lane_minutes, input_lane_workers=a.input_lane_workers,
+                        only=tuple(fn.strip() for fn in (a.only or '').split(',') if fn.strip()))
     from concurrent.futures import ThreadPoolExecutor
     with RunLock(run_dir), ThreadPoolExecutor(max_workers=max(1, a.verify_threads)) as verifier:
         (run_dir / 'STOP').unlink(missing_ok=True)
