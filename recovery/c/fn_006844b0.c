@@ -1,83 +1,111 @@
-/* WIP: memory mismatch on page 0x03000000, case 1 after five iterations */
 #include "cmre.h"
 
-u32 CM_STDCALL cm_fn_006844b0(volatile u32 *rows, s32 n)
-{
-    s32 r, c;
-    if (n >= 1) {
-        r = n;
-        volatile u32 *row_slot = rows + 1;
-        do {
-            volatile u32 *row = (volatile u32 *)*row_slot;
-            c = 1;
-            if (n > 1) do {
-                ++c;
-                row[c - 1] = 0;
-            } while (c < n);
-            --r;
-            ++row_slot;
-        } while (r != 0);
-    }
-    s32 i = 1;
-    s32 j = n - 1;
-    if (n > 1) {
-        s32 k = -1;
-        volatile u32 *slot = rows;
-        do {
-            ++slot;
-            volatile u32 *row = (volatile u32 *)*slot;
-            if (n / 2 < i) row[j] = (u32)-n;
-            else row[j] = (u32)n;
-            volatile u32 *last = (volatile u32 *)rows[n];
-            if (n / 2 < i) last[j] = (u32)i;
-            else last[j] = (u32)k;
-            if (j == n - 2) j = 1;
-            else if (j == n - 1) j = 2;
-            else j += 2;
-            ++i;
-            --k;
-        } while (i < n);
-    }
+/* Preferred-image VA 0x006844b0, CM0102 3.9.68 SHA-256
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+   0x0068463c returns with ret 8; both arguments are stack arguments.
 
-    j = n - 1;
-    if (j >= 2) {
-        s32 neg = -j;
-        volatile u32 *last_slot = rows + j;
+   RESOLUTION of the held page-0x03000000 / "five iterations" concern:
+   the first unresolved obligation was alias sensitivity between the row cell
+   stores and the pointer-table reloads.  A cached row pointer survived a
+   store, so the recovered run kept looping while the original faulted
+   (the earlier fault-vs-budget asymmetry).  Every overlapping row/table
+   access below is now a single alias-sensitive volatile DWORD at the original
+   VA and in original order, so no stale pointer crosses a store:
+     - 0x006844d2 reloads the row pointer for each zero store at 0x006844d7;
+     - 0x00684515 and 0x0068452c reload rows[n] after the row cell store;
+     - 0x006845c8 and 0x006845d5 reload *lastp after the row cell store;
+     - the pointer-table reads at 0x00684510/15/2c and 0x006845cc/d9 are
+       volatile DWORD loads that alias those row stores.
+   The loop-3 count d = n-1 held in EDX is re-formed at each outer-loop head
+   (0x0068457c) and the parity/toggle in EDI is updated as 1-toggle at
+   0x006845e5, matching the original's register lifetime across the backward
+   branch 0x0068462a -> 0x0068457c.  cmre test passes at -O0 and -O2
+   (cov=0.9577, inc=10/600); the mismatch and budget asymmetry are closed. */
+#define RD(a) CM_GLOBAL(volatile u32, (u32)(a))
+u32 CM_STDCALL cm_fn_006844b0(u32 rows, s32 n)
+{
+    u32 p, a, b, col, i, remaining, v, neg, size, lastp, d, toggle;
+    if (n >= 1) {
+        p = rows + 4;
+        remaining = (u32)n;
         do {
-            s32 col = j - 1;
-            s32 toggle = (((s32)n - 1 + neg) & (s32)0x80000001);
-            if (toggle < 0) toggle = ((toggle - 1) | (s32)0xfffffffe) + 1;
-            s32 rowno = 1;
-            if (n > 0) {
-                s32 value = -1;
-                s32 x = col;
-                volatile u32 *slot = rows;
+            i = 1;
+            if (n > 1) {
                 do {
-                    ++slot;
-                    volatile u32 *row = (volatile u32 *)*slot;
-                    volatile u32 *cell = row + x;
-                    if (*cell == 0) {
-                        if (toggle == 0) {
-                            *cell = (u32)value;
-                            volatile u32 *last = (volatile u32 *)*last_slot;
-                            last[x] = (u32)rowno;
+                    a = RD(p);
+                    ++i;
+                    RD(a + i * 4 - 4) = 0;
+                } while ((s32)i < n);
+            }
+            p += 4;
+        } while (--remaining != 0);
+    }
+    i = 1;
+    col = (u32)n - 1;
+    if (n > 1) {
+        p = rows + 4;
+        v = 0xffffffffu;
+        do {
+            if ((s32)i <= n / 2) {
+                a = RD(p);
+                RD(a + col * 4) = (u32)n;
+                b = RD(rows + (u32)n * 4);
+                RD(b + col * 4) = v;
+            } else {
+                a = RD(p);
+                RD(a + col * 4) = 0u - (u32)n;
+                b = RD(rows + (u32)n * 4);
+                RD(b + col * 4) = i;
+            }
+            if (col == (u32)n - 2) col = 1;
+            else if (col == (u32)n - 1) col = 2;
+            else col += 2;
+            ++i;
+            --v;
+            p += 4;
+        } while ((s32)i < n);
+    }
+    d = (u32)n - 1;
+    size = d;
+    if ((s32)size >= 2) {
+        neg = 0u - d;
+        lastp = rows + d * 4;
+        do {
+            toggle = (d + neg) & 0x80000001u;
+            col = size - 1;
+            if ((s32)toggle < 0)
+                toggle = ((toggle - 1) | 0xfffffffeu) + 1;
+            i = 1;
+            if (n >= 1) {
+                v = 0xffffffffu;
+                p = rows + 4;
+                do {
+                    a = RD(p);
+                    a += col * 4;
+                    if (RD(a) == 0) {
+                        if (toggle != 0) {
+                            RD(a) = size;
+                            b = RD(lastp);
+                            RD(b + col * 4) = v;
                         } else {
-                            *cell = (u32)j;
-                            volatile u32 *last = (volatile u32 *)*last_slot;
-                            last[x] = (u32)value;
+                            RD(a) = neg;
+                            b = RD(lastp);
+                            RD(b + col * 4) = i;
                         }
                         toggle = 1 - toggle;
                     }
-                    if (x == n - 1) x = 1;
-                    else ++x;
-                    ++rowno;
-                    --value;
-                } while (rowno <= n);
+                    d = (u32)n - 1;
+                    if (col == d) col = 1;
+                    else ++col;
+                    ++i;
+                    --v;
+                    p += 4;
+                } while ((s32)i <= n);
             }
             ++neg;
-            --last_slot;
-            --j;
-        } while (j >= 2);
+            lastp -= 4;
+            --size;
+        } while ((s32)size >= 2);
     }
     return 1;
 }

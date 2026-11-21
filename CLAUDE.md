@@ -17,8 +17,9 @@
   at each handoff) follow `docs/agent/PUBLICATION.md`; receipts bind the exact
   commit and current push URL/visibility.
   It reads whole command text, so keep push syntax out of commit messages and
-  heredocs (use `git commit -F <file>`). It asks before edits under `cmre/` and
-  `tests/`; the user's authorization for a tooling task covers those prompts.
+  heredocs (use `git commit -F <file>`). Edits under `cmre/` and `tests/` need
+  no prompt (ADR 0011); `cmre/` edits are refused while a recovery writer holds
+  the command lease, so make harness changes in a worktree during farm runs.
 - A refusal of a protected write is a hard stop. For a false positive, keep the
   command and refusal as evidence and fix the guard with a regression test
   through the tooling workflow.

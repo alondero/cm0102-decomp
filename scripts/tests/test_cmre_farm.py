@@ -4325,6 +4325,28 @@ def test_lift_lane_does_not_start_while_stopping(root):
     assert procs == []
 
 
+@pytest.mark.parametrize('exit_mode', ['stop', 'deadline', 'empty'])
+def test_farm_drains_the_active_lift_pass_before_exiting(root, exit_mode):
+    f, clock, procs = lift_farm(root)
+    f.tick()
+    assert len(procs) == 1
+    if exit_mode == 'stop':
+        (f.run_dir / 'STOP').write_text('stop')
+    elif exit_mode == 'deadline':
+        f.deadline = clock['now']
+    else:
+        f.config.continuous = False
+
+    assert not f.finished() and not f.drained()
+    finish_lift(f, procs, {'accepted': ['fn_00402000'], 'processed': 1})
+    f.tick()
+
+    assert f.drained()
+    started, done = [e for e in events(f.run_dir) if e['event'].startswith('lift-lane-')]
+    assert started['event'] == 'lift-lane-start'
+    assert done['event'] == 'lift-lane-done' and done['accepted'] == ['fn_00402000']
+
+
 def test_set_changes_the_lift_lane_interval(root):
     run = root / 'run'
     assert farm.main(['set', str(run), '--lift-lane-minutes', '0']) == 0

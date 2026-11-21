@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import random
 
-from . import capture, env
+from . import capture, emu, env
 
 PAGE = capture.PAGE
 MUTATION_VALUES = (0, 1, 2, 0xFF, 0x7F, 0x80, 0xFFFF, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF)
@@ -117,8 +117,237 @@ def _mutate(rng: random.Random, machine, parent: dict, *, mutate_seed: bool = Fa
     return mutant, notes
 
 
+# --- comparison-guided (input-to-state) mutation --------------------------------
+# Random edits rarely hit the exact constant a `cmp` wants (a message id, an enum,
+# a record type). Tracing each comparison's operand values on the original side
+# and writing the other operand's value into the input byte that supplied this
+# one reaches those branches directly. Still original-side input exploration
+# only: the result is a derived capture, and the unchanged gate decides.
+I2S_GP = ("eax", "ecx", "edx", "ebx", "esi", "edi")
+I2S_MATCHES = 8          # input positions tried per traced operand value
+I2S_SITE_VALUES = 8      # distinct operand pairs kept per comparison site
+I2S_SWITCH_MAX = 64      # `cmp x, n` with n <= this also offers every value 0..n+1
+
+
+def _disassembler():
+    import capstone
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+    md.detail = True
+    return md
+
+
+def _starts_from_bytes(va: int, code: bytes) -> set[int]:
+    """Linear-sweep instruction starts of a code blob (synthetic tests, small tools)."""
+    md = _disassembler()
+    return {ins.address for ins in md.disasm(code, va)}
+
+
+def _compare_sites(machine, starts) -> dict:
+    """Decoded `cmp`/`test` instructions among the function's instruction starts."""
+    md = _disassembler()
+    sites = {}
+    for address in sorted(starts):
+        blob = b""
+        for length in (16, 8, 4):
+            try:
+                blob = bytes(machine.uc.mem_read(address, length))
+                break
+            except Exception:
+                continue
+        ins = next(md.disasm(blob, address, 1), None)
+        if ins is not None and ins.mnemonic in ("cmp", "test") and len(ins.operands) == 2:
+            sites[address] = ins
+    return sites
+
+
+def _operand(uc, ins, op):
+    """(kind, location, value, size) of one operand just before `ins` executes."""
+    from capstone import x86_const as X
+    from unicorn import x86_const as U
+    size = op.size
+    mask = (1 << (8 * size)) - 1
+    if op.type == X.X86_OP_IMM:
+        return ("imm", None, op.imm & mask, size)
+    if op.type == X.X86_OP_REG:
+        name = ins.reg_name(op.reg)
+        return ("reg", name, uc.reg_read(getattr(U, f"UC_X86_REG_{name.upper()}")) & mask, size)
+    if op.type == X.X86_OP_MEM:
+        if op.mem.segment:
+            return None
+        address = op.mem.disp
+        if op.mem.base:
+            address += uc.reg_read(getattr(U, f"UC_X86_REG_{ins.reg_name(op.mem.base).upper()}"))
+        if op.mem.index:
+            address += op.mem.scale * uc.reg_read(getattr(U, f"UC_X86_REG_{ins.reg_name(op.mem.index).upper()}"))
+        address &= 0xFFFFFFFF
+        try:
+            value = int.from_bytes(bytes(uc.mem_read(address, size)), "little")
+        except Exception:
+            return None
+        return ("mem", address, value, size)
+    return None
+
+
+def _traced_run(machine, va: int, opts, entry: dict, sites: dict):
+    """One original-side run of `entry` that also records each comparison's operands."""
+    import unicorn
+    observed, seen = [], {}
+
+    def hook(uc, address, size, _):
+        ins = sites.get(address)
+        if ins is None:
+            return
+        ops = [_operand(uc, ins, op) for op in ins.operands]
+        if None in ops:
+            return
+        key = tuple(o[2] for o in ops)
+        bucket = seen.setdefault(address, set())
+        if key in bucket or len(bucket) >= I2S_SITE_VALUES:
+            return
+        bucket.add(key)
+        observed.append({"site": address, "mnemonic": ins.mnemonic, "ops": ops})
+
+    handle = None
+    if sites:
+        handle = machine.uc.hook_add(unicorn.UC_HOOK_CODE, hook, begin=min(sites), end=max(sites))
+    try:
+        result = _run(machine, va, opts, entry["regs"], entry["stack"], entry["pages"],
+                      entry.get("seed", 0), entry.get("fpcw"))
+    finally:
+        if handle is not None:
+            machine.uc.hook_del(handle)
+    return result, observed
+
+
+def _editable_page(machine, parent: dict, page: int) -> bool:
+    if page in parent["pages"]:
+        return True
+    if emu.STACK <= page < emu.STACK + emu.STACK_SIZE or emu.ARENA <= page < emu.ARENA + machine.arena_size:
+        return False
+    return any(lo <= page < hi for lo, hi in machine._writable_image)
+
+
+def _read_input(machine, parent: dict, address: int, size: int) -> int | None:
+    page, offset = address & ~(PAGE - 1), address & (PAGE - 1)
+    if offset + size > PAGE or not _editable_page(machine, parent, page):
+        return None
+    blob = parent["pages"].get(page)
+    if blob is None:
+        blob = machine.pristine.get(page)
+    if blob is None:
+        return None
+    return int.from_bytes(blob[offset:offset + size], "little")
+
+
+def _stack_index(address: int, size: int, count: int) -> int | None:
+    base = emu.STACK_TOP + 4
+    if address % 4 or size != 4 or not base <= address < base + 4 * count:
+        return None
+    return (address - base) // 4
+
+
+def _targets(observation: dict, side: int) -> list[int]:
+    """Values that would change this comparison's outcome when written into operand `side`."""
+    ops = observation["ops"]
+    kind, _, value, size = ops[side]
+    other = ops[1 - side]
+    mask = (1 << (8 * size)) - 1
+    if observation["mnemonic"] == "test":
+        if other[0] == "imm" or other[1] != ops[side][1]:
+            bits = other[2] & mask
+            values = [value | bits, value & ~bits & mask]
+        else:  # test r, r: zero versus non-zero
+            values = [0, 1]
+    else:
+        wanted = other[2] & mask
+        values = [wanted, (wanted + 1) & mask, (wanted - 1) & mask]
+        if other[0] == "imm" and 0 < wanted <= I2S_SWITCH_MAX:
+            values += list(range(wanted + 2))
+    out = []
+    for v in values:
+        if v != value and v not in out:
+            out.append(v)
+    return out
+
+
+def _positions(machine, parent: dict, side) -> list[tuple]:
+    """Input positions that supplied this operand: exact for memory, by value for registers."""
+    kind, location, value, size = side
+    mask = (1 << (8 * size)) - 1
+    if kind == "mem":
+        index = _stack_index(location, size, len(parent["stack"]))
+        if index is not None:
+            return [("stack", index, size)]
+        page = location & ~(PAGE - 1)
+        if _editable_page(machine, parent, page) and _read_input(machine, parent, location, size) is not None:
+            return [("mem", location, size)]
+        if any(lo <= page < hi for lo, hi in machine._executable) or (
+                page in machine.pristine and not _editable_page(machine, parent, page)
+                and not emu.ARENA <= page < emu.ARENA + machine.arena_size):
+            return []  # code, constants and harness memory are not inputs
+    found = []
+    for address, width in parent.get("reads", []):
+        if width >= size:
+            current = _read_input(machine, parent, address, width)
+            if current is not None and current & mask == value:
+                found.append(("mem", address, width))
+    for index, word in enumerate(parent["stack"]):
+        if word & mask == value:
+            found.append(("stack", index, 4))
+    for name in I2S_GP:
+        if parent["regs"].get(name, 0) & mask == value:
+            found.append(("reg", name, 4))
+    return found[:I2S_MATCHES]
+
+
+def _edit(machine, parent: dict, position, size: int, value: int):
+    """Copy of `parent` with the low `size` bytes at `position` set to `value`, plus its note."""
+    regs, stack = dict(parent["regs"]), list(parent["stack"])
+    pages = dict(parent["pages"])
+    kind, location, width = position
+    mask = (1 << (8 * size)) - 1
+    if kind == "stack":
+        stack[location] = (stack[location] & ~mask | value) & 0xFFFFFFFF
+        note = ["stack", location, stack[location]]
+    elif kind == "reg":
+        regs[location] = (regs.get(location, 0) & ~mask | value) & 0xFFFFFFFF
+        note = ["reg", location, regs[location]]
+    else:
+        page, offset = location & ~(PAGE - 1), location & (PAGE - 1)
+        blob = bytearray(pages.get(page) or machine.pristine[page])
+        full = (1 << (8 * width)) - 1
+        old = int.from_bytes(blob[offset:offset + width], "little")
+        new = (old & ~mask | value) & full
+        blob[offset:offset + width] = new.to_bytes(width, "little")
+        pages[page] = bytes(blob)
+        note = ["mem", location, width, new]
+    return {"regs": regs, "stack": stack, "pages": pages, "seed": parent.get("seed", 0)}, [note]
+
+
+def _i2s_mutants(machine, parent: dict, observations: list) -> list[tuple[dict, list]]:
+    """Deterministic single edits that make traced comparisons go the other way."""
+    out, seen = [], set()
+    for observation in observations:
+        for side in (0, 1):
+            operand = observation["ops"][side]
+            if operand[0] == "imm":
+                continue
+            values = _targets(observation, side)
+            if not values:
+                continue
+            for position in _positions(machine, parent, operand):
+                for value in values:
+                    mutant, notes = _edit(machine, parent, position, operand[3], value)
+                    key = repr(notes)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append((mutant, notes))
+    return out
+
+
 def expand(va: int, *, iterations: int = 600, target: float = 0.9, limit: int = 64,
-           mutate_import_seed: bool = False) -> dict:
+           mutate_import_seed: bool = False, compare: bool = True) -> dict:
     """Coverage-guided mutation of this function's captures, original side only.
 
     A mutant is kept only when the original executes an instruction of the
@@ -126,6 +355,8 @@ def expand(va: int, *, iterations: int = 600, target: float = 0.9, limit: int = 
     whose metadata names its parent and edits: a derived test input, not an
     observation of the game. `mutate_import_seed` is an opt-in exploration of
     the seeded import-stub inputs; it adds no evidence about real imports.
+    `compare` (default) first solves traced comparisons (input-to-state), then
+    spends the remaining iterations on random edits.
     """
     starts, region = _function(va)
     names = capture.names_for(va)
@@ -142,9 +373,39 @@ def expand(va: int, *, iterations: int = 600, target: float = 0.9, limit: int = 
         covered |= result.covered & starts
         corpus.append(entry)
     before = len(covered) / len(starts)
+    added, spent = 0, 0
+    if compare:
+        sites = _compare_sites(machine, starts)
+        queue, tried = list(corpus), set()
+        while sites and queue and spent < iterations and len(covered) / len(starts) < target and added < limit:
+            parent = queue.pop(0)
+            spent += 1  # the traced run is an emulator run of the same budget
+            _, observed = _traced_run(machine, va, opts, parent, sites)
+            for mutant, notes in _i2s_mutants(machine, parent, observed):
+                if spent >= iterations or added >= limit or len(covered) / len(starts) >= target:
+                    break
+                key = (parent["name"], repr(notes))
+                if key in tried:
+                    continue
+                tried.add(key)
+                spent += 1
+                result = _run(machine, va, opts, mutant["regs"], mutant["stack"], mutant["pages"],
+                              mutant["seed"], parent["fpcw"])
+                fresh = (result.covered & starts) - covered
+                if not fresh:
+                    continue
+                meta = {"kind": "mutated", "parent": parent["name"], "edits": notes, "outcome": result.outcome,
+                        "budget": opts.budget, "arg_count": opts.arg_count, "strategy": "compare"}
+                name = capture.save(va, mutant["regs"], parent["fpcw"], mutant["stack"], mutant["pages"],
+                                    mutant["seed"], meta)
+                covered |= fresh
+                added += 1
+                entry = {**mutant, "name": name, "fpcw": parent["fpcw"], "reads": _input_reads(result)}
+                corpus.append(entry)
+                queue.append(entry)
+    compared = added
     rng = random.Random(va)
-    added = 0
-    for _ in range(iterations):
+    for _ in range(max(0, iterations - spent)):
         if len(covered) / len(starts) >= target or added >= limit:
             break
         parent = rng.choice(corpus)
@@ -167,7 +428,7 @@ def expand(va: int, *, iterations: int = 600, target: float = 0.9, limit: int = 
         added += 1
         corpus.append({**mutant, "name": name, "fpcw": parent["fpcw"],
                        "reads": _input_reads(result)})
-    return {"va": f"{va:#010x}", "captures": len(names), "added": added,
+    return {"va": f"{va:#010x}", "captures": len(names), "added": added, "added_compare": compared,
             "coverage_before": round(before, 4), "coverage": round(len(covered) / len(starts), 4)}
 
 
@@ -194,6 +455,29 @@ def select(va: int, limit: int | None = None) -> list[str]:
     return sorted(chosen)
 
 
+LEASE_POLL_SECONDS = 5
+LEASE_WAIT_SECONDS = 2 * 3600
+
+
+def _write_hints(path, hints: dict) -> None:
+    """Hints are declared test inputs: write them only under the writer lease, waiting
+    for a session check or accept to finish, so their evidence stays conclusive."""
+    from . import coordination
+    import time
+    deadline = time.monotonic() + LEASE_WAIT_SECONDS
+    while True:
+        try:
+            with coordination.writer():
+                temporary = path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(hints, indent=1) + "\n", encoding="utf-8")
+                temporary.replace(path)
+            return
+        except coordination.BusyError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(LEASE_POLL_SECONDS)
+
+
 def apply(va: int, *, test: bool = True) -> dict:
     """List the selected captures in the function's hints, then run the unchanged lifted gate."""
     from . import difftest, recover
@@ -205,9 +489,7 @@ def apply(va: int, *, test: bool = True) -> dict:
     hints.pop("auto", None)  # a claimed hint: automatic inference no longer rewrites it
     hints["captures"] = names
     difftest.validate_hints(hints)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(hints, indent=1) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    _write_hints(path, hints)
     out = {"va": f"{va:#010x}", "captures": len(names)}
     if test:
         report = recover.test_lifted(va)

@@ -60,9 +60,11 @@ def test_agent_work_paths_are_allowed(path):
     assert decide("Write", file_path=path, content="x")[0] == "allow"
 
 
-def test_harness_edits_need_approval(tmp_path, monkeypatch):
+@pytest.mark.parametrize("path", ["cmre/difftest.py", "tests/test_cmre_guard.py", "pytest.ini"])
+def test_engineering_edits_are_allowed_without_a_prompt(tmp_path, monkeypatch, path):
+    # ADR 0011: agents decide engineering changes; review and tests are the control, not a prompt.
     monkeypatch.setenv('CMRE_COORDINATION_PATH', str(tmp_path / 'command.lock'))
-    assert decide("Edit", file_path="cmre/difftest.py", old_string="a", new_string="b")[0] == "ask"
+    assert decide("Edit", file_path=path, old_string="a", new_string="b")[0] == "allow"
 
 
 def decide_with_lease(lease_path, tool, **tool_input):
@@ -93,17 +95,17 @@ def test_any_cmre_edit_is_denied_while_a_writer_holds_the_lease(tmp_path, path):
         assert decide_with_lease(lease, "Write", file_path=path, content="x")[0] == "deny"
 
 
-def test_cmre_edits_need_approval_again_once_the_lease_is_free(tmp_path):
+def test_cmre_edits_are_allowed_again_once_the_lease_is_free(tmp_path):
     from cmre import coordination
     lease = tmp_path / "command.lock"
     with coordination.lock(lease):
         pass  # released; the probe must not leave it held either
-    assert decide_with_lease(lease, "Edit", file_path="cmre/difftest.py", old_string="a", new_string="b")[0] == "ask"
+    assert decide_with_lease(lease, "Edit", file_path="cmre/difftest.py", old_string="a", new_string="b")[0] == "allow"
     with coordination.lock(lease):  # would raise BusyError if the guard leaked its probe lock
         pass
 
 
-APPROVAL_TESTS = ("tests/test_cmre_guard.py::test_harness_edits_need_approval",
+APPROVAL_TESTS = ("tests/test_cmre_guard.py::test_engineering_edits_are_allowed_without_a_prompt",
                   "tests/test_cmre_guard.py::test_codex_authorization_does_not_override_preservation",
                   "tests/test_cmre_guard_adapters.py::"
                   "test_explicit_scope_avoids_repeat_approval_without_weakening_preservation")
@@ -181,8 +183,10 @@ def test_python_inside_quotes_is_not_a_command(command):
     assert decide("Bash", command=command)[0] == "allow"
 
 
-def codex_hook(tool, tool_input, *, scopes=()):
+def codex_hook(tool, tool_input, *, scopes=(), lease=None):
     hook_env = dict(os.environ, CMRE_AUTHORIZED_PATHS=json.dumps(scopes))
+    if lease is not None:  # a suite run under `cmre_session.py` holds the real lease
+        hook_env["CMRE_COORDINATION_PATH"] = str(lease)
     return subprocess.run(
         [sys.executable, str(GUARD), "--codex"],
         input=json.dumps({"hook_event_name": "PreToolUse", "tool_name": tool,
@@ -194,11 +198,11 @@ def codex_hook(tool, tool_input, *, scopes=()):
 @pytest.mark.parametrize("path,expected", [
     ("recovery/c/fn_00450a70.c", 0),
     ("CM0102/Game/cm0102.exe", 2),
-    ("cmre/guard.py", 2),
+    ("cmre/guard.py", 0),
 ])
-def test_codex_patch_command_payload(path, expected):
+def test_codex_patch_command_payload(path, expected, tmp_path):
     patch = f"*** Begin Patch\n*** Update File: {path}\n@@\n-a\n+b\n*** End Patch"
-    result = codex_hook("apply_patch", {"command": patch})
+    result = codex_hook("apply_patch", {"command": patch}, lease=tmp_path / "command.lock")
     assert result.returncode == expected, result.stderr
     assert not result.stdout.strip()  # Codex must never receive unsupported `ask`.
 
@@ -222,9 +226,10 @@ def test_codex_shell_payload():
 @pytest.mark.parametrize("tool,tool_input,expected", [
     ("Bash", {"command": "py -3.13 -m cmre status"}, 0),
     ("Bash", {"command": "git push origin main"}, 2),
-    ("apply_patch", {"command": "*** Begin Patch\n*** Update File: cmre/guard.py\n@@\n-a\n+b\n*** End Patch"}, 2),
+    ("apply_patch", {"command": "*** Begin Patch\n*** Update File: cmre/guard.py\n@@\n-a\n+b\n*** End Patch"}, 0),
+    ("apply_patch", {"command": "*** Begin Patch\n*** Update File: recovery/ledger/fn_x.json\n@@\n-a\n+b\n*** End Patch"}, 2),
 ])
-def test_configured_codex_hook_from_subdirectory(tool, tool_input, expected):
+def test_configured_codex_hook_from_subdirectory(tool, tool_input, expected, tmp_path):
     if not (env.ROOT / ".codex" / "hooks.json").is_file():
         pytest.skip("host Codex hook configuration unavailable; synthetic guard checks still run")
     config = json.loads((env.ROOT / ".codex" / "hooks.json").read_text())
@@ -239,7 +244,8 @@ def test_configured_codex_hook_from_subdirectory(tool, tool_input, expected):
         input=json.dumps({"hook_event_name": "PreToolUse", "tool_name": tool,
                           "tool_input": tool_input}),
         capture_output=True, text=True, cwd=env.ROOT / "recovery",
-        env=dict(os.environ, CMRE_AUTHORIZED_PATHS="[]"), timeout=handler["timeout"],
+        env=dict(os.environ, CMRE_AUTHORIZED_PATHS="[]",
+                 CMRE_COORDINATION_PATH=str(tmp_path / "command.lock")), timeout=handler["timeout"],
     )
     assert result.returncode == expected, result.stderr
     assert not result.stdout.strip()

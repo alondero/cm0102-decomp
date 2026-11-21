@@ -111,6 +111,24 @@ def _kernel32():
     return k
 
 
+class Plateau:
+    """Ends a round once no new target function has been reached for `seconds`.
+    Holiday saturates (two seasons reached little new code), so game time past the
+    plateau belongs to a different activity. None, 0 or a negative value disables the stop."""
+
+    def __init__(self, seconds: float | None, *, start: float):
+        self.seconds, self.since, self.best, self.fired = max(0, seconds or 0), start, 0, False
+
+    def update(self, now: float, *, reached: int) -> bool:
+        if reached > self.best:
+            self.best, self.since = reached, now
+        self.fired = self.fired or bool(self.seconds) and now - self.since >= self.seconds
+        return self.fired
+
+    def reason(self) -> str:
+        return f"plateau: no new target function for {round(self.seconds / 60)} min"
+
+
 class Recorder:
     """Attach to one running pinned game process and capture entry inputs for `targets`.
 
@@ -295,16 +313,17 @@ class Recorder:
         self.stats["seconds_frozen"] += time.perf_counter() - started
 
     # session ----------------------------------------------------------------------------------
-    def run(self, seconds: float, status_path: Path | None = None) -> dict:
+    def run(self, seconds: float, status_path: Path | None = None, plateau_seconds: float | None = None) -> dict:
         k = self.k
         if not k.DebugActiveProcess(self.pid):
             raise OSError(ctypes.get_last_error(), "cannot attach to the game process")
         k.DebugSetProcessKillOnExit(False)
         event = _DebugEvent()
         deadline, last_status, exited = time.monotonic() + seconds, 0.0, False
+        plateau = Plateau(plateau_seconds, start=time.monotonic())
         try:
             pending = list(self.targets)
-            while time.monotonic() < deadline and not exited:
+            while time.monotonic() < deadline and not exited and not plateau.fired:
                 if k.WaitForDebugEvent(ctypes.byref(event), 50):
                     code, status = event.dwDebugEventCode, DBG_CONTINUE
                     if code == CREATE_PROCESS_DEBUG_EVENT:
@@ -340,10 +359,14 @@ class Recorder:
                 for va in [va for va, when in self.rearm_at.items() if when <= now]:
                     del self.rearm_at[va]
                     self._arm(va)
-                if status_path is not None and now - last_status > 5:
+                if now - last_status > 5:
                     last_status = now
-                    self._status(status_path)
+                    plateau.update(now, reached=sum(1 for va in self.targets if self.hits[va]))
+                    if status_path is not None:
+                        self._status(status_path)
         finally:
+            if plateau.fired:
+                self.stats["stopped"] = plateau.reason()
             if not exited:
                 for va in list(self.armed):
                     self._disarm(va)

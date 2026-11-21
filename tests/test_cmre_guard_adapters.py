@@ -25,7 +25,7 @@ def test_explicit_scope_avoids_repeat_approval_without_weakening_preservation(tm
     monkeypatch.setenv('CMRE_COORDINATION_PATH', str(tmp_path / 'command.lock'))
     monkeypatch.setenv('CMRE_AUTHORIZED_PATHS', json.dumps(['cmre/', 'tests/']))
     assert guard.decide('Edit', {'file_path': 'cmre/difftest.py'})[0] == 'allow'
-    assert guard.decide('Edit', {'file_path': 'pytest.ini'})[0] == 'ask'
+    assert guard.decide('Edit', {'file_path': 'pytest.ini'})[0] == 'allow'
     monkeypatch.setenv('CMRE_AUTHORIZED_PATHS', json.dumps(['recovery/ledger/']))
     assert guard.decide('Edit', {'file_path': 'recovery/ledger/fn_x.json'})[0] == 'deny'
 

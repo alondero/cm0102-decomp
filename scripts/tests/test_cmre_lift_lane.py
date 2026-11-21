@@ -77,6 +77,16 @@ def test_new_captures_reopen_a_function(tmp_path):
     assert ops.expanded == [[A], [A]]
 
 
+def test_a_new_expander_version_reopens_low_coverage_functions(tmp_path, monkeypatch):
+    ops = Ops({A: ['c1']})
+    lane.run_once(ops, tmp_path / 'state.json', jobs=1)
+    monkeypatch.setattr(lane, 'EXPANDER_VERSION', lane.EXPANDER_VERSION + '-next')
+    lane.run_once(ops, tmp_path / 'state.json', jobs=1)
+    assert ops.expanded == [[A], [A]]
+    lane.run_once(ops, tmp_path / 'state.json', jobs=1)
+    assert ops.expanded == [[A], [A]]               # once per version, not every round
+
+
 def test_a_busy_writer_leaves_the_accept_for_the_next_round(tmp_path):
     answers = iter(['busy', 'accepted'])
     ops = Ops({A: ['c1']}, apply_status={A: {'status': 'pass', 'coverage': 0.9}}, accept=lambda fn: next(answers))
