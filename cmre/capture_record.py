@@ -114,10 +114,10 @@ def _kernel32():
 class Plateau:
     """Ends a round once no new target function has been reached for `seconds`.
     Holiday saturates (two seasons reached little new code), so game time past the
-    plateau belongs to a different activity. None or 0 disables the stop."""
+    plateau belongs to a different activity. None, 0 or a negative value disables the stop."""
 
     def __init__(self, seconds: float | None, *, start: float):
-        self.seconds, self.since, self.best, self.fired = seconds or 0, start, 0, False
+        self.seconds, self.since, self.best, self.fired = max(0, seconds or 0), start, 0, False
 
     def update(self, now: float, *, reached: int) -> bool:
         if reached > self.best:

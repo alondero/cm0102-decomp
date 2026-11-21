@@ -377,11 +377,12 @@ def expand(va: int, *, iterations: int = 600, target: float = 0.9, limit: int = 
     if compare:
         sites = _compare_sites(machine, starts)
         queue, tried = list(corpus), set()
-        while queue and spent < iterations and len(covered) / len(starts) < target and added < limit:
+        while sites and queue and spent < iterations and len(covered) / len(starts) < target and added < limit:
             parent = queue.pop(0)
+            spent += 1  # the traced run is an emulator run of the same budget
             _, observed = _traced_run(machine, va, opts, parent, sites)
             for mutant, notes in _i2s_mutants(machine, parent, observed):
-                if spent >= iterations or added >= limit:
+                if spent >= iterations or added >= limit or len(covered) / len(starts) >= target:
                     break
                 key = (parent["name"], repr(notes))
                 if key in tried:

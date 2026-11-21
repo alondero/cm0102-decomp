@@ -750,7 +750,7 @@ def main(argv=None) -> int:
     s.add_argument('--pid', type=int, help='record: the running pinned cm0102.exe process')
     s.add_argument('--seconds', type=float, default=600, help='record: session length')
     s.add_argument('--plateau-minutes', type=float, default=30,
-                   help='record: detach early after this long with no new target function reached (0 = never)')
+                   help='record: detach early after this long with no new target function reached (0 or less = never)')
     s.add_argument('--per-function', type=int, default=24, help='record: coverage-adding captures kept per function')
     s.add_argument('--status', type=Path, help='record: live JSON progress file')
     s.add_argument('--iterations', type=int, default=1500, help='expand: mutation attempts per function')

@@ -70,8 +70,8 @@ inform inputs; C validation and acceptance wait for the required gate.
    inherit and reverify its proof automatically, including at finalization.
 
    Completion: observed failure and an explicit target behaviour, with files in scope.
-2. Make the change and run its focused check. User authorization for this task
-   covers necessary edits; honor it if a runtime guard asks about harness files.
+2. Make the change and run its focused check. Harness edits need no prompt
+   (ADR 0011); while a recovery writer holds the lease, edit in a worktree.
    The guard denies every `cmre/` edit while a recovery writer holds the command
    lease, because a running revalidation or batch would load the change mid-run.
    Edit in a separate worktree while a run is active, then merge one batch

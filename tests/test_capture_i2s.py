@@ -115,3 +115,59 @@ def test_tracing_leaves_the_run_unchanged():
     for result in (traced, again):
         assert (result.outcome, result.regs, result.covered, result.events) == (
             plain.outcome, plain.regs, plain.covered, plain.events)
+
+
+# mov eax,[ecx]; cmp eax,0x12345; jne +5; mov edx,1;
+# mov eax,[ecx+4]; cmp eax,0x777; jne +5; mov edx,2; ret
+TWO_BRANCHES = bytes.fromhex('8b01' '3d45230100' '7505' 'ba01000000'
+                             '8b4104' '3d77070000' '7505' 'ba02000000' 'c3')
+
+
+def _expand_world(monkeypatch, code=TWO_BRANCHES):
+    """`expand` over a synthetic image with one stored capture; returns (saved, runs)."""
+    machine = emu.Machine(_image(code), watch=(CODE, CODE + len(code)))
+    starts = capture_expand._starts_from_bytes(CODE, code)
+    parent = _parent({'ecx': HEAP + 8}, pages={HEAP: bytes(PAGE)})
+    stored = SimpleNamespace(regs=parent['regs'], stack=parent['stack'], pages=parent['pages'],
+                             import_seed=0, fpcw=None)
+    saved, runs = [], []
+    real_run = capture_expand._run
+    monkeypatch.setattr(capture_expand, '_function', lambda va: (set(starts), (CODE, CODE + len(code))))
+    monkeypatch.setattr(capture_expand, '_machine', lambda va, region: (OPTS, machine))
+    monkeypatch.setattr(capture, 'names_for', lambda va: ['p'])
+    monkeypatch.setattr(capture, 'load', lambda va, name: stored)
+    monkeypatch.setattr(capture, 'save', lambda va, regs, fpcw, stack, pages, seed, meta:
+                        saved.append(meta) or f'd{len(saved)}')
+    monkeypatch.setattr(capture_expand, '_run', lambda *a: runs.append(1) or real_run(*a))
+    return saved, runs
+
+
+def test_expand_solves_both_branches_with_comparison_guidance(monkeypatch):
+    saved, _ = _expand_world(monkeypatch)
+    result = capture_expand.expand(CODE, iterations=40, target=1.0)
+    assert result['coverage'] == 1.0 and result['added_compare'] == 2
+    assert all(meta['strategy'] == 'compare' for meta in saved)
+
+
+def test_expand_without_compare_never_traces(monkeypatch):
+    saved, _ = _expand_world(monkeypatch)
+    def refuse(*a, **k):
+        raise AssertionError('compare phase ran')
+    monkeypatch.setattr(capture_expand, '_traced_run', refuse)
+    monkeypatch.setattr(capture_expand, '_compare_sites', refuse)
+    result = capture_expand.expand(CODE, iterations=40, target=1.0, compare=False)
+    assert result['added_compare'] == 0
+    assert all('strategy' not in meta for meta in saved)
+
+
+def test_expand_stays_within_its_iteration_budget(monkeypatch):
+    _, runs = _expand_world(monkeypatch)  # `_traced_run` executes through `_run`, so traces count here
+    capture_expand.expand(CODE, iterations=3, target=1.0)
+    corpus_replays = 1
+    assert len(runs) - corpus_replays <= 3
+
+
+def test_expand_stops_comparison_mutants_at_the_coverage_target(monkeypatch):
+    saved, _ = _expand_world(monkeypatch)
+    result = capture_expand.expand(CODE, iterations=40, target=0.85)  # 8 of 9 instructions
+    assert result['added'] == 1 and len(saved) == 1

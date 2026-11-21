@@ -19,7 +19,7 @@ def test_any_new_function_restarts_the_quiet_period():
 
 
 def test_zero_or_none_disables_the_stop():
-    for seconds in (0, None):
+    for seconds in (0, None, -60):
         watch = capture_record.Plateau(seconds, start=0.0)
         assert not watch.update(10 ** 9, reached=1)
 
