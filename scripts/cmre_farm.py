@@ -66,7 +66,7 @@ NOTABLE_EVENTS = ('farm-exit', 'open-defect', 'model-unavailable', 'model-limite
 # Settings `set` may change on a running farm (RUN/control.json), applied on the next tick.
 CONTROL_KEYS = ('workers', 'audit_workers', 'min_bytes', 'max_bytes', 'ladder', 'audit_model',
                 'confirm_model', 'include_held', 'skip_ranges', 'attempt_minutes', 'stall_minutes',
-                'lift_lane_minutes')
+                'lift_lane_minutes', 'input_lane_workers')
 SUPPLY_KEYS = ('min_bytes', 'max_bytes', 'include_held', 'skip_ranges')   # changes that reselect the frontier
 RESTART_SECONDS = 30         # supervisor pause before relaunching a farm that died
 MAX_RESTARTS_PER_HOUR = 5    # more than this is a crash loop: stop and wake the coordinator
@@ -109,6 +109,9 @@ class Item:
     module: str
 
 
+FARM_LANE_STOP = 'stopped by the farm (deadline or drain)'
+
+
 @dataclass
 class FarmConfig:
     workers: int
@@ -127,6 +130,7 @@ class FarmConfig:
     continuous: bool = False       # idle and rescan on empty supply; only STOP or the deadline ends the run
     rescan_seconds: float = 120    # how often an empty frontier is fetched again
     lift_lane_minutes: float = 0   # captures -> accepted lifts pass (scripts/cmre_lift_lane.py); 0 disables
+    input_lane_workers: int = 0    # authored-input workers (scripts/cmre_input_lane.py, ADR 0013); 0 disables
 
 
 def parse_ranges(text):
@@ -686,6 +690,9 @@ class Farm:
         self.last_input_check = None
         self.lift_launch = None     # callable(command) -> process with poll(); None: subprocess.Popen
         self.lift_proc, self.last_lift = None, None
+        self.input_launch = None    # callable(command) -> process; None: subprocess.Popen
+        self.input_proc, self.last_input_launch = None, None
+        self.input_drain = False    # an exit-when-empty farm stopped its lane to finish
         self.recheck_ready = set()  # parked work stays durable until its verification finishes
         self.retried = {}          # fn -> parked record of a function returned to the queue
         self.state['deadline_at'] = None if config.hours is None else time.time() + config.hours * 3600
@@ -1053,7 +1060,7 @@ class Farm:
 
     def finished(self):
         return (self.stopping() and not self.running and not self.accept_queue
-                and not self.verifying and self.lift_proc is None)
+                and not self.verifying and self.lift_proc is None and self.input_proc is None)
 
     def drained(self):
         """The run is over. A continuous farm ends only on STOP or its deadline: with no supply
@@ -1064,8 +1071,13 @@ class Farm:
         if self.config.continuous:
             return False
         supply_done = self.frontier == [] or self.config.workers == 0
-        return (not self.running and not self.pending and not self.accept_queue
+        done = (not self.running and not self.pending and not self.accept_queue
                 and not self.verifying and not self.audit_queue and self.lift_proc is None and supply_done)
+        if done and self.input_proc is not None:
+            self.input_drain = True   # the lane would supply forever: stop it, then exit
+            self._stop_input_lane()
+            return False
+        return done
 
     # -- live control
     def _control(self):
@@ -1134,6 +1146,7 @@ class Farm:
                 'unavailable_models': dict(self.state['unavailable_models']),
                 'limited': {p: v['until'] for p, v in self.state.get('limited_providers', {}).items()
                             if v['until'] > time.time()},
+                'input_lane': input_lane_summary(self.run_dir),
                 'stopping': self.stopping()}
 
     # -- supply
@@ -2206,6 +2219,7 @@ class Farm:
         self._requests()  # admit requests unblocked by acceptance before deciding the run drained
         self._input_arrivals()
         self._lift_lane()
+        self._input_lane()
         self._dispatch()
         self.save()
         self.observe()
@@ -2249,6 +2263,58 @@ class Farm:
         self.last_lift = self.clock()
         self._event('lift-lane-start')
 
+    def _input_lane(self):
+        """Keep one input-lane process running beside the farm (ADR 0013).
+
+        It is the farm's own supply source: model workers author entry inputs for unlifted
+        functions and every pass becomes an accepted lift the C frontier picks up on its
+        next rescan. On 21 Nov the farm sat supply-empty while only the coordinator did this.
+        The lane reads RUN/STOP and RUN/control.json itself; the farm relaunches it if it exits."""
+        if self.input_proc is not None:
+            code = self.input_proc.poll()
+            if code is None:
+                if self.stopping():
+                    self._stop_input_lane()   # the lane reads STOP files, not the farm deadline
+                return
+            self.input_proc = None
+            self._event('input-lane-exit', code=code)
+            if code == 0:   # a clean exit may follow new lifts; a refused start (lock held) does not
+                self.frontier, self.last_scan = None, None
+        workers = self.config.input_lane_workers or 0
+        if workers <= 0 or self.stopping() or self.launcher is None or self.input_drain:
+            return
+        stop = self.run_dir / 'input-lane' / 'STOP'
+        try:
+            mine = stop.read_text(encoding='utf-8') == FARM_LANE_STOP
+        except OSError:
+            mine = None
+        if mine is False:
+            return   # someone paused the input lane by hand
+        if mine:
+            stop.unlink(missing_ok=True)   # the farm's own stop from an earlier deadline
+        if self.last_input_launch is not None and self.clock() - self.last_input_launch < 300:
+            return
+        command = [sys.executable, str(Path(__file__).resolve().parent / 'cmre_input_lane.py'), 'run',
+                   str(self.run_dir), '--workers', str(workers), '--ladder', ','.join(self.config.ladder),
+                   '--attempt-minutes', str(self.config.attempt_minutes)]
+        (self.run_dir / 'input-lane').mkdir(parents=True, exist_ok=True)
+        self.input_proc = (self.input_launch or self._popen_input)(command)
+        self.last_input_launch = self.clock()
+        self._event('input-lane-start', workers=workers)
+
+    def _stop_input_lane(self):
+        stop = self.run_dir / 'input-lane' / 'STOP'
+        if not stop.exists():
+            stop.parent.mkdir(parents=True, exist_ok=True)
+            stop.write_text(FARM_LANE_STOP, encoding='utf-8')
+            self._event('input-lane-stop')
+
+    def _popen_input(self, command):
+        logs = self.run_dir / 'input-lane'
+        return subprocess.Popen(command, cwd=self.root, stdin=subprocess.DEVNULL,
+                                stdout=(logs / 'lane.out').open('ab'), stderr=(logs / 'lane.err').open('ab'),
+                                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+
     def _popen_lift(self, command):
         logs = self.run_dir / 'lift-lane'
         return subprocess.Popen(command, cwd=self.root, stdin=subprocess.DEVNULL,
@@ -2279,9 +2345,9 @@ class Farm:
 # Every state the farm cannot leave by itself, with the lane that owns it and its next action.
 # Before 19 Nov these were one "parked" count; nothing said who moved them, so they piled up.
 LANES = {
-    'lift': ('lift lane (automatic; farm runs scripts/cmre_lift_lane.py)',
-             'low-coverage: record more captures (CAPTURE.md) or add c-independent hints; '
-             'py -3.13 scripts/cmre_lift_lane.py status'),
+    'lift': ('input lane + lift lane (automatic; farm runs scripts/cmre_input_lane.py and cmre_lift_lane.py)',
+             'low-coverage: the input lane authors inputs (py -3.13 scripts/cmre_input_lane.py status RUN); '
+             'captures (CAPTURE.md) add game-observed ones'),
     'input-needed': ('input lane (farm re-gates by itself when hints change)',
                      'py -3.13 scripts/cmre_farm.py inputs RUN; add evidenced hints'),
     'budget-bound': ('Adam: shared budget hints for accepted lifts',
@@ -3271,6 +3337,31 @@ def _request(run_dir, fn, kind, **data):
     return path
 
 
+def input_lane_summary(run_dir):
+    """Input-lane counts from RUN/input-lane/events.jsonl, or None when the lane never ran."""
+    path = Path(run_dir) / 'input-lane' / 'events.jsonl'
+    if not path.exists():
+        return None
+    events, _ = _read_events(path, 0)
+    running, accepted, accepted_bytes = set(), set(), 0
+    for event in events:
+        name, key = event.get('event'), (event.get('fn'), event.get('n'))
+        if name == 'dispatch':
+            running.add(key)
+        elif name in ('result', 'model-limited'):
+            running.discard(key)
+        elif name in ('lane-start', 'lane-exit', 'interrupted'):
+            if name == 'interrupted':
+                running.discard(key)
+            else:
+                running.clear()   # a killed lane writes no exit; its successor's start ends its jobs
+        counted = name == 'accepted' or (name == 'screen-accept' and event.get('outcome') == 'accepted')
+        if counted and event.get('fn') not in accepted:
+            accepted.add(event.get('fn'))
+            accepted_bytes += event.get('bytes') or 0
+    return {'running': len(running), 'accepted': len(accepted), 'accepted_bytes': accepted_bytes}
+
+
 def status_line(s):
     models = ', '.join(f"{m} {v['passes']}/{v['attempts']}" for m, v in s['by_model'].items())
     return (f"accepted {s['accepted_functions']} fn / {s['accepted_bytes']} B in {s['hours']} h "
@@ -3285,6 +3376,8 @@ def status_line(s):
              + ''.join(f" | LIMITED {p} until {time.strftime('%H:%M', time.localtime(until))}"
                        for p, until in s.get('limited', {}).items())
              + (f" | QUARANTINED {','.join(sorted(s['quarantined']))}" if s.get('quarantined') else '')
+            + (f" | inputs: running {s['input_lane']['running']}, accepted {s['input_lane']['accepted']} fn / "
+               f"{s['input_lane']['accepted_bytes']} B" if s.get('input_lane') else '')
             + (f" | SUPPLY EMPTY {round((time.time() - s['supply_empty_since']) / 60)} min: work the supply lane"
                if s.get('supply_empty_since') and not s['stopping'] else '')
             + (' | STOPPING' if s['stopping'] else ''))
@@ -3683,6 +3776,9 @@ def main(argv=None):
     r.add_argument('--rescan-minutes', type=float, default=2, help='how often an empty queue is fetched again')
     r.add_argument('--lift-lane-minutes', type=float, default=60,
                    help='run scripts/cmre_lift_lane.py (captures -> accepted lifts) this often; 0 disables')
+    r.add_argument('--input-lane-workers', type=int, default=4,
+                   help='model workers authoring entry inputs for unlifted functions '
+                        '(scripts/cmre_input_lane.py, ADR 0013); 0 disables')
     st = sub.add_parser('start', help='run the farm detached under a restart supervisor; args as for run')
     st.add_argument('run_dir')
     st.add_argument('run_args', nargs=argparse.REMAINDER)
@@ -3703,6 +3799,7 @@ def main(argv=None):
     se.add_argument('--attempt-minutes', type=float)
     se.add_argument('--stall-minutes', type=float)
     se.add_argument('--lift-lane-minutes', type=float, help='lift-lane pass interval; 0 disables')
+    se.add_argument('--input-lane-workers', type=int, help='input-lane model workers; 0 dispatches no new input jobs')
     se.add_argument('--add-hours', type=float, help='extend the deadline')
     ln = sub.add_parser('lanes', help='every state the farm cannot leave by itself: owner, bytes, next action')
     ln.add_argument('run_dir')
@@ -3986,7 +4083,7 @@ def main(argv=None):
                         owner=a.owner or f'farm-{run_dir.name}', stall_minutes=a.stall_minutes,
                         confirm_model=a.confirm_model or None, skip_ranges=tuple(parse_ranges(a.skip_ranges)),
                         continuous=not a.exit_when_empty, rescan_seconds=a.rescan_minutes * 60,
-                        lift_lane_minutes=a.lift_lane_minutes)
+                        lift_lane_minutes=a.lift_lane_minutes, input_lane_workers=a.input_lane_workers)
     from concurrent.futures import ThreadPoolExecutor
     with RunLock(run_dir), ThreadPoolExecutor(max_workers=max(1, a.verify_threads)) as verifier:
         (run_dir / 'STOP').unlink(missing_ok=True)

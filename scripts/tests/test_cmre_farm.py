@@ -4919,3 +4919,135 @@ def test_actionable_view_names_failed_checks_and_quarantine_journal(root, monkey
     text = capsys.readouterr().out
     assert 'push destination visibility is unknown' in text
     assert 'example.invalid' not in text
+
+
+# --- input lane (authored inputs -> accepted lifts; ADR 0013) -----------------
+
+def input_farm(root, workers=3):
+    clock = {'now': 0.0}
+    f, cmre, launcher = make(root, [], writes(GOOD), input_lane_workers=workers, continuous=True, hours=None)
+    f.clock = lambda: clock['now']
+    procs = []
+    f.input_launch = lambda command: procs.append(FakeLiftProc(command)) or procs[-1]
+    return f, clock, procs
+
+
+def test_an_empty_frontier_still_has_a_supply_process_beside_it(root):
+    """21 Nov: queue 0, idle 16 and the lift lane processed 0 every hour; nothing made supply."""
+    f, clock, procs = input_farm(root)
+    f.tick()
+    assert len(procs) == 1
+    command = procs[0].command
+    assert command[1].endswith('cmre_input_lane.py') and command[2] == 'run'
+    assert command[command.index('--workers') + 1] == '3'
+    assert command[command.index('--ladder') + 1] == 'm/cheap,m/strong'
+    assert 'input-lane-start' in [e['event'] for e in events(f.run_dir)]
+
+
+def test_the_input_lane_is_relaunched_after_it_exits_but_not_in_a_tight_loop(root):
+    f, clock, procs = input_farm(root)
+    f.tick()
+    procs[0].code = 1
+    clock['now'] = 10
+    f.tick()
+    assert len(procs) == 1                          # exit recorded, relaunch waits
+    assert [e for e in events(f.run_dir) if e['event'] == 'input-lane-exit'][0]['code'] == 1
+    clock['now'] = 400
+    f.tick()
+    assert len(procs) == 2
+
+
+def test_the_input_lane_is_off_at_zero_and_live_settable(root):
+    f, clock, procs = input_farm(root, workers=0)
+    f.tick()
+    assert procs == []
+    (f.run_dir / 'control.json').write_text(json.dumps({'input_lane_workers': 2}))
+    f.tick()
+    assert len(procs) == 1
+
+
+def test_a_stopping_farm_waits_for_the_input_lane_to_exit(root):
+    f, clock, procs = input_farm(root)
+    f.tick()
+    (f.run_dir / 'STOP').write_text('stop')
+    f.tick()
+    assert not f.finished()                          # the lane is applying or finishing a job
+    procs[0].code = 0
+    f.tick()
+    assert f.finished() and len(procs) == 1
+
+
+def test_status_line_reports_input_lane_supply(root):
+    f, clock, procs = input_farm(root)
+    lane = f.run_dir / 'input-lane'
+    lane.mkdir(parents=True, exist_ok=True)
+    rows = [{'event': 'dispatch', 'fn': 'fn_00401000', 'n': 1}, {'event': 'dispatch', 'fn': 'fn_00402000', 'n': 2},
+            {'event': 'result', 'fn': 'fn_00401000', 'n': 1}, {'event': 'accepted', 'fn': 'fn_00401000', 'bytes': 900}]
+    (lane / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+    line = farm.status_line(f.summary())
+    assert 'inputs: running 1, accepted 1 fn / 900 B' in line
+
+
+def test_a_refused_input_lane_start_does_not_force_frontier_rescans(root):
+    f, clock, procs = input_farm(root)
+    f.tick()
+    f.frontier, f.last_scan = [item('fn_00401000')], 0.0
+    procs[0].code = 1                                # e.g. another lane already owns the run
+    f._input_lane()
+    assert f.frontier == [item('fn_00401000')]
+
+
+def test_a_killed_lane_does_not_leave_phantom_running_jobs(root):
+    f, clock, procs = input_farm(root)
+    lane = f.run_dir / 'input-lane'
+    lane.mkdir(parents=True, exist_ok=True)
+    rows = [{'event': 'dispatch', 'fn': 'fn_00401000', 'n': 1}, {'event': 'lane-start'}]
+    (lane / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+    assert farm.input_lane_summary(f.run_dir)['running'] == 0
+
+
+def test_a_farm_deadline_stops_the_input_lane(root):
+    """Re-review: the lane watched only STOP files, so a farm past its deadline never finished."""
+    f, clock, procs = input_farm(root)
+    f.tick()
+    f.deadline = 50.0
+    clock['now'] = 60.0
+    f.tick()
+    assert (f.run_dir / 'input-lane' / 'STOP').exists() and not f.finished()
+    procs[0].code = 0
+    f.tick()
+    assert f.finished()
+
+
+def test_an_extended_deadline_relaunches_a_lane_the_farm_stopped(root):
+    f, clock, procs = input_farm(root)
+    f.tick()
+    f.deadline = 50.0
+    clock['now'] = 60.0
+    f.tick()
+    procs[0].code = 0
+    f.tick()
+    f.deadline = 10_000.0
+    clock['now'] = 1_000.0
+    f.tick()
+    assert len(procs) == 2 and not (f.run_dir / 'input-lane' / 'STOP').exists()
+
+
+def test_a_user_lane_stop_is_left_in_place(root):
+    f, clock, procs = input_farm(root)
+    lane = f.run_dir / 'input-lane'
+    lane.mkdir(parents=True, exist_ok=True)
+    (lane / 'STOP').write_text('pause inputs')
+    f.tick()
+    assert (lane / 'STOP').read_text() == 'pause inputs'
+
+
+def test_an_exit_when_empty_farm_stops_its_input_lane_before_exiting(root):
+    f, clock, procs = input_farm(root)
+    f.config.continuous = False
+    f.tick()
+    f.frontier = []
+    assert not f.drained() and (f.run_dir / 'input-lane' / 'STOP').exists()
+    procs[0].code = 0
+    f.tick()
+    assert f.drained()
