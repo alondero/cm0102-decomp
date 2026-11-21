@@ -335,6 +335,22 @@ def test_a_usage_limit_pauses_the_provider_without_spending_an_attempt(tmp_path)
     assert [job['model'] for job, _, _ in launcher.started][-1] == 'q/strong'
 
 
+GO_MONTHLY = ('OpenCode Go monthly usage limit reached. Switch to a free model, or turn on Extra Usage '
+              'on the Go page in OpenCode Console to keep going.')
+
+
+def test_a_paid_usage_limit_leaves_free_models_usable(tmp_path):
+    l, _, _, _ = make_lane(tmp_path, {})
+    l._pause('p/paid', GO_MONTHLY, 600)
+    assert not l._available('p/paid')
+    assert l._available('p/hy4-flash-free')
+    l._pause('p/hy4-flash-free', 'Too Many Requests', 60)
+    assert not l._available('p/hy4-flash-free')
+    assert not l._available('p/paid')
+    l._pause('q/paid', 'quota', 600)
+    assert not l._available('q/other-free')
+
+
 def test_a_busy_writer_leaves_the_pass_for_a_later_apply(tmp_path):
     l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, apply='busy',
                                         gate={'fn_00401000': {'status': 'pass', 'coverage': 0.7}})

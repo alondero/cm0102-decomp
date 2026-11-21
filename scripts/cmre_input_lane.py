@@ -268,8 +268,21 @@ class Lane:
             self.ladder = list(control['ladder'])
 
     def _available(self, model):
-        until = self.state['limited'].get(model.split('/', 1)[0], 0)
-        return until <= self.clock()
+        """A provider limit pauses every tier; provider:paid only paid models; provider:free only free."""
+        import cmre_farm
+        provider = model.split('/', 1)[0]
+        tier = 'free' if cmre_farm._is_free_model(model) else 'paid'
+        limited = self.state['limited']
+        return max(limited.get(provider, 0), limited.get(f'{provider}:{tier}', 0)) <= self.clock()
+
+    def _pause(self, model, message, seconds):
+        import cmre_farm
+        provider = model.split('/', 1)[0]
+        if cmre_farm._is_free_model(model):
+            key = f'{provider}:free'
+        else:   # a limit that says to switch to a free model covers the paid tier only
+            key = f'{provider}:paid' if cmre_farm.FREE_EXEMPT.search(message or '') else provider
+        self.state['limited'][key] = self.clock() + seconds
 
     def _model(self, attempt):
         for model in self.ladder[min(attempt, len(self.ladder) - 1):] if self.ladder else []:
@@ -430,7 +443,7 @@ class Lane:
         if not limit:
             return False
         message, seconds = limit
-        self.state['limited'][job['model'].split('/', 1)[0]] = self.clock() + seconds
+        self._pause(job['model'], message, seconds)
         self.event('model-limited', fn=job['fn'], n=job['n'], model=job['model'], seconds=seconds, message=message)
         self.save()
         return True

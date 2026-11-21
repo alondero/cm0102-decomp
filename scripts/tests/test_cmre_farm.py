@@ -3518,6 +3518,47 @@ def test_a_limited_provider_falls_through_to_another_providers_rung(root, monkey
     assert [r['model'] for r in f.state['attempts']['fn_00401000']] == ['mm/b']
 
 
+GO_MONTHLY_LIMIT = ('OpenCode Go monthly usage limit reached. Switch to a free model, or turn on '
+                    'Extra Usage on the Go page in OpenCode Console to keep going.')
+
+
+def test_a_paid_usage_limit_leaves_the_providers_free_models_usable(root, monkeypatch):
+    # 2026-11-21: the Go monthly limit (until 12-08) paused opencode-go/hy4-flash-free, the
+    # ladder's best free rung, although the limit message itself says to switch to a free model.
+    monkeypatch.setattr(farm.time, 'time', lambda: 1000.0)
+    f, cmre, launcher = make(root, [item('fn_00401000')], writes(GOOD), workers=1,
+                             ladder=['go/hy4-flash-free', 'mm/b'])
+    f.state['limited_providers'] = {'go': {'until': 4600, 'message': GO_MONTHLY_LIMIT}}
+    assert f._limited_until('go/paid-model') == 4600
+    assert f._limited_until('go/hy4-flash-free') is None
+    assert f._limited_until('go/hy4-flash-free#low') is None
+    assert 'LIMITED go (paid) until' in farm.status_line(f.summary())
+    drain(f)
+    assert [job['model'] for job, _, _ in launcher.started] == ['go/hy4-flash-free']
+    assert cmre.accepted == ['fn_00401000']
+
+
+def test_a_free_models_limit_pauses_only_the_free_tier(root, monkeypatch):
+    monkeypatch.setattr(farm.time, 'time', lambda: 1000.0)
+    f, _, _ = make(root, [], writes(GOOD), workers=0, ladder=['go/hy4-flash-free', 'go/paid'])
+    f.state['limited_providers'] = {'go': {'until': 9000, 'message': GO_MONTHLY_LIMIT}}
+    job = f._new_job('translate', 'fn_00401000', 'go/hy4-flash-free', bytes=200)
+    f._launch(job)
+    f._limited(job, 'Too Many Requests', 60)
+    assert f.state['limited_providers']['go'] == {'until': 9000, 'message': GO_MONTHLY_LIMIT}
+    assert f._limited_until('go/hy4-flash-free') == 1060
+    assert f._limited_until('go/paid') == 9000
+    f.state['limited_providers']['go']['until'] = 0
+    assert f._limited_until('go/paid') is None
+
+
+def test_a_generic_provider_limit_still_pauses_free_models(root, monkeypatch):
+    monkeypatch.setattr(farm.time, 'time', lambda: 1000.0)
+    f, _, _ = make(root, [], writes(GOOD), workers=0)
+    f.state['limited_providers'] = {'go': {'until': 4600, 'message': 'quota exhausted'}}
+    assert f._limited_until('go/hy4-flash-free') == 4600
+
+
 @pytest.mark.parametrize('source, accepted', [(GOOD, True), (GOOD.replace('a + 1', 'a + 2'), False)])
 def test_default_terra_lane_works_when_other_providers_are_limited(root, monkeypatch, source, accepted):
     monkeypatch.setattr(farm.time, 'time', lambda: 1000.0)
