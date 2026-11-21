@@ -82,7 +82,10 @@ of the function. `apply` selects a covering set, writes it to the function's
 hints as `captures` (removing `"auto": true`, which claims the hint), and runs
 the unchanged lifted gate. Its summary lists `passing` functions and their
 bytes. Both commands default to every function that has stored captures; name
-`fn_XXXXXXXX` IDs to bound them. Neither takes the writer lease.
+`fn_XXXXXXXX` IDs to bound them. `expand` takes no lease. `apply` holds the
+writer lease only while it writes each hint, waiting out a running session
+check or accept: hints are declared test inputs, and a write during a check
+makes its evidence inconclusive.
 
 If greedy selection would replace an existing prefix, prepare a private
 append-only proposal for review and supported hint application instead.

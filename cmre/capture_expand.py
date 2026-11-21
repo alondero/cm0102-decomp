@@ -455,6 +455,29 @@ def select(va: int, limit: int | None = None) -> list[str]:
     return sorted(chosen)
 
 
+LEASE_POLL_SECONDS = 5
+LEASE_WAIT_SECONDS = 2 * 3600
+
+
+def _write_hints(path, hints: dict) -> None:
+    """Hints are declared test inputs: write them only under the writer lease, waiting
+    for a session check or accept to finish, so their evidence stays conclusive."""
+    from . import coordination
+    import time
+    deadline = time.monotonic() + LEASE_WAIT_SECONDS
+    while True:
+        try:
+            with coordination.writer():
+                temporary = path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(hints, indent=1) + "\n", encoding="utf-8")
+                temporary.replace(path)
+            return
+        except coordination.BusyError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(LEASE_POLL_SECONDS)
+
+
 def apply(va: int, *, test: bool = True) -> dict:
     """List the selected captures in the function's hints, then run the unchanged lifted gate."""
     from . import difftest, recover
@@ -466,9 +489,7 @@ def apply(va: int, *, test: bool = True) -> dict:
     hints.pop("auto", None)  # a claimed hint: automatic inference no longer rewrites it
     hints["captures"] = names
     difftest.validate_hints(hints)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(hints, indent=1) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    _write_hints(path, hints)
     out = {"va": f"{va:#010x}", "captures": len(names)}
     if test:
         report = recover.test_lifted(va)
