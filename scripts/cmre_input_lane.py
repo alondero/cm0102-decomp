@@ -39,6 +39,7 @@ LANE_VERSION = 'input-lane/1'
 MAX_ATTEMPTS = 3            # worker attempts per function and hint state (one per ladder rung)
 ATTEMPT_MINUTES = 30
 STALL_MINUTES = 15
+INFRA_PAUSE_SECONDS = 3600   # auth/key failure: pause the provider, retry hourly in case it is renewed
 CANDIDATE_REFRESH_SECONDS = 600
 SCREEN_JOBS = 2
 SKIP_STATUSES = ('lift-blocked', 'fail', 'error', 'not-unlifted')
@@ -459,9 +460,24 @@ class Lane:
         except OSError:
             return False
 
+    def _pause_provider(self, model, message, seconds):
+        """A key/auth failure covers every model of the provider, free or paid."""
+        self.state['limited'][model.split('/', 1)[0]] = self.clock() + seconds
+
     def _worker_done(self, job, handle, interrupted):
-        if self._record_limit(job, handle) and not self._spec_changed(job):
-            return   # not an attempt: the function returns to the queue on the next refresh
+        # Limits first, as in the farm: a quota limit can also match the infra pattern.
+        if self._record_limit(job, handle):
+            if not self._spec_changed(job):
+                return   # not an attempt: the function returns to the queue on the next refresh
+        else:
+            infra = handle.infra_error() if hasattr(handle, 'infra_error') else None
+            if infra and not self._spec_changed(job):
+                # A provider/auth failure (2026-11-21 23:04: "401 api_key_expired") is not an attempt.
+                self._pause_provider(job['model'], infra, INFRA_PAUSE_SECONDS)
+                self.event('model-unavailable', fn=job['fn'], n=job['n'], model=job['model'],
+                           seconds=INFRA_PAUSE_SECONDS, error=str(infra)[:300])
+                self.save()
+                return
         # A limit that ends a worker after it wrote a new spec still gates that work.
         self._submit_gate(job, self._worker_line(handle), interrupted)
 

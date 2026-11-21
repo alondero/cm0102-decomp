@@ -3384,7 +3384,7 @@ def input_lane_summary(run_dir):
         name, key = event.get('event'), (event.get('fn'), event.get('n'))
         if name == 'dispatch':
             running.add(key)
-        elif name in ('result', 'model-limited'):
+        elif name in ('result', 'model-limited', 'model-unavailable'):
             running.discard(key)
         elif name in ('lane-start', 'lane-exit', 'interrupted'):
             if name == 'interrupted':
@@ -3590,7 +3590,8 @@ class OpencodeHandle:
             if '"type":"error"' in line.replace(' ', '') and INFRA_ERROR.search(line):
                 try:
                     data = json.loads(line)['error']
-                    return str((data.get('data') or {}).get('message') or data.get('name'))
+                    return str(data.get('message') or (data.get('data') or {}).get('message')
+                               or data.get('name') or data.get('type'))
                 except (ValueError, KeyError, TypeError, AttributeError):
                     return line[:300]
         return None

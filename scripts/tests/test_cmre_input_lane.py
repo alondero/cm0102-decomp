@@ -372,6 +372,63 @@ def test_a_limit_after_real_work_still_gates_the_written_spec(tmp_path):
     assert not l._available('p/cheap')
 
 
+class AuthLauncher(Launcher):
+    def start(self, job, prompt, agent):
+        handle = super().start(job, prompt, agent)
+        handle.infra_error = lambda: 'This API key has expired. Create a new API key in OpenCode Console'
+        return handle
+
+
+def test_an_expired_key_pauses_the_provider_and_spends_no_attempt(tmp_path):
+    # 2026-11-21 23:04: jobs 39-50 died on "401 api_key_expired"; each spent an attempt.
+    l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1)
+    l.launcher = AuthLauncher(tmp_path)
+    l.tick()
+    l.tick()
+    assert ops.gates == [] and l.state['functions']['fn_00401000'].get('attempts', []) == []
+    assert not l._available('p/cheap') and not l._available('p/other')
+    assert any(e['event'] == 'model-unavailable' for e in
+               map(json.loads, (l.dir / 'events.jsonl').read_text().splitlines()))
+
+
+def test_a_quota_limit_that_also_looks_like_infra_stays_a_timed_limit(tmp_path):
+    # MiniMax "Token Plan usage limit" is type provider.quota: it matches both detectors.
+    l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1)
+    l.launcher = AuthLauncher(tmp_path, limit=('The Token Plan usage limit has been reached.', 900))
+    l.tick()
+    l.tick()
+    assert l.state['limited'] == {'p': pytest.approx(1900.0)}
+    names = [json.loads(x)['event'] for x in (l.dir / 'events.jsonl').read_text().splitlines()]
+    assert 'model-limited' in names and 'model-unavailable' not in names
+
+
+def test_an_expired_key_on_a_free_model_pauses_the_whole_provider(tmp_path):
+    l, _, _, _ = make_lane(tmp_path, {})
+    l.ladder = ['p/x-free']
+    l._pause_provider('p/x-free', 'This API key has expired', 3600)
+    assert not l._available('p/x-free') and not l._available('p/paid')
+
+
+def test_the_farm_lane_summary_ends_a_job_on_model_unavailable(tmp_path):
+    import cmre_farm
+    l, _, _, _ = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1)
+    l.launcher = AuthLauncher(tmp_path)
+    l.tick()
+    l.tick()
+    # the key failure ended job 1; job 2 (the next rung) is the only one still running
+    assert [job['model'] for job, _, _ in l.running] == ['q/strong']
+    assert cmre_farm.input_lane_summary(l.run_dir)['running'] == 1
+
+
+def test_handle_infra_error_reports_the_error_message(tmp_path):
+    import cmre_farm
+    log = tmp_path / 'w.jsonl'
+    log.write_text(json.dumps({'type': 'error', 'error': {
+        'type': 'provider.auth', 'status': 401,
+        'message': 'This API key has expired. Create a new API key in OpenCode Console.'}}) + '\n')
+    assert cmre_farm.OpencodeHandle(None, log).infra_error().startswith('This API key has expired')
+
+
 def test_a_no_route_pauses_only_that_model_and_spends_no_attempt(tmp_path):
     l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1,
                                         limit=('Model unavailable: p/cheap', 3600))
