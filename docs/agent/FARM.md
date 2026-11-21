@@ -665,6 +665,10 @@ the fixtures that reach new instructions to the canonical hints under the writer
 lease, and runs `cmre accept`. A refused accept restores the previous hints.
 New lifts reach the C translators on the next frontier rescan.
 
+- When a worker probe finishes with a pass or mismatch, the lane can collect it
+  before the worker exits. It freezes the spec only if its hash and the probe's
+  base-hint hash match, then stops the worker and runs its usual independent gate
+  on that snapshot. A probe result is not acceptance evidence.
 - Order: nearest the coverage threshold first, then larger. A never-gated
   function is gated once first, and if that gate passes it is accepted with no
   model call. Each function gets three attempts per canonical-hint state, one

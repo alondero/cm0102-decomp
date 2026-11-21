@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -183,6 +184,99 @@ def test_a_worker_claim_is_not_evidence(tmp_path):
     assert ops.applies == []
     row = l.state['functions']['fn_00401000']
     assert row['best']['coverage'] == 0.52 and 'status' not in row
+
+
+@pytest.mark.parametrize(('reported', 'verified'), [('pass', 'pass'), ('pass', 'low-coverage'), ('fail', 'fail')])
+def test_a_terminal_probe_result_gates_the_exact_spec_without_waiting_for_worker_exit(tmp_path, reported, verified):
+    fn = 'fn_00401000'
+    l, ops, _, _ = make_lane(tmp_path, {fn: candidate(700)}, workers=1,
+                              gate={fn: {'status': verified, 'coverage': 0.71}})
+    l.tick()
+    job, handle, _ = l.running[0]
+    handle.code = None
+    spec = Path(job['spec'])
+    data = b'{"fixtures":[{"name":"checked"}]}'
+    spec.write_bytes(data)
+    spec.with_suffix('.probe-result.json').write_text(json.dumps({
+        'fn': fn, 'status': reported, 'spec_sha256': hashlib.sha256(data).hexdigest(),
+        'prior_sha256': 'h' * 64,
+    }))
+    gate = ops.gate
+
+    def check_snapshot(fn, path, model):
+        spec.write_bytes(b'{"fixtures":[{"name":"different"}]}')
+        assert path != spec and path.read_bytes() == data
+        return gate(fn, path, model)
+
+    ops.gate = check_snapshot
+    l.tick()
+    assert handle.killed and ops.gates == [(fn, 'p/cheap')]
+    assert bool(ops.applies) == (verified == 'pass')
+    assert l.state['functions'][fn]['attempts'][0]['status'] == verified
+
+
+@pytest.mark.parametrize('stale', ['spec_sha256', 'prior_sha256'])
+def test_a_terminal_probe_from_different_inputs_does_not_interrupt_the_worker(tmp_path, stale):
+    fn = 'fn_00401000'
+    l, ops, _, _ = make_lane(tmp_path, {fn: candidate(700)}, workers=1)
+    l.tick()
+    job, handle, _ = l.running[0]
+    handle.code = None
+    spec = Path(job['spec'])
+    result = {'fn': fn, 'status': 'pass', 'spec_sha256': hashlib.sha256(spec.read_bytes()).hexdigest(),
+              'prior_sha256': 'h' * 64}
+    result[stale] = '0' * 64
+    spec.with_suffix('.probe-result.json').write_text(json.dumps(result))
+    l.tick()
+    assert not handle.killed and not ops.gates
+
+
+def test_early_probe_keeps_the_provider_cooldown_and_does_not_park_mismatch_on_drifted_hints(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, _, _ = make_lane(tmp_path, {fn: candidate(700)}, workers=1, limit=('quota', 600),
+                              gate={fn: {'status': 'fail', 'prior_sha256': 'x' * 64,
+                                         'mismatches': [{'case': 3}]}})
+    l.tick()
+    job, handle, _ = l.running[0]
+    handle.code = None
+    spec = Path(job['spec'])
+    spec.with_suffix('.probe-result.json').write_text(json.dumps({
+        'fn': fn, 'status': 'fail', 'spec_sha256': hashlib.sha256(spec.read_bytes()).hexdigest(),
+        'prior_sha256': 'h' * 64,
+    }))
+    l.tick()
+    assert l.state['limited'].get('p') == pytest.approx(1600.0)
+    row = l.state['functions'][fn]
+    assert row['accept'] == 'hints-changed' and 'mismatches' not in row and row.get('status') != 'fail'
+    assert not ops.applies
+
+
+def test_worker_probe_publishes_terminal_result_bound_to_the_bytes_it_read(tmp_path, monkeypatch):
+    fn = 'fn_00401000'
+    spec = tmp_path / 'spec.json'
+    data = b'{"fixtures":[]}'
+    spec.write_bytes(data)
+    monkeypatch.setattr(probe, 'gate_spec', lambda *args: {'fn': fn, 'status': 'pass', 'prior_sha256': None})
+    assert probe.main(['gate', fn, str(spec)]) == 0
+    assert json.loads(spec.with_suffix('.probe-result.json').read_text()) == {
+        'fn': fn, 'status': 'pass', 'prior_sha256': None, 'spec_sha256': hashlib.sha256(data).hexdigest(),
+    }
+
+
+def test_worker_probe_still_prints_its_result_if_the_optional_receipt_cannot_be_written(tmp_path, monkeypatch, capsys):
+    from cmre import coordination
+
+    def refuse(*args):
+        raise PermissionError('receipt not writable')
+
+    fn = 'fn_00401000'
+    spec = tmp_path / 'spec.json'
+    spec.write_bytes(b'{"fixtures":[]}')
+    result = {'fn': fn, 'status': 'fail', 'prior_sha256': None, 'mismatches': [{'case': 3}]}
+    monkeypatch.setattr(probe, 'gate_spec', lambda *args: result)
+    monkeypatch.setattr(coordination, 'atomic_bytes', refuse)
+    assert probe.main(['gate', fn, str(spec)]) == 0
+    assert json.loads(capsys.readouterr().out) == result
 
 
 def test_failed_attempts_escalate_and_continue_from_the_best_spec(tmp_path):
