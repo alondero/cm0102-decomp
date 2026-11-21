@@ -1,1 +1,0 @@
-/* WIP: REP MOVSD and MOVSB at VA 0x004CA242/0x004CA248 execute without CLD. The result and memory accesses depend on incoming EFLAGS.DF, which the plain-C contract does not expose; no faithful C substitute or test is available. */

@@ -84,8 +84,11 @@ void CM_FASTCALL cm_fn_00403c80(int param_1, u32 param_2)
   u8 mode;
   int edi;
   int ebx;
-  int x;
-  int y;
+  u32 x;
+  u32 y;
+  u32 coordinate;
+  u32 color;
+  u8 extent;
 
   if (CM_FIELD(0xbed) == 0) {
     cm_fn_00944cff(0x009873c0u, 0, 0, (void *)(buf + 0x100), (void *)buf);
@@ -122,9 +125,13 @@ void CM_FASTCALL cm_fn_00403c80(int param_1, u32 param_2)
                  CM_FIELD(0xb8a) - 1, flags, CM_COLOR(hi16, DAT_00ae317e), 0);
 
   /* 0x00403dcf: y at 0x00403dcc, x at 0x00403dac, colour from ECX (0x00403d90) */
-  y = (int)(0x14 - (int)DAT_009cd6bc) / 2 + (int)CM_FIELD(0xb7a) + ebx;
-  x = (int)(0x14 - (int)DAT_009cd6bd) / 2 + (int)CM_FIELD(0xb7e) + edi;
-  cm_fn_005e3ce0(y, x, CM_COLOR(hi16, DAT_00aebdea), &DAT_009cd6bc);
+  extent = CM_GLOBAL(volatile u8, 0x009cd6bd);
+  color = CM_COLOR(hi16, CM_GLOBAL(volatile u16, 0x00aebdea));
+  x = CM_FIELD(0xb7e) + (u32)((0x14 - (int)extent) / 2) + (u32)edi;
+  coordinate = CM_FIELD(0xb7a);
+  extent = CM_GLOBAL(volatile u8, 0x009cd6bc);
+  y = coordinate + (u32)((0x14 - (int)extent) / 2) + (u32)ebx;
+  cm_fn_005e3ce0((s32)y, (s32)x, color, &DAT_009cd6bc);
 
   /* 0x00403dfc */
   cm_fn_005e5df0(CM_FIELD(0xb7a), CM_FIELD(0xb8a), CM_FIELD(0xb82),
@@ -150,7 +157,10 @@ void CM_FASTCALL cm_fn_00403c80(int param_1, u32 param_2)
 
   /* 0x00403ece: colour low half from 0x00403e81 (`mov ax, word ptr [0xaebdea]`),
      whose upper half is the 0x005e5df0 result still in EAX. */
-  y = (int)(0x14 - (int)DAT_009cd6bc) / 2 + (int)CM_FIELD(0xb7a) + ebx;
-  x = (int)(0x14 - (int)DAT_009cd6bd) / 2 + (int)CM_FIELD(0xb8e) + 1 + edi;
-  cm_fn_005e3ce0(y, x, CM_COLOR(ret, DAT_00aebdea), &DAT_009cd6dc);
+  color = CM_COLOR(ret, CM_GLOBAL(volatile u16, 0x00aebdea));
+  extent = CM_GLOBAL(volatile u8, 0x009cd6bd);
+  x = CM_FIELD(0xb8e) + (u32)((0x14 - (int)extent) / 2) + 1u + (u32)edi;
+  extent = CM_GLOBAL(volatile u8, 0x009cd6bc);
+  y = CM_FIELD(0xb7a) + (u32)((0x14 - (int)extent) / 2) + (u32)ebx;
+  cm_fn_005e3ce0((s32)y, (s32)x, color, &DAT_009cd6dc);
 }
