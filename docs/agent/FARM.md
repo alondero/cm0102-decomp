@@ -128,7 +128,7 @@ failing case for mismatches). Work the lane with the most bytes that you own:
 
 | Lane | Owner | Moves by |
 |---|---|---|
-| `lift` | lift lane (automatic) | farm runs it; low coverage needs more captures |
+| `lift` | input lane + lift lane (automatic) | farm runs both; low coverage gets authored inputs and captures |
 | `gate-mismatch`, `contract` | expert session | `cm-decompile` from the retained `RUN/src` candidate, then `cmre accept fn_X --c` |
 | `input-needed`, `hint-evidence` | input lane | evidenced hints; the farm re-gates by itself |
 | `budget-bound` | Adam | C exhausts the 200k budget; a raised budget changes shared hints of an accepted lift |
@@ -650,6 +650,43 @@ Audit workers do not run `cmre mutate` (it outlives the worker shell's 2-minute
 timeout). When triaging an open defect by hand, `cmre mutate fn_X` shows operator
 mutants that survive the corpus; a surviving mutant on a line the listing proves
 is a weak test, not a defect by itself.
+
+### Input lane
+
+[ADR 0013](../adr/0013-input-lane-authored-entry-inputs.md). The farm keeps one
+`scripts/cmre_input_lane.py run RUN` process beside its translators
+(`--input-lane-workers`, default 4; `set RUN --input-lane-workers N` changes it
+live, and 0 stops dispatch). It is the farm's own supply source. Each job asks
+one ladder model to write a compact input spec for one unlifted function
+(arena records, stack words, globals, `vary` axes) and gate it with
+`scripts/cmre_input_probe.py`. The lane then re-gates the spec itself, appends
+the fixtures that reach new instructions to the canonical hints under the writer
+lease, and runs `cmre accept`. A refused accept restores the previous hints.
+New lifts reach the C translators on the next frontier rescan.
+
+- Order: nearest the coverage threshold first, then larger. A never-gated
+  function is gated once first, and if that gate passes it is accepted with no
+  model call. Each function gets three attempts per canonical-hint state, one
+  ladder rung each. Each later attempt starts from the best spec so far.
+- Skipped: hard work holds, blocked records, lift `lift-blocked`, `fail` and
+  `error`. A mismatch found with authored inputs is recorded in
+  `RUN/input-lane/state.json` for triage and is never reshaped away.
+- Stopping: the lane obeys `RUN/STOP` and `RUN/input-lane/STOP`, kills its
+  running workers and finishes in-flight gates. At its deadline, or when an
+  `--exit-when-empty` farm drains, the farm writes the lane's STOP itself and
+  waits for it to exit. The farm removes only its own marker on a later
+  relaunch (for example after `set --add-hours`). A hand-written
+  `input-lane/STOP` pauses the lane until you delete it.
+- Poor targets: functions whose uncovered code lies behind an import result,
+  such as file open or allocation failure. The lane adds no import transcripts,
+  so after three `no-new-reach` attempts it leaves them alone.
+- Watch it with `cmre_farm.py status RUN` (`inputs: running N, accepted K fn /
+  B`), `scripts/cmre_input_lane.py status RUN`, and `plan RUN --top 20` for the
+  next candidates. Events, specs, proposals and worker logs are local evidence
+  under `RUN/input-lane/`; never publish them.
+- An expert session does not hand-author fixtures for a function the lane can
+  reach. Improve the lane instead (prompt, probe spec format, ordering) and
+  measure the change in bytes moved out of `unlifted`.
 
 ## Session throughput rules (measured 2026-11-21)
 
