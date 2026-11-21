@@ -736,6 +736,283 @@ def test_review_claim_cli_is_immutable_and_required_by_adopt(root, monkeypatch, 
     assert not list((f.run_dir / 'requests').glob('*.json'))
 
 
+def prepare_hand_claim(root, monkeypatch):
+    run = root / 'CM0102/Analysis/cmre/farm/fake-run'
+    run.mkdir(parents=True)
+    fn = 'fn_00401000'
+    canonical = root / 'recovery/c' / f'{fn}.c'
+    canonical.write_bytes(b'reviewed C bytes\n')
+    state = {'defects': {fn: ['original listing concern']}}
+    (run / 'state.json').write_text(json.dumps(state), encoding='utf-8')
+    claim = farm.claim_review(run, root, fn, 'hand-start')
+    monkeypatch.setattr(farm, 'ROOT', root)
+    args = ['prepare-hand', str(run), fn, '--review-receipt', claim['review_receipt']]
+    return run, fn, canonical, args
+
+
+def test_prepare_hand_copies_only_immutable_claim_bytes_without_overwriting(root, monkeypatch, capsys):
+    run, fn, canonical, args = prepare_hand_claim(root, monkeypatch)
+    assert farm.main(args) == 0
+    result = json.loads(capsys.readouterr().out)
+    source = run / 'hand' / f'{fn}.c'
+    assert result == {'fn': fn, 'status': 'prepared', 'source': str(source.resolve())}
+    assert source.read_bytes() == canonical.read_bytes() == b'reviewed C bytes\n'
+    source.write_bytes(b'worker in progress\n')
+    assert farm.main(args) == 2
+    assert json.loads(capsys.readouterr().out)['status'] == 'conflict'
+    assert source.read_bytes() == b'worker in progress\n'
+    assert canonical.read_bytes() == b'reviewed C bytes\n'
+    assert not (run / 'requests').exists()
+
+
+def test_prepare_hand_claim_scoped_paths_preserve_existing_work(root, monkeypatch, capsys):
+    run, fn, canonical, args = prepare_hand_claim(root, monkeypatch)
+    legacy = run / 'hand' / f'{fn}.c'
+    assert farm.main(args) == 0
+    capsys.readouterr()
+    legacy.write_bytes(b'prior hand work')
+
+    assert farm.main([*args, '--claim-scoped']) == 0
+    first = Path(json.loads(capsys.readouterr().out)['source'])
+    assert first == run / 'hand' / f'{fn}-hand-start.c'
+    assert first.read_bytes() == canonical.read_bytes()
+    first.write_bytes(b'current hand work')
+
+    assert farm.main([*args, '--claim-scoped']) == 2
+    assert json.loads(capsys.readouterr().out)['status'] == 'conflict'
+    second_claim = farm.claim_review(run, root, fn, 'independent-review')
+    assert farm.main([*args[:-1], second_claim['review_receipt'], '--claim-scoped']) == 0
+    second = Path(json.loads(capsys.readouterr().out)['source'])
+    assert second == run / 'hand' / f'{fn}-independent-review.c'
+    assert second.read_bytes() == canonical.read_bytes()
+    assert first.read_bytes() == b'current hand work'
+    assert legacy.read_bytes() == b'prior hand work'
+    assert not (run / 'requests').exists()
+
+
+@pytest.mark.parametrize('changed', ['canonical-source', 'new-finding', 'quarantined', 'snapshot'])
+def test_prepare_hand_refuses_stale_inputs_without_making_a_work_file(root, monkeypatch, capsys, changed):
+    run, fn, canonical, args = prepare_hand_claim(root, monkeypatch)
+    if changed == 'canonical-source':
+        canonical.write_bytes(b'changed by another job')
+    elif changed == 'snapshot':
+        Path(args[-1]).with_name('source.c').write_bytes(b'drifted immutable input')
+    else:
+        path = run / 'state.json'
+        state = json.loads(path.read_bytes())
+        if changed == 'new-finding':
+            state['defects'][fn].append('new concern')
+        else:
+            state['quarantined'] = {fn: {}}
+        path.write_text(json.dumps(state), encoding='utf-8')
+    assert farm.main(args) == 2
+    status = json.loads(capsys.readouterr().out)['status']
+    assert status == ('acceptance-quarantined' if changed == 'quarantined' else 'fresh-review-required')
+    assert not (run / 'hand').exists()
+
+
+def test_prepare_hand_does_not_publish_partial_bytes_after_write_failure(root, monkeypatch, capsys):
+    from contextlib import contextmanager
+
+    run, fn, _, args = prepare_hand_claim(root, monkeypatch)
+    normal = os.fdopen
+
+    class BrokenWriter:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def write(self, data):
+            self.stream.write(data[:1])
+            raise OSError('injected partial write')
+
+    @contextmanager
+    def failing_fdopen(*args, **kwargs):
+        with normal(*args, **kwargs) as stream:
+            yield BrokenWriter(stream)
+
+    with monkeypatch.context() as edit:
+        edit.setattr(os, 'fdopen', failing_fdopen)
+        assert farm.main(args) == 2
+    capsys.readouterr()
+    source = run / 'hand' / f'{fn}.c'
+    assert not source.exists()
+    assert farm.main(args) == 0
+    assert source.read_bytes() == b'reviewed C bytes\n'
+
+
+def test_prepare_hand_refuses_a_redirected_hand_directory(root, monkeypatch, capsys):
+    run, _, _, args = prepare_hand_claim(root, monkeypatch)
+    other = root / 'outside-hand'
+    other.mkdir()
+    try:
+        (run / 'hand').symlink_to(other, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f'directory symlink unavailable: {error}')
+    assert farm.main(args) == 2
+    assert 'must not be redirected' in json.loads(capsys.readouterr().out)['reason']
+    assert list(other.iterdir()) == []
+
+
+def test_prepare_hand_refuses_other_run_receipt_and_nonstandard_run(root, monkeypatch, capsys):
+    run, _, _, args = prepare_hand_claim(root, monkeypatch)
+    other = run.with_name('other-run')
+    other.mkdir()
+    (other / 'state.json').write_bytes((run / 'state.json').read_bytes())
+    assert farm.main([args[0], str(other), *args[2:]]) == 2
+    assert json.loads(capsys.readouterr().out)['status'] == 'fresh-review-required'
+    assert not (other / 'hand').exists()
+    relocated = root / 'nonstandard-run'
+    run.rename(relocated)
+    receipt = str((relocated / 'reviews/hand-start/receipt.json').resolve())
+    assert farm.main([args[0], str(relocated), *args[2:-1], receipt]) == 2
+    assert 'existing run under' in json.loads(capsys.readouterr().out)['reason']
+    assert not (relocated / 'hand').exists()
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='covers Windows directory replacement during hand preparation')
+def test_prepare_hand_pins_directory_through_file_creation(root, monkeypatch, capsys):
+    run, fn, _, args = prepare_hand_claim(root, monkeypatch)
+    hand = run / 'hand'
+    hand.mkdir()
+    displaced = run / 'old-hand'
+    other = root / 'outside-hand'
+    other.mkdir()
+    source = hand / f'{fn}.c'
+    opened = []
+    original_write = farm._WindowsHandFiles.write
+
+    def write_with_concurrent_move(tree, directory, name, content):
+        assert name == source.name
+        opened.append(True)
+        try:
+            hand.rename(displaced)
+        except PermissionError:
+            pass
+        else:
+            hand.symlink_to(other, target_is_directory=True)
+        return original_write(tree, directory, name, content)
+
+    monkeypatch.setattr(farm._WindowsHandFiles, 'write', write_with_concurrent_move)
+    assert farm.main(args) == 0
+    assert json.loads(capsys.readouterr().out)['status'] == 'prepared'
+    assert opened
+    assert source.read_bytes() == b'reviewed C bytes\n'
+    assert not displaced.exists()
+    assert list(other.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='covers Windows sharing during atomic scratch publication')
+def test_prepare_hand_can_publish_with_directory_write_sharing(root, monkeypatch, capsys):
+    import ctypes
+    from ctypes import wintypes
+
+    run, fn, _, args = prepare_hand_claim(root, monkeypatch)
+    hand = run / 'hand'
+    hand.mkdir()
+    source = hand / f'{fn}.c'
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    create_file = kernel.CreateFileW
+    create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create_file.restype = wintypes.HANDLE
+    close = kernel.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    invalid = ctypes.c_void_p(-1).value
+
+    def try_directory_write():
+        handle = create_file(str(hand), 0x40000000, 7, None, 3, 0x02200000, None)
+        if handle == invalid:
+            return ctypes.get_last_error()
+        close(handle)
+        return 0
+
+    assert try_directory_write() == 0
+    original_write = farm._WindowsHandFiles.write
+    observed = []
+
+    def write_with_directory_probe(tree, directory, name, content):
+        assert name == source.name
+        observed.append(try_directory_write())
+        return original_write(tree, directory, name, content)
+
+    monkeypatch.setattr(farm._WindowsHandFiles, 'write', write_with_directory_probe)
+    assert farm.main(args) == 0
+    assert json.loads(capsys.readouterr().out)['status'] == 'prepared'
+    assert observed == [0]
+    assert try_directory_write() == 0
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='covers Windows in-place mount points during hand preparation')
+def test_prepare_hand_does_not_follow_mount_point_set_in_place(root, monkeypatch, capsys):
+    import ctypes
+    import struct
+    from ctypes import wintypes as w
+
+    run, fn, _, args = prepare_hand_claim(root, monkeypatch)
+    hand = run / 'hand'
+    hand.mkdir()
+    outside = root / 'outside-hand'
+    outside.mkdir()
+    name = f'{fn}.c'
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, w.LPVOID, w.DWORD, w.DWORD, w.HANDLE]
+    create.restype = w.HANDLE
+    device = kernel.DeviceIoControl
+    device.argtypes = [w.HANDLE, w.DWORD, w.LPVOID, w.DWORD, w.LPVOID, w.DWORD,
+                       ctypes.POINTER(w.DWORD), w.LPVOID]
+    device.restype = w.BOOL
+    close = kernel.CloseHandle
+    close.argtypes = [w.HANDLE]
+    invalid = ctypes.c_void_p(-1).value
+    tag = 0xA0000003
+    canonical = str(outside.resolve())
+    target = ('\\??\\' + canonical).encode('utf-16-le')
+    label = canonical.encode('utf-16-le')
+    data = target + b'\0\0' + label + b'\0\0'
+    mount = struct.pack('<IHHHHHH', tag, len(data) + 8, 0, 0, len(target), len(target) + 2, len(label)) + data
+    clear = struct.pack('<IHH', tag, 0, 0)
+
+    def set_or_clear(control, payload):
+        handle = create(str(hand), 0x100, 7, None, 3, 0x02200000, None)
+        if handle == invalid:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            size = w.DWORD()
+            if not device(handle, control, payload, len(payload), None, 0, ctypes.byref(size), None):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            close(handle)
+
+    try:
+        set_or_clear(0x900A4, mount)
+    except OSError as error:
+        pytest.skip(f'attribute-only mount-point creation unavailable: {error}')
+    set_or_clear(0x900AC, clear)
+    replaced = []
+    original_write = farm._WindowsHandFiles.write
+
+    def write_with_mount_point(tree, directory, filename, content):
+        assert filename == name
+        set_or_clear(0x900A4, mount)
+        replaced.append(True)
+        try:
+            return original_write(tree, directory, filename, content)
+        finally:
+            set_or_clear(0x900AC, clear)
+
+    monkeypatch.setattr(farm._WindowsHandFiles, 'write', write_with_mount_point)
+    code = farm.main(args)
+    view = json.loads(capsys.readouterr().out)
+    assert replaced and not (outside / name).exists()
+    if code == 0:
+        assert view['status'] == 'prepared'
+        assert (hand / name).read_bytes() == b'reviewed C bytes\n'
+    else:
+        assert code == 2 and view['status'] == 'fresh-review-required'
+        assert not (hand / name).exists()
+
+
 def test_documented_lookup_cli_subprocess_reads_and_claims_fake_run(root):
     f, cmre, _ = make(root, [], writes(GOOD), workers=0)
     fn = 'fn_00401000'
@@ -4398,6 +4675,17 @@ def test_lanes_board_orders_the_expert_queue_by_bytes_and_names_each_owner():
     assert 'gate-mismatch' in text and 'fn_00408000' in text and 'cm-decompile' in text
 
 
+def test_lanes_keeps_quarantined_acceptance_out_of_retry_lanes():
+    state = lanes_state()
+    fn = 'fn_00401000'
+    state['quarantined'] = {fn: {'reason': 'accept outcome missing'}}
+    result = farm.lanes_board(state, lambda _: 72, actionable=True)
+    row, = result['acceptance-quarantined']['top']
+    assert (row['fn'], row['first']) == (fn, 'accept outcome missing')
+    assert all(fn != item['fn'] for item in result['gate-mismatch']['top'])
+    assert 'cmre work show' in result['acceptance-quarantined']['next']
+
+
 def test_recorded_blockers_route_parked_mismatches_to_harness_and_evidence_lanes():
     records = {'fn_00401000': {'state': 'harness-blocker', 'blocker': 'x87-live-stack'},
                'fn_00408000': {'state': 'evidence-needed', 'blocker': 'unproved-format'},
@@ -4407,5 +4695,227 @@ def test_recorded_blockers_route_parked_mismatches_to_harness_and_evidence_lanes
     assert board['gate-mismatch']['count'] == 0 and board['contract']['count'] == 0
     assert board['harness-blocker']['count'] == 2
     assert board['harness-blocker']['groups'] == {'x87-live-stack': [2, 150]}
+    assert 'independent review' in board['harness-blocker']['owner']
     assert board['evidence-needed']['groups'] == {'unproved-format': [1, 900]}
     assert 'x87-live-stack' in farm.lanes_text(board)
+
+
+@pytest.mark.parametrize('hold', [None, 'work', 'tool', 'both', 'below-cap', 'malformed', 'scalar'])
+def test_actionable_lanes_exposes_lift_fixtures_without_runtime_captures(root, monkeypatch, capsys, hold):
+    from types import SimpleNamespace
+
+    from cmre import env, inventory, ledger, recover, work
+
+    monkeypatch.setattr(farm, 'ROOT', root)
+    monkeypatch.setattr(env, 'ROOT', root)
+    monkeypatch.setattr(env, 'HINTS_DIR', root / 'recovery/hints')
+    monkeypatch.setattr(recover, 'execution_identity', lambda: {'target': env.TARGET_SHA256})
+    monkeypatch.setattr(inventory, 'load', lambda: SimpleNamespace(
+        functions={0x401000: SimpleNamespace(body_bytes=256), 0x402000: SimpleNamespace(body_bytes=512)}))
+    monkeypatch.setattr(ledger, 'recovered', lambda: {0x402000: object()})
+    fn = 'fn_00401000'
+    record = {'state': 'harness-blocker', 'blocker': 'unproved-boundary', 'retry_when': 'Resolve boundary'}
+    if hold == 'malformed':
+        record.update(blocker=['invalid'], retry_when=None)
+    elif hold == 'scalar':
+        record = 'invalid'
+    has_work_hold = hold in ('work', 'both', 'malformed', 'scalar')
+    monkeypatch.setattr(work, 'read', lambda: {'functions': {fn: record} if has_work_hold else {}})
+    run = root / 'run'
+    run.mkdir()
+    (run / 'state.json').write_text(json.dumps({'parked': {fn: {'detail': 'fail: 1 mismatches'}}}), encoding='utf-8')
+    if hold in ('tool', 'both', 'below-cap'):
+        from scripts.cmre_lift_lane import MAX_ERRORS
+
+        lane = root / 'CM0102/Analysis/cmre/lift-lane/state.json'
+        lane.parent.mkdir(parents=True)
+        error = {'status': 'error', 'errors': MAX_ERRORS - (hold == 'below-cap'), 'error': 'OSError: exe unreadable'}
+        lane.write_text(json.dumps({'functions': {fn: error, 'fn_00403000': error}}), encoding='utf-8')
+    elif hold == 'malformed':
+        lane = root / 'CM0102/Analysis/cmre/lift-lane/state.json'
+        lane.parent.mkdir(parents=True)
+        lane.write_text('{"functions": null}', encoding='utf-8')
+    for target in (fn, 'fn_00402000'):
+        (env.HINTS_DIR / f'{target}.json').write_text('{"fixtures": [{}]}', encoding='utf-8')
+
+    assert farm.main(['lanes', str(run), '--actionable', '--json']) == 0
+    view = json.loads(capsys.readouterr().out)
+    row, = view['fixture_lifts']
+    assert (row['fn'], row['bytes']) == (fn, 256)
+    if hold == 'scalar':
+        assert row['hold']['blocker'] == 'invalid work record'
+        assert row['command'] == f'py -3.13 -m cmre work show {fn} --json'
+    elif hold == 'malformed':
+        assert row['hold'] == {'state': 'harness-blocker', 'blocker': '', 'retry_when': ''}
+        assert row['command'] == f'py -3.13 -m cmre work show {fn} --json'
+    elif has_work_hold:
+        assert row['hold'] == {**record, 'retry_when': record['retry_when'] or ''}
+        assert row['command'] == f'py -3.13 -m cmre work show {fn}'
+    elif hold == 'tool':
+        assert row['command'] == 'py -3.13 scripts/cmre_lift_lane.py status'
+    else:
+        assert 'hold' not in row
+        assert row['command'] == f'py -3.13 -m cmre test {fn} --json'
+    if hold in ('tool', 'both'):
+        assert row['tool_error'] == {'count': MAX_ERRORS, 'detail': 'OSError: exe unreadable'}
+        assert {failure['fn'] for failure in view['lift_tool_holds']} == {fn, 'fn_00403000'}
+        assert farm.main(['lanes', str(run), '--actionable']) == 0
+        assert 'tool error retry cap' in capsys.readouterr().out
+    else:
+        assert not view['lift_tool_holds']
+    assert view['farm_state'] == str(run / 'state.json')
+
+
+@pytest.mark.parametrize('hold', [False, True])
+@pytest.mark.parametrize('origin', ['automatic', 'manual', 'both', 'stale', 'stale-lane', 'stale-both'])
+def test_actionable_lanes_points_to_an_uncovered_branch_and_its_incoming_edge(root, monkeypatch, capsys, hold, origin):
+    from types import SimpleNamespace
+
+    from cmre import difftest, env, inventory, ledger, lift, recover, work
+
+    fn = 'fn_00401000'
+    monkeypatch.setattr(farm, 'ROOT', root)
+    monkeypatch.setattr(env, 'RUNS', root / 'reports')
+    monkeypatch.setattr(env, 'HINTS_DIR', root / 'recovery/hints')
+    identity = {'target': env.TARGET_SHA256}
+    monkeypatch.setattr(recover, 'execution_identity', lambda: identity)
+    monkeypatch.setattr(inventory, 'load', lambda: SimpleNamespace(
+        functions={0x401000: SimpleNamespace(body_bytes=32)}))
+    monkeypatch.setattr(ledger, 'recovered', dict)
+    record = {'state': 'evidence-needed', 'blocker': 'proven-dead-original-coverage',
+              'retry_when': 'New original reachability evidence'}
+    monkeypatch.setattr(work, 'read', lambda: {'functions': {fn: record} if hold else {}})
+    monkeypatch.setattr(lift, 'discover', lambda va: SimpleNamespace(
+        problems=[], insns={0x401000: lift.Insn(0x401000, b'\x74\x0e', 'je', '0x401010', 0x401010, 'jcc'),
+                            0x401010: lift.Insn(0x401010, b'\xc3', 'ret', '', None, 'ret')}, tables={}))
+    run = root / 'run'
+    run.mkdir()
+    (run / 'state.json').write_text('{}', encoding='utf-8')
+    if origin in ('automatic', 'both', 'stale-lane', 'stale-both'):
+        lane = root / 'CM0102/Analysis/cmre/lift-lane/state.json'
+        lane.parent.mkdir(parents=True)
+        coverage = 0.59 if origin.startswith('stale-') else 0.58
+        lane.write_text(json.dumps({'functions': {fn: {'status': 'low-coverage', 'coverage': coverage}}}), encoding='utf-8')
+    if origin in ('manual', 'both', 'stale', 'stale-both'):
+        (env.HINTS_DIR / f'{fn}.json').write_text(json.dumps({'arg_count': 0, 'fixtures': [{
+            'regs': dict.fromkeys(difftest.emu.REG_NAMES, 0), 'stack': [],
+            'arena_template': 0, 'arena_writes': {}, 'globals': {}, 'import_seed': 1,
+        }]}), encoding='utf-8')
+    key = '1234567812345678'
+    report = env.RUNS / fn / key / 'report.json'
+    report.parent.mkdir(parents=True)
+    opts = difftest.Options.for_function(0x401000)
+    request = recover._key(identity, 0x401000, opts.__dict__, recover.LIFTED_PROFILE)
+    (env.RUNS / fn / f'request-{request}.json').write_text(json.dumps({'key': key}), encoding='utf-8')
+    report.write_text(json.dumps({'tier': 'lifted', 'status': 'low-coverage', 'va': '0x00401000',
+                                  'key': key, 'execution_identity': {} if origin == 'stale' else identity,
+                                  'difftest': {'coverage': 0.58, 'uncovered': ['0x00401010']}}), encoding='utf-8')
+
+    assert farm.main(['lanes', str(run), '--actionable', '--json']) == 0
+    view = json.loads(capsys.readouterr().out)
+    if origin.startswith('stale'):
+        assert not view['lift_branches']
+        assert [row['fn'] for row in view['fixture_lifts']] == ([fn] if origin == 'stale' else [])
+        return
+    row, = view['lift_branches']
+    assert not view['fixture_lifts']
+    assert row['evidence'] == str(report)
+    assert row['uncovered'] == '0x00401010'
+    assert row['incoming'][0]['at'] == '0x00401000'
+    if hold:
+        assert row['hold'] == record
+        assert row['command'] == f'py -3.13 -m cmre work show {fn}'
+        assert farm.main(['lanes', str(run), '--actionable']) == 0
+        display = capsys.readouterr().out
+        assert 'held: proven-dead-original-coverage' in display
+        assert 'Retry when: New original reachability evidence' in display
+    else:
+        assert 'hold' not in row
+        assert ' disasm ' in row['command']
+
+
+def test_actionable_hint_proposal_exposes_current_hold_without_hiding_evidence(root, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from cmre import env, inventory, ledger, recover, work
+
+    fn = 'fn_00401000'
+    record = {'state': 'evidence-needed', 'blocker': 'copied-original-scratch',
+              'retry_when': 'Prove copied scratch bytes at the original call'}
+    monkeypatch.setattr(farm, 'ROOT', root)
+    monkeypatch.setattr(env, 'ANALYSIS', root / 'analysis')
+    monkeypatch.setattr(inventory, 'load', lambda: SimpleNamespace(functions={}))
+    monkeypatch.setattr(ledger, 'recovered', dict)
+    monkeypatch.setattr(recover, 'execution_identity', dict)
+    monkeypatch.setattr(work, 'read', lambda: {'functions': {fn: record}})
+    run = root / 'run'
+    run.mkdir()
+    (run / 'state.json').write_text(json.dumps({
+        'parked': {fn: {'detail': 'private hint proposal requires parent validation/application'}},
+        'hint_proposals': {fn: {'receipt': 'old-proposal.json'}},
+    }), encoding='utf-8')
+
+    assert farm.main(['lanes', str(run), '--actionable', '--json']) == 0
+    proposal, = json.loads(capsys.readouterr().out)['lanes']['hint-evidence']['top']
+    assert proposal['hold'] == record
+    assert proposal['work_command'] == f'py -3.13 -m cmre work show {fn}'
+    assert proposal['evidence']['hint_proposals'] == 'old-proposal.json'
+    assert farm.main(['lanes', str(run), '--actionable']) == 0
+    display = capsys.readouterr().out
+    assert 'copied-original-scratch' in display and 'Prove copied scratch bytes' in display
+    assert 'old-proposal.json' in display
+
+
+def test_actionable_view_names_failed_checks_and_quarantine_journal(root, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from cmre import env, inventory, ledger, recover, work
+
+    monkeypatch.setattr(farm, 'ROOT', root)
+    monkeypatch.setattr(env, 'ANALYSIS', root / 'analysis')
+    monkeypatch.setattr(inventory, 'load', lambda: SimpleNamespace(functions={}))
+    monkeypatch.setattr(ledger, 'recovered', dict)
+    monkeypatch.setattr(recover, 'execution_identity', dict)
+    monkeypatch.setattr(work, 'read', lambda: {'functions': {}})
+    monkeypatch.setattr(farm.subprocess, 'run', lambda *a, **k: SimpleNamespace(stdout='a' * 40, returncode=0))
+    run = root / 'run'
+    run.mkdir()
+    journal = run / 'acceptance/attempt.json'
+    (run / 'state.json').write_text(json.dumps({'quarantined': {
+        'fn_00401000': {'reason': 'missing result', 'journal': str(journal)}
+    }}), encoding='utf-8')
+    check = env.ANALYSIS / 'cmre/sessions/20261120-check'
+    check.mkdir(parents=True)
+    (check / 'pytest.log').write_text('FAILED tests/test_example.py::test_a - assertion\n', encoding='utf-8')
+    (check / 'verify.log').write_text('BAD fn_00401000: ledger mismatch\n', encoding='utf-8')
+    (check / 'receipt.json').write_text(json.dumps({
+        'mode': 'check', 'state': 'finished', 'exit_code': 1, 'steps': [
+            {'command': ['py', '-m', 'pytest'], 'exit_code': 1, 'log': 'pytest.log',
+             'detail': 'Declared test inputs changed during pytest; evidence is inconclusive'},
+            {'command': ['py', '-m', 'cmre', 'verify'], 'exit_code': 1, 'log': 'verify.log'},
+        ]
+    }), encoding='utf-8')
+    pub = env.ANALYSIS / 'cmre/publication'
+    pub.mkdir()
+    (pub / f'{"a" * 40}.json').write_text(json.dumps({
+        'commit': 'a' * 40, 'result': 'fail', 'findings': [{
+            'kind': 'instruction-listing', 'path': 'older.c', 'detail': 'reachable from local origin/main'
+        }]
+    }), encoding='utf-8')
+
+    assert farm.main(['lanes', str(run), '--actionable']) == 0
+    text = capsys.readouterr().out
+    assert str(journal) in text and 'missing result' in text
+    assert 'FAILED tests/test_example.py::test_a' in text and 'cmre_session.py status' in text
+    assert 'Declared test inputs changed during pytest' in text
+    assert 'BAD fn_00401000: ledger mismatch' in text
+    assert 'reachable from local origin/main' in text
+
+    (pub / f'{"a" * 40}.json').write_text(json.dumps({
+        'commit': 'a' * 40, 'result': 'fail', 'findings': [],
+        'remote': {'url': 'https://example.invalid/private', 'visibility': 'UNKNOWN'},
+    }), encoding='utf-8')
+    assert farm.main(['lanes', str(run), '--actionable']) == 0
+    text = capsys.readouterr().out
+    assert 'push destination visibility is unknown' in text
+    assert 'example.invalid' not in text

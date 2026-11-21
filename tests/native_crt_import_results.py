@@ -49,6 +49,20 @@ def verify_caller(name, fields, exact, imports):
                 limitation="Verified caller plus observed endpoint SP, not callee RET tracing")
 
 
+def verify_last_error_followup(fields, exact, imports):
+    slot = fields["last_error_iat"]
+    start, end = fields["continuation"], fields["last_error_continuation"]
+    storage = fields["last_error_storage"]
+    if imports.get(slot) != "KERNEL32.dll!GetLastError" or end - start != 11:
+        raise ValueError("missing immediate GetLastError follow-up")
+    raw = exact(start, 16)
+    if raw[:1] != b"\xa3" or raw[5:11] != b"\xff\x15" + struct.pack("<I", slot):
+        raise ValueError("expected scalar store then direct GetLastError call")
+    if raw[11:] != b"\xa3" + struct.pack("<I", storage):
+        raise ValueError("GetLastError result not stored in the reported sample")
+    return {"iat": slot, "continuation": end, "storage": storage, "caller_bytes_hex": raw.hex()}
+
+
 # Minimal freestanding child. All selected continuations first store raw EAX.
 # The names 'crt' in filenames identify a supply lane, NOT original CRT frames.
 SOURCE_HEAD = r"""
@@ -63,11 +77,13 @@ API int FindNextFileA(HANDLE, void *);
 API int FileTimeToLocalFileTime(const void *, void *);
 API int FileTimeToSystemTime(const void *, void *);
 API int FindClose(HANDLE);
+API U32 GetLastError(void);
 API U32 SetErrorMode(U32);
 API void ExitProcess(U32) __attribute__((noreturn));
 _Static_assert(sizeof(void *) == 4 && sizeof(U32) == 4, "i386 only");
 unsigned char first_data[320], next_data[320], local_data[8], local_saved[8], system_data[16];
 U32 first_result, next_result, local_result, system_result;
+U32 first_last_error, next_last_error;
 U32 time_input[2] = {0x69050000, 0x01d5c036};
 const char *pattern = "authored-*.bin";
 extern char fixture_done, fixture_probe;
@@ -103,7 +119,8 @@ CALLS = (
 
 
 def child_source():
-    declarations, assembly, manifest, output = [], [".text", ".globl _calls", "_calls:"], [], []
+    declarations = ['extern U32 last_error_iat __asm__("__imp__GetLastError@0");']
+    assembly, manifest, output = [".text", ".globl _calls", "_calls:"], [], []
     for name, tag, out, inp, scalar in CALLS:
         declarations.append(f'extern U32 {tag}_iat __asm__("__imp__{name}@8");\n'
                             f'extern char {tag}_pushes, {tag}_call, {tag}_cont;')
@@ -113,6 +130,22 @@ def child_source():
             f"_{tag}_call:", f"call *__imp__{name}@8",
             f"_{tag}_cont:", f"movl %eax, _{scalar}",
         ])
+        error_binding = error_json = ""
+        if tag in ("first", "next"):
+            declarations.append(f"extern char {tag}_last_error_cont;")
+            assembly.extend([
+                "call *__imp__GetLastError@0",
+                f".globl _{tag}_last_error_cont", f"_{tag}_last_error_cont:",
+                f"movl %eax, _{tag}_last_error", f"movl _{scalar}, %eax",
+            ])
+            failed = "0xffffffff" if tag == "first" else "0"
+            error_binding = (
+                'text(",\\"last_error_iat\\":"); number((U32)&last_error_iat);'
+                f'text(",\\"last_error_continuation\\":"); number((U32)&{tag}_last_error_cont);'
+                f'text(",\\"last_error_storage\\":"); number((U32)&{tag}_last_error);')
+            error_json = (
+                f'text(",\\"last_error\\":"); number({tag}_last_error);'
+                f'text(",\\"last_error_defined\\":"); text({scalar} == {failed} ? "true" : "false");')
         # Use the real first file's last-write FILETIME as subsequent input.
         if tag == "first":
             assembly.extend(["cmpl $-1, %eax", "je 1f",
@@ -129,23 +162,24 @@ def child_source():
             f'text(",\\"{name}\\":{{\\"iat\\":"); number((U32)&{tag}_iat);'
             f'text(",\\"pushes\\":"); number((U32)&{tag}_pushes);'
             f'text(",\\"call\\":"); number((U32)&{tag}_call);'
-            f'text(",\\"continuation\\":"); number((U32)&{tag}_cont); text("}}");')
+            f'text(",\\"continuation\\":"); number((U32)&{tag}_cont);'
+            + error_binding + 'text("}");')
         output.append(
             f'text("{"," if output else ""}\\"{name}\\":{{\\"eax\\":"); number({scalar});'
             f'text(",\\"hex\\":\\""); hex({tag + "_saved" if tag == "local" else tag + "_data"}, '
-            f'{SIZES[name]}); text("\\"}}");')
+            f'{SIZES[name]}); text("\\"");' + error_json + 'text("}");')
     assembly.extend(["ret", ".globl _done_marker, _fixture_done",
                      "_done_marker:", "_fixture_done:", "int3", "ret",
                      ".globl _probe, _fixture_probe", "_probe:", "_fixture_probe:", "nop", "ret"])
     return (SOURCE_HEAD + "\n".join(declarations) + "\n__asm__(" +
             json.dumps("\n".join(assembly) + "\n") + ");\n" + r"""
 void start(void) {
-    U32 i, mode;
+    U32 i, mode, close_result = 0;
     SetErrorMode(3);
     for (i = 0; i < 320; ++i) first_data[i] = next_data[i] = 0xa5;
     for (i = 0; i < 8; ++i) local_data[i] = 0xa5;
     for (i = 0; i < 16; ++i) system_data[i] = 0xa5;
-    text("{\"version\":3,\"done\":"); number((U32)&fixture_done);
+    text("{\"version\":4,\"done\":"); number((U32)&fixture_done);
     text(",\"probe\":"); number((U32)&fixture_probe);
 """ + "\n".join(manifest) + r"""
     text("}\n");
@@ -156,10 +190,17 @@ void start(void) {
     command();
     if (*(volatile unsigned char *)&fixture_probe != 0x90) ExitProcess(74);
     probe();
+    if (first_result != 0xffffffff) close_result = FindClose((HANDLE)first_result);
     text("{");
 """ + "\n".join(output) + r"""
-    text("}\n");
-    if (first_result != 0xffffffff && !FindClose((HANDLE)first_result)) ExitProcess(73);
+    text(",\"FindClose\":{\"called\":");
+    if (first_result == 0xffffffff) text("false");
+    else {
+        text("true,\"handle\":"); number(first_result);
+        text(",\"eax\":"); number(close_result);
+    }
+    text("}}\n");
+    if (first_result != 0xffffffff && !close_result) ExitProcess(73);
     ExitProcess(0);
 }
 """)
@@ -177,7 +218,7 @@ def build_native_crt_results(directory):
     source.write_text(child_source(), encoding="ascii")
     definition.write_text("LIBRARY KERNEL32.dll\nEXPORTS\n" + "\n".join(
         [name + "@8" for name in SIZES] +
-        ["GetStdHandle@4", "ReadFile@20", "WriteFile@20", "FindClose@4",
+         ["GetStdHandle@4", "ReadFile@20", "WriteFile@20", "FindClose@4", "GetLastError@0",
          "SetErrorMode@4", "ExitProcess@4"]) + "\n", encoding="ascii")
     obj, lib, exe = (directory / n for n in ("fixture.o", "kernel32.a", "fixture.exe"))
     commands = [
@@ -210,7 +251,7 @@ def build_native_crt_results(directory):
 class NativeCrtResultsProfile(NativeResultsProfile):
     """Private authored-child seam; never usable as a game import model."""
     scenarios = {"success": "s", "exhausted": "x", "error": "e"}
-    manifest_version, event_budget = 3, 1024
+    manifest_version, event_budget = 4, 1024
     warning = ("Authored real file/time OS observations only. No original CRT frame, "
                "game parity, all-effects, timezone oracle or replay claim.")
 
@@ -228,6 +269,8 @@ class NativeCrtResultsProfile(NativeResultsProfile):
         for name in SIZES:
             fields = manifest[name]
             abi = verify_caller(name, fields, exact, self.imports)
+            if name in ("FindFirstFileA", "FindNextFileA"):
+                abi["last_error_followup"] = verify_last_error_followup(fields, exact, self.imports)
             target = struct.unpack("<I", exact(fields["iat"], 4))[0]
             info = api._MemoryInfo()
             if not k.VirtualQueryEx(process, target, ctypes.byref(info), ctypes.sizeof(info)):
@@ -310,6 +353,6 @@ def observe_native_crt_results(exe, scenario, **options):
         (directory / filename).write_bytes(b"")
     report = options.pop("report", {})
     report.update(authored_directory=str(directory), authored_files=filenames,
-                  effects_scope="Only declared bounded raw storage and actual EAX; no replay")
+                  effects_scope="Bounded raw storage, actual EAX, authored search lifecycle; no replay")
     return observe_calls(exe, scenario, _profile=NativeCrtResultsProfile(exe, directory),
                          report=report, **options)

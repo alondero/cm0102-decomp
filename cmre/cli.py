@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from importlib import import_module, metadata
 import json
 import math
 import os
@@ -41,9 +42,13 @@ def cmd_doctor(a) -> int:
 
     line(sys.version_info[:2] == env.PYTHON_REQUIRED, "python", sys.version.split()[0] + " (use `py -3.13`)")
     try:
-        import capstone, unicorn, pefile  # noqa: F401
-
-        line(True, "packages", f"unicorn {unicorn.__version__}, capstone {capstone.__version__}")
+        versions = []
+        for name in ("capstone", "unicorn", "pefile"):
+            module = import_module(name)
+            installed = metadata.version(name)
+            declared = getattr(module, "__version__", installed)
+            versions.append(f"{name} {installed}" + (f" (module declares {declared})" if declared != installed else ""))
+        line(True, "packages", ", ".join(versions))
     except ImportError as exc:
         line(False, "packages", str(exc))
     try:

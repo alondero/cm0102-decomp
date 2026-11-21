@@ -16,6 +16,7 @@ asynchronously; a defect gets one fix attempt, otherwise it is reported open.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -26,6 +27,7 @@ import re
 import subprocess
 import sys
 import time
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -2290,13 +2292,15 @@ LANES = {
                  'fix the declared return width or build/preprocessing problem, then retry RUN fn_X'),
     'safeguard-blocker': ('triage (cm-triage skill)', 'resolve the declared blocker; then retry RUN fn_X'),
     'hint-evidence': ('parent input lane', 'review RUN/hints proposal; scripts/cmre_hint_apply.py'),
-    'harness-blocker': ('harness release (ADR, worktree, Adam review): largest blocker group first',
-                        'py -3.13 -m cmre work list --state harness-blocker; release the group holding most bytes'),
+    'harness-blocker': ('harness release (worktree and independent review)',
+                        'Follow docs/agent/HARNESS.md for the blocker group holding most bytes'),
     'evidence-needed': ('triage (cm-triage skill): largest blocker group first',
                         'establish the named ABI/layout/consumer evidence, then cmre work retry fn_X --changed'),
     'worker-failure': ('coordinator', 'retry RUN fn_X --reason "transient worker failure"'),
     'other': ('coordinator', 'read the parked detail in RUN/state.json'),
     'open-defect': ('defect lane (FARM.md "Defect subagent")', 'fix or dismiss with evidence'),
+    'acceptance-quarantined': ('coordinator (manual ledger review)',
+                               'py -3.13 -m cmre work show fn_X; reconcile the retained acceptance before retry'),
     'boundary': ('none: explicit unknown (unproven callee consumption)',
                  'becomes a defect only when a consumer is shown to read the bits'),
 }
@@ -2323,12 +2327,22 @@ def parked_lane(fn, detail, state):
     return 'other'
 
 
-def lanes_board(state, size_of, lift_state=None, top=10, work_of=None):
+def _lift_function_rows(lift_state):
+    functions = lift_state.get('functions') if isinstance(lift_state, dict) else None
+    return {fn: row for fn, row in functions.items()
+            if re.fullmatch(r'fn_[0-9a-f]{8}', fn) and isinstance(row, dict)} if isinstance(functions, dict) else {}
+
+
+def lanes_board(state, size_of, lift_state=None, top=10, work_of=None, *, actionable=False):
     """work_of(fn) -> the function's `cmre work` record or None. A recorded harness or evidence
     blocker owns a parked gate failure: on 19 Nov 185 of 196 parked mismatches (260 KB) carried
     one, in 81 groups, so hand translation was the wrong lane for nearly all of them."""
     board = {name: {'owner': owner, 'next': nxt, 'count': 0, 'bytes': 0, 'top': [], 'groups': {}}
-             for name, (owner, nxt) in LANES.items()}
+             for name, (owner, nxt) in LANES.items() if actionable or name != 'acceptance-quarantined'}
+    if actionable:
+        board['lift']['next'] = 'For unheld work, ' + board['lift']['next']
+        for name in ('input-needed', 'hint-evidence'):
+            board[name]['next'] = 'Check current work holds first; ' + board[name]['next']
 
     def add(lane, fn, group=None, **extra):
         size = size_of(fn)
@@ -2340,20 +2354,31 @@ def lanes_board(state, size_of, lift_state=None, top=10, work_of=None):
             row[0] += 1
             row[1] += size
 
+    quarantined = state.get('quarantined', {}) if actionable else {}
+    for fn, value in sorted(quarantined.items()):
+        reason = value.get('reason', 'unresolved acceptance') if isinstance(value, dict) else value
+        add('acceptance-quarantined', fn, first=str(reason)[:300])
     for fn, row in sorted(state.get('parked', {}).items()):
+        if fn in quarantined:
+            continue
         detail = row.get('detail') or ''
         first = _FIRST.search(detail)
         lane, group = parked_lane(fn, detail, state), None
         record = (work_of(fn) if work_of else None) or {}
-        if lane in ('gate-mismatch', 'contract') and record.get('state') in ('harness-blocker', 'evidence-needed'):
-            lane, group = record['state'], record.get('blocker') or '(unnamed)'
+        if (lane in ('gate-mismatch', 'contract') and isinstance(record, dict)
+                and record.get('state') in ('harness-blocker', 'evidence-needed')):
+            blocker = record.get('blocker')
+            lane = record['state']
+            group = blocker if isinstance(blocker, str) and blocker else '(unnamed)'
         add(lane, fn, group, first=first.group(1) if first else detail[:120])
     for fn in sorted(state.get('defects', {})):
-        add('open-defect', fn)
+        if fn not in quarantined:
+            add('open-defect', fn)
     for fn in sorted(state.get('boundaries', {})):
-        add('boundary', fn)
-    for fn, row in sorted(((lift_state or {}).get('functions') or {}).items()):
-        if row.get('status') != 'pass':
+        if fn not in quarantined:
+            add('boundary', fn)
+    for fn, row in sorted(_lift_function_rows(lift_state).items()):
+        if row.get('status') != 'pass' and fn not in quarantined:
             add('lift', fn, first=f"{row.get('status')} coverage {row.get('coverage')}")
     for lane in board.values():
         lane['top'] = sorted(lane['top'], key=lambda r: (-r['bytes'], r['fn']))[:top]
@@ -2373,7 +2398,224 @@ def lanes_text(board):
                 f'{name} {n} fn/{size} B' for name, (n, size) in groups[:6]))
         for row in lane['top'][:5]:
             lines.append(f"{'':<20}{row['fn']} {row['bytes']:>6} B  {str(row.get('first', ''))[:90]}")
+            if hold := row.get('hold'):
+                lines.append(f"{'':<22}held: {hold['blocker'] or hold['state']}; {row['work_command']}")
+                if hold['retry_when']:
+                    lines.append(f"{'':<22}Retry when: {hold['retry_when']}")
+            for kind, path in row.get('evidence', {}).items():
+                lines.append(f"{'':<22}{kind}: {path}")
     return '\n'.join(lines)
+
+
+def _saved_lift_report(fn, identity):
+    from cmre import difftest, env, recover
+
+    va = int(fn[3:], 16)
+    directory = env.RUNS / fn
+    if not directory.is_dir():
+        return None
+    try:
+        opts = difftest.Options.for_function(va)
+        request = recover._key(identity, va, opts.__dict__, recover.LIFTED_PROFILE)
+        key = json.loads((directory / f'request-{request}.json').read_bytes())['key']
+        if not re.fullmatch(r'[a-f0-9]{16}', key):
+            return None
+        path = directory / key / 'report.json'
+        report = json.loads(path.read_bytes())
+        if (report.get('key'), report.get('tier'), report.get('va'), report.get('execution_identity')) == (
+                key, 'lifted', f'{va:#010x}', identity):
+            return path, report
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def _lift_branch(fn, coverage, saved):
+    from cmre import lift
+
+    path, report = saved
+    try:
+        diff = report['difftest']
+        if report['status'] != 'low-coverage' or diff['coverage'] != coverage:
+            return None
+        target = int(diff['uncovered'][0], 16)
+    except (ValueError, IndexError, KeyError, TypeError):
+        return None
+    decoded = lift.discover(int(fn[3:], 16))
+    if decoded.problems or target not in decoded.insns:
+        return None
+    incoming = []
+    for pc, op in sorted(decoded.insns.items()):
+        if op.target == target or (pc + op.size == target and op.kind in ('plain', 'call', 'jcc')):
+            incoming.append({'at': f'{pc:#010x}', 'instruction': f'{op.mnemonic} {op.op_str}'.strip()})
+    inspect = incoming[0]['at'] if incoming else f'{target:#010x}'
+    return {'fn': fn, 'coverage': coverage, 'uncovered': f'{target:#010x}', 'incoming': incoming[:5],
+            'evidence': str(path), 'command': f'py -3.13 -m cmre disasm {inspect} --count 12'}
+
+
+def _actionable_hold(fn, record, hard_holds):
+    if not isinstance(record, dict):
+        hold = {'state': 'unknown', 'blocker': 'invalid work record', 'retry_when': ''}
+        invalid = True
+    elif record.get('state') in hard_holds:
+        fields = {key: record.get(key, '') for key in ('state', 'blocker', 'retry_when')}
+        invalid = any(not isinstance(value, str) for value in fields.values())
+        hold = {key: value[:240] if isinstance(value, str) else '' for key, value in fields.items()}
+    else:
+        return {}
+    return {'hold': hold, 'work_command': f'py -3.13 -m cmre work show {fn}' + (' --json' if invalid else '')}
+
+
+def actionable_lanes(run_dir, board, functions, lift_state, records, state):
+    from cmre import capture, env, ledger, recover, work
+    from cmre.guard import PUBLICATION_VISIBILITIES
+    from scripts.cmre_lift_lane import MAX_ERRORS
+    from scripts.cmre_session import receipt_status
+
+    recovered = ledger.recovered()
+    blocked = ledger.blocked()
+    identity = recover.execution_identity()
+    lift_rows = _lift_function_rows(lift_state)
+    capped = {fn: {'count': result['errors'], 'detail': str(result.get('error') or '')[:240]}
+              for fn, result in lift_rows.items()
+              if int(fn[3:], 16) not in recovered and type(result.get('errors')) is int
+              and result['errors'] >= MAX_ERRORS}
+    fixture_lifts = []
+    low = {}
+    automatic_reports = {}
+    quarantined = state.get('quarantined', {})
+
+    hints_by_va = {}
+    for path in env.HINTS_DIR.glob('fn_*.json'):
+        fn = path.stem
+        if re.fullmatch(r'fn_[0-9a-f]{8}', fn):
+            va = int(fn[3:], 16)
+            if va in functions and va not in recovered and va not in blocked and fn not in quarantined:
+                hints_by_va[va] = path
+    for va, path in sorted(hints_by_va.items(), key=lambda item: (-functions[item[0]].body_bytes, item[0])):
+        fn = path.stem
+        try:
+            hints = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        fixtures = hints.get('fixtures') if isinstance(hints, dict) else None
+        if not isinstance(fixtures, list) or not fixtures:
+            continue
+        if saved := _saved_lift_report(fn, identity):
+            if fn in lift_rows:
+                automatic_reports[fn] = saved
+            else:
+                _, report = saved
+                diff = report.get('difftest')
+                coverage = diff.get('coverage') if isinstance(diff, dict) else None
+                if report.get('status') == 'low-coverage' and type(coverage) in (float, int) and 0 <= coverage < 1:
+                    low[fn] = (coverage, saved)
+            continue
+        if len(fixture_lifts) >= 5:
+            continue
+        record = records.get(fn)
+        fixture_lifts.append({'fn': fn, 'bytes': functions[va].body_bytes, 'fixture_count': len(fixtures),
+                              'stored_captures': len(capture.names_for(va)), 'evidence': str(path),
+                              'work_state': record.get('state') if isinstance(record, dict) else None,
+                              'command': f'py -3.13 -m cmre test {fn} --json'})
+    for fn, row in lift_rows.items():
+        if fn in quarantined or int(fn[3:], 16) in recovered:
+            continue
+        coverage = row.get('coverage')
+        if row.get('status') == 'low-coverage' and type(coverage) in (float, int) and 0 <= coverage < 1:
+            low[fn] = (coverage, automatic_reports.get(fn))
+    branches = []
+    for fn, (coverage, saved) in sorted(low.items(), key=lambda pair: (-pair[1][0], pair[0])):
+        if saved := saved or _saved_lift_report(fn, identity):
+            if row := _lift_branch(fn, coverage, saved):
+                branches.append(row)
+        if len(branches) == 5:
+            break
+    for row in [*fixture_lifts, *branches]:
+        fn = row['fn']
+        if routed := _actionable_hold(fn, records.get(fn, {}), work.HARD_HOLDS):
+            row.update(hold=routed['hold'], command=routed['work_command'])
+        if fn in capped:
+            row['tool_error'] = capped[fn]
+            if 'hold' not in row:
+                row['command'] = 'py -3.13 scripts/cmre_lift_lane.py status'
+    evidence_fields = (('input_needed', 'source'), ('hint_proposals', 'receipt'))
+    for name, lane in board.items():
+        for item in lane['top']:
+            fn = item['fn']
+            if name in ('input-needed', 'hint-evidence'):
+                item.update(_actionable_hold(fn, records.get(fn, {}), work.HARD_HOLDS))
+            paths = {name: state.get(name, {}).get(fn, {}).get(field) for name, field in evidence_fields}
+            review = state.get('audits', {}).get(fn, {}).get('review') or {}
+            paths['audit'] = review.get('audit_path')
+            quarantine = state.get('quarantined', {}).get(fn)
+            if quarantine is not None:
+                journal = quarantine.get('journal') if isinstance(quarantine, dict) else None
+                paths['acceptance_record'] = journal or str(run_dir / 'state.json')
+            item['evidence'] = {key: path for key, path in paths.items() if isinstance(path, str)}
+    check = next(iter(sorted((env.ANALYSIS / 'cmre/sessions').glob('*-check/receipt.json'), reverse=True)), None)
+    try:
+        session = receipt_status(check) if check else None
+    except (OSError, ValueError):
+        session = None
+    if session and session['exit_code'] not in (0, None):
+        session['next'] = f'py -3.13 scripts/cmre_session.py status "{session["receipt"]}"'
+        for step in session['steps']:
+            if step['exit_code'] in (0, None):
+                continue
+            step['failures'] = []
+            if not step.get('log'):
+                continue
+            try:
+                with Path(step['log']).open(encoding='utf-8', errors='replace') as log:
+                    for line in log:
+                        if line.startswith(('FAILED ', 'ERROR ', 'BAD ')):
+                            step['failures'].append(line.rstrip()[:240])
+                            if len(step['failures']) == 3:
+                                break
+            except OSError:
+                pass
+    head = subprocess.run(['git', 'rev-parse', '--verify', 'HEAD'], cwd=ROOT, capture_output=True, text=True)
+    commit = head.stdout.strip()
+    publication = env.ANALYSIS / 'cmre/publication' / f'{commit}.json'
+    try:
+        receipt = json.loads(publication.read_bytes()) if re.fullmatch(r'[0-9a-f]{40}', commit) else None
+    except (OSError, ValueError):
+        receipt = None
+    publication_status = None
+    if isinstance(receipt, dict) and receipt.get('commit') == commit:
+        findings = [f for f in receipt.get('findings', []) if isinstance(f, dict)]
+        identity_finding = next((f for f in findings if f.get('kind') == 'accepted-mismatch'), None)
+        content_finding = next((f for f in findings if f.get('kind') != 'accepted-mismatch'), None)
+        destination_issues = []
+        remote = receipt.get('remote')
+        if receipt.get('result') == 'fail' and isinstance(remote, dict):
+            if not remote.get('url'):
+                destination_issues.append('push destination has no resolved URL')
+            if remote.get('visibility') not in PUBLICATION_VISIBILITIES:
+                destination_issues.append('push destination visibility is unknown')
+        publication_status = {
+            'receipt': str(publication), 'result': receipt.get('result'),
+            'first_source_mismatch': identity_finding, 'first_other_finding': content_finding,
+            'destination_issues': destination_issues,
+            'next': 'Read docs/agent/PUBLICATION.md; resolve the scan failure and rerun before any push.'
+            if receipt.get('result') == 'fail' else None,
+        }
+    summary = {}
+    for name, lane in board.items():
+        if lane['count']:
+            groups = sorted(lane['groups'].items(), key=lambda item: (-item[1][1], item[0]))
+            summary[name] = {**lane, 'group_count': len(groups),
+                             'groups': [{'name': group, 'count': n, 'bytes': size}
+                                        for group, (n, size) in groups[:6]]}
+    return {'farm_state': str(run_dir / 'state.json'), 'last_session_check': str(check) if check else None,
+             'session': session,
+             'lift_state': str(ROOT / 'CM0102/Analysis/cmre/lift-lane/state.json'),
+             'fixture_lifts': fixture_lifts, 'lift_branches': branches,
+             'lift_tool_hold_count': len(capped),
+             'lift_tool_holds': [{'fn': fn, **capped[fn]} for fn in sorted(capped)[:5]],
+             'publication': publication_status,
+            'lanes': summary}
 
 
 def running_from_events(path):
@@ -2496,7 +2738,8 @@ def defect_agent():
     rules = [('*', '*', 'deny'), ('read', '*', 'allow'), ('grep', '*', 'allow'), ('glob', '*', 'allow'),
              ('edit', 'CM0102/Analysis/cmre/farm/*/hand/*.c', 'allow'),
              ('write', 'CM0102/Analysis/cmre/farm/*/hand/*.c', 'allow')]
-    shell = [f'{PY} scripts/cmre_farm.py test *', f'{PY} scripts/cmre_farm.py review *']
+    shell = [f'{PY} scripts/cmre_farm.py test *', f'{PY} scripts/cmre_farm.py review *',
+             f'{PY} scripts/cmre_farm.py prepare-hand *']
     shell += [f'{PY} -m cmre {command} *' for command in WORKER_COMMANDS if command not in ('test', 'explain')]
     shell += list(READ_ONLY_SHELL)
     rules += [('shell', command, 'allow') for command in shell]
@@ -2519,7 +2762,10 @@ review. Repeat the lookup before any ADOPT/DISMISS result; if identity changed
 or previously bound evidence became unbound, return UNRESOLVED rather than reuse
 stale findings. A legacy/fresh-review branch requires a complete fresh review
 and unchanged identity/open_findings. Explicitly verify every open_findings item
-in the claim before deciding. Return ADOPT <source> <review_receipt> <note> or
+in the claim before deciding. For a confirmed defect, use
+`py -3.13 scripts/cmre_farm.py prepare-hand RUN fn_X --review-receipt PATH --claim-scoped`
+to materialize the immutable claim source without overwriting existing work.
+Return ADOPT <source> <review_receipt> <note> or
 DISMISS <review_receipt> <reason>; never replace the receipt with a new current
 claim to make an old fix admissible. Never guess stable audit/bundle paths.
 """
@@ -2712,6 +2958,192 @@ def _quarantine_status(state, fn):
     return {'fn': fn, 'status': 'acceptance-quarantined', 'reason': str(reason)[:300],
             'instruction': 'Preserve this function and request; manual/current ledger review is required. '
                            'Unrelated functions remain actionable.'}
+
+
+class _WindowsHandFiles:
+    def __init__(self, leases):
+        import ctypes
+        from ctypes import wintypes as w
+
+        class UnicodeString(ctypes.Structure):
+            _fields_ = [('Length', w.USHORT), ('MaximumLength', w.USHORT), ('Buffer', w.LPWSTR)]
+
+        class ObjectAttributes(ctypes.Structure):
+            _fields_ = [('Length', w.DWORD), ('RootDirectory', w.HANDLE),
+                        ('ObjectName', ctypes.POINTER(UnicodeString)), ('Attributes', w.DWORD),
+                        ('SecurityDescriptor', w.LPVOID), ('SecurityQualityOfService', w.LPVOID)]
+
+        class IoStatusBlock(ctypes.Structure):
+            _fields_ = [('StatusOrPointer', w.LPVOID), ('Information', ctypes.c_size_t)]
+
+        class RenameInformation(ctypes.Structure):
+            _fields_ = [('ReplaceIfExists', ctypes.c_ubyte), ('RootDirectory', w.HANDLE),
+                        ('FileNameLength', w.DWORD), ('FileName', w.WCHAR * 1)]
+
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        native = ctypes.WinDLL('ntdll')
+        self.open_root = kernel.CreateFileW
+        self.open_root.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, w.LPVOID, w.DWORD, w.DWORD, w.HANDLE]
+        self.open_root.restype = w.HANDLE
+        self.close = kernel.CloseHandle
+        self.close.argtypes = [w.HANDLE]
+        self.close.restype = w.BOOL
+        self.read_attributes = kernel.GetFileInformationByHandleEx
+        self.read_attributes.argtypes = [w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD]
+        self.read_attributes.restype = w.BOOL
+        self.create = native.NtCreateFile
+        self.create.argtypes = [ctypes.POINTER(w.HANDLE), w.DWORD, ctypes.POINTER(ObjectAttributes),
+                                ctypes.POINTER(IoStatusBlock), w.LPVOID, w.DWORD, w.DWORD, w.DWORD,
+                                w.DWORD, w.LPVOID, w.DWORD]
+        self.create.restype = w.LONG
+        self.set_info = native.NtSetInformationFile
+        self.set_info.argtypes = [w.HANDLE, ctypes.POINTER(IoStatusBlock), w.LPVOID, w.DWORD, ctypes.c_int]
+        self.set_info.restype = w.LONG
+        self.dos_error = native.RtlNtStatusToDosError
+        self.dos_error.argtypes = [w.LONG]
+        self.dos_error.restype = w.DWORD
+        self.ctypes, self.types = ctypes, w
+        self.name_type, self.object_type, self.io_type = UnicodeString, ObjectAttributes, IoStatusBlock
+        self.rename_type = RenameInformation
+        self.leases = leases
+
+    def _pin(self, handle):
+        ctypes, w = self.ctypes, self.types
+        self.leases.callback(self.close, handle)
+        info = (w.DWORD * 2)()
+        if not self.read_attributes(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not info[0] & 0x10 or info[0] & 0x400:
+            raise ValueError('hand directory must not be redirected')
+        return handle
+
+    def root(self, anchor):
+        ctypes = self.ctypes
+        handle = self.open_root(anchor, 0x81, 1, None, 3, 0x02200000, None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return self._pin(handle)
+
+    def _open_child(self, parent, name, *, directory, create=False):
+        ctypes, w = self.ctypes, self.types
+        buffer = ctypes.create_unicode_buffer(name)
+        length = ctypes.sizeof(buffer) - 2
+        child_name = self.name_type(length, length + 2, ctypes.cast(buffer, w.LPWSTR))
+        obj_case_insensitive = 0x40
+        obj_dont_reparse = 0x1000
+        attributes = self.object_type(ctypes.sizeof(self.object_type), parent, ctypes.pointer(child_name),
+                                      obj_case_insensitive | obj_dont_reparse, None, None)
+        handle, io = w.HANDLE(), self.io_type()
+        access = 0x00100081 if directory else 0x00110002
+        share = 3 if directory else 0
+        disposition = (3 if create else 1) if directory else 2
+        options = 0x00200020 | (1 if directory else 0x40)
+        status = self.create(ctypes.byref(handle), access, ctypes.byref(attributes), ctypes.byref(io),
+                             None, 0, share, disposition, options, None, 0)
+        if status < 0:
+            error = ctypes.WinError(self.dos_error(status))
+            error.filename = name
+            raise error
+        return handle.value
+
+    def directory(self, parent, name, *, create):
+        return self._pin(self._open_child(parent, name, directory=True, create=create))
+
+    def write(self, parent, name, content):
+        import msvcrt
+
+        ctypes = self.ctypes
+        handle = self._open_child(parent, f'.prepare-{uuid4().hex}.tmp', directory=False)
+        try:
+            fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+        except OSError:
+            self._discard(handle)
+            self.close(handle)
+            raise
+        published = False
+        try:
+            with os.fdopen(os.dup(fd), 'wb') as out:
+                out.write(content)
+            filename = name.encode('utf-16-le')
+            offset = self.rename_type.FileName.offset
+            data = ctypes.create_string_buffer(max(ctypes.sizeof(self.rename_type), offset + len(filename)))
+            info = self.rename_type.from_buffer(data)
+            info.RootDirectory, info.FileNameLength = parent, len(filename)
+            ctypes.memmove(ctypes.addressof(data) + offset, filename, len(filename))
+            io = self.io_type()
+            status = self.set_info(handle, ctypes.byref(io), data, offset + len(filename), 10)
+            if status < 0:
+                raise ctypes.WinError(self.dos_error(status))
+            published = True
+        finally:
+            if not published:
+                self._discard(handle)
+            os.close(fd)
+
+    def _discard(self, handle):
+        ctypes = self.ctypes
+        io, remove = self.io_type(), ctypes.c_ubyte(1)
+        self.set_info(handle, ctypes.byref(io), ctypes.byref(remove), ctypes.sizeof(remove), 13)
+
+
+def _write_new_hand_source(source, content):
+    with ExitStack() as leases:
+        parts = source.parent.parts[1:]
+        if os.name == 'nt':
+            tree = _WindowsHandFiles(leases)
+            directory = tree.root(source.anchor)
+            for index, part in enumerate(parts):
+                directory = tree.directory(directory, part, create=index == len(parts) - 1)
+            tree.write(directory, source.name, content)
+            return
+
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        fd = os.open(source.anchor, flags)
+        leases.callback(os.close, fd)
+        parts = source.parent.parts[1:]
+        for index, part in enumerate(parts):
+            if index == len(parts) - 1:
+                try:
+                    os.mkdir(part, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            fd = os.open(part, flags, dir_fd=fd)
+            leases.callback(os.close, fd)
+        temporary = f'.prepare-{uuid4().hex}.tmp'
+        new_file = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=fd)
+        try:
+            with os.fdopen(new_file, 'wb') as out:
+                out.write(content)
+            os.link(temporary, source.name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+        finally:
+            os.unlink(temporary, dir_fd=fd)
+
+
+def prepare_hand(run_dir, root, fn, receipt, *, claim_scoped=False):
+    if not re.fullmatch(r'fn_[0-9a-f]{8}', fn):
+        raise ValueError('expected a lowercase fn_XXXXXXXX')
+    run_dir, root = Path(run_dir).resolve(), Path(root).resolve()
+    if run_dir.parent != root / 'CM0102/Analysis/cmre/farm':
+        raise ValueError('expected an existing run under CM0102/Analysis/cmre/farm')
+    view = review_paths(run_dir, root, fn)
+    if view['status'] == 'acceptance-quarantined':
+        return view
+    name = fn
+    if claim_scoped:
+        receipt = (root / receipt).resolve()
+        claim = receipt.parent
+        if claim.parent != run_dir / 'reviews' or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', claim.name):
+            raise ValueError('expected a named review claim directly under RUN/reviews')
+        name = f'{fn}-{claim.name}'
+    snapshot, _, findings = read_review_receipt(receipt, run_dir, root, fn)
+    if not findings or view['identity'] != _identity(snapshot) or view['open_findings'] != findings:
+        raise ValueError('claimed inputs or open findings changed; fresh review required')
+    directory = run_dir / 'hand'
+    if directory.resolve() != directory or directory.is_symlink() or directory.is_junction():
+        raise ValueError('hand directory must not be redirected')
+    source = directory / f'{name}.c'
+    _write_new_hand_source(source, snapshot['c'])
+    return {'fn': fn, 'status': 'prepared', 'source': str(source)}
 
 
 def defect_lines(state):
@@ -3275,6 +3707,7 @@ def main(argv=None):
     ln = sub.add_parser('lanes', help='every state the farm cannot leave by itself: owner, bytes, next action')
     ln.add_argument('run_dir')
     ln.add_argument('--json', action='store_true')
+    ln.add_argument('--actionable', action='store_true', help='include bounded evidence and fixture-only lift candidates')
     ip = sub.add_parser('inputs', help='parked functions whose candidate ran clean but needs more test inputs')
     ip.add_argument('run_dir')
     rt = sub.add_parser('retry', help='return parked functions to the running farm after something changed')
@@ -3308,6 +3741,11 @@ def main(argv=None):
     rv.add_argument('run_dir')
     rv.add_argument('fn')
     rv.add_argument('--claim', metavar='NAME', help='explicitly create immutable RUN/reviews/NAME inputs/receipt')
+    ph = sub.add_parser('prepare-hand', help='copy claimed source to a hand-work path without overwriting')
+    ph.add_argument('run_dir')
+    ph.add_argument('fn')
+    ph.add_argument('--review-receipt', required=True)
+    ph.add_argument('--claim-scoped', action='store_true', help='name the hand source using its review claim')
     sub.add_parser('install-agents', help='write the OpenCode coordinator and defect agents into .opencode/agents/')
     pr = sub.add_parser('probe', help='check every ladder/audit model answers before a run')
     pr.add_argument('--ladder', default=','.join(DEFAULT_LADDER + (DEFAULT_AUDIT_MODEL, DEFAULT_CONFIRM_MODEL)))
@@ -3362,8 +3800,62 @@ def main(argv=None):
         from cmre import work
         records = work.read()['functions']
         board = lanes_board(state, lambda fn: getattr(functions.get(int(fn[3:], 16)), 'body_bytes', 0), lift,
-                            work_of=records.get)
-        print(json.dumps(board, indent=1) if a.json else lanes_text(board))
+                            top=3 if a.actionable else 10, work_of=records.get, actionable=a.actionable)
+        if a.actionable:
+            view = actionable_lanes(run_dir, board, functions, lift, records, state)
+            if a.json:
+                print(json.dumps(view, indent=1))
+            else:
+                print(f"Farm: {view['farm_state']}\nLifts: {view['lift_state']}")
+                if view['last_session_check']:
+                    print(f"Last session check: {view['last_session_check']}")
+                for step in (view['session'] or {}).get('steps', []):
+                    if step.get('exit_code') not in (None, 0):
+                        print(f"  Exit {step['exit_code']}: {' '.join(step['command'])} [{step.get('log', 'no log')}]")
+                        if step.get('detail'):
+                            print(f"  {step['detail']}")
+                        for failure in step.get('failures', []):
+                            print(f"  {failure}")
+                if (view['session'] or {}).get('next'):
+                    print(f"  {view['session']['next']}")
+                if view['publication']:
+                    status = view['publication']
+                    print(f"Publication: {status['result']} [{status['receipt']}]")
+                    for field in ('first_source_mismatch', 'first_other_finding'):
+                        if status[field]:
+                            finding = status[field]
+                            print(f"  {finding['kind']}: {finding['path']} — {finding.get('detail', '')[:300]}")
+                    for issue in status['destination_issues']:
+                        print(f"  {issue}")
+                    if status['result'] == 'fail' and not (
+                            status['first_source_mismatch'] or status['first_other_finding'] or status['destination_issues']):
+                        print("  Scan failed without a recorded finding; inspect the receipt and scan output.")
+                    if status['next']:
+                        print(f"  {status['next']}")
+                visible_tool_errors = set()
+                for row in [*view['fixture_lifts'], *view['lift_branches']]:
+                    note = (f"({row['bytes']} B), retained fixtures" if 'fixture_count' in row
+                            else f"first uncovered {row['uncovered']}")
+                    print(f"{row['fn']} {note}: {row['command']} [{row['evidence']}]")
+                    if hold := row.get('hold'):
+                        print(f"  held: {hold['blocker'] or hold['state']}. Inspect all holds with work show.")
+                        if hold['retry_when']:
+                            print(f"  Retry when: {hold['retry_when']}")
+                    if error := row.get('tool_error'):
+                        print(f"  tool error retry cap ({error['count']} errors); last error: {error['detail']}")
+                        visible_tool_errors.add(row['fn'])
+                    for op in row.get('incoming', []):
+                        print(f"  {op['at']} {op['instruction']}")
+                for error in view['lift_tool_holds']:
+                    if error['fn'] not in visible_tool_errors:
+                        print(f"{error['fn']} tool error retry cap ({error['count']} errors); "
+                              f"last error: {error['detail']}")
+                        visible_tool_errors.add(error['fn'])
+                if omitted := view['lift_tool_hold_count'] - len(visible_tool_errors):
+                    print(f"  {omitted} more capped tool errors in the lift state.")
+                print(lanes_text(board))
+        else:
+            print(json.dumps(board, indent=1) if a.json else lanes_text(board))
         return 0
     if a.action == 'reaudit':
         accepted = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))['accepted']
@@ -3403,6 +3895,15 @@ def main(argv=None):
             return 2
         print(json.dumps(view, indent=1))
         return 2 if view['status'] in ('acceptance-quarantined', 'conflict') else 0
+    if a.action == 'prepare-hand':
+        try:
+            result = prepare_hand(run_dir, ROOT, a.fn, a.review_receipt, claim_scoped=a.claim_scoped)
+        except FileExistsError:
+            result = {'fn': a.fn, 'status': 'conflict', 'reason': 'Preserve the existing hand work file.'}
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            result = {'fn': a.fn, 'status': 'fresh-review-required', 'reason': str(exc)[:300]}
+        print(json.dumps(result, indent=1))
+        return 0 if result['status'] == 'prepared' else 2
     if a.action == 'defects':
         for line in defect_lines(json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))):
             print(line)

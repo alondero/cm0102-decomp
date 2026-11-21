@@ -397,7 +397,7 @@ def _blobs(repo: Path, specs: list[str]):
 
 
 def scan_commit(repo: Path, ref: str, index: OriginalIndex,
-                private_refs=PRIVATE_REFS, source_reviews=None) -> tuple[str, list[Finding]]:
+                private_refs=PRIVATE_REFS, source_reviews=None, *, tracking_ref=None) -> tuple[str, list[Finding]]:
     """Every path and blob reachable from `ref`, and its ancestry against the private history."""
     repo = Path(repo)
     commit = _git(repo, "rev-parse", "--verify", ref + "^{commit}").decode().strip()
@@ -431,10 +431,27 @@ def scan_commit(repo: Path, ref: str, index: OriginalIndex,
     kinds = _git(repo, "cat-file", "--batch-check=%(objectname) %(objecttype)",
                  stdin=("\n".join(named) + "\n").encode()).decode().split()
     named = {sha: named[sha] for sha, kind in zip(kinds[::2], kinds[1::2]) if kind == "blob"}
+    tracked = set()
+    tip = {}
+    if tracking_ref:
+        exists = subprocess.run(["git", "show-ref", "--verify", "--quiet", tracking_ref], cwd=repo).returncode
+        if exists == 0:
+            tracked = {line.partition(" ")[0]
+                       for line in _git(repo, "rev-list", "--objects", tracking_ref).decode().splitlines()}
+        for line in _git(repo, "ls-tree", "-r", "-z", commit).decode().split("\0"):
+            if line:
+                meta, path = line.split("\t", 1)
+                tip[path] = meta.split()[2]
     for sha, data in _blobs(repo, sorted(named)):
         for path in sorted(named[sha]):
             found += path_findings(path)
-            found += content_findings(path, data, index, source_reviews)
+            entries = content_findings(path, data, index, source_reviews)
+            if tracking_ref:
+                scope = "commit tree" if tip.get(path) == sha else "reachable history only"
+                present = f"; blob already reachable from local {tracking_ref}" if sha in tracked else ""
+                entries = [Finding(row.path, row.kind, f"{row.detail} [{scope}; blob {sha[:12]}{present}]")
+                           for row in entries]
+            found += entries
     # Provenance is a property of the tree being published, not of superseded blobs.
     tree = [line.split("\t", 1) for line in _git(repo, "ls-tree", "-r", commit, "--", "recovery/c").decode().splitlines()]
     current = {}
@@ -547,7 +564,10 @@ def command(a) -> int:
     index = supplied_index()
     print(f"index: {len(index.files)} supplied files, {len(index.values)} blocks, identity {index.identity()[:12]}")
     if a.commit:
-        commit, findings = scan_commit(env.ROOT, a.commit, index, tuple(a.private_ref or PRIVATE_REFS), source_reviews)
+        destination = getattr(a, 'destination', 'main')
+        tracking = f"refs/remotes/{a.remote}/{destination}"
+        commit, findings = scan_commit(env.ROOT, a.commit, index, tuple(a.private_ref or PRIVATE_REFS), source_reviews,
+                                       tracking_ref=tracking)
         remote = remote_state(env.ROOT, a.remote)
         receipt = write_receipt(RECEIPTS, commit, findings, index, remote, source_reviews)
         print(f"remote {remote['name']} visibility {remote['visibility']}")
@@ -588,6 +608,8 @@ def add_commands(sub) -> None:
     mode.add_argument("--commit", help="every blob reachable from this ref; writes the push receipt")
     s.add_argument("--private-ref", action="append", help=f"history that must not be shared (default {PRIVATE_REFS[0]})")
     s.add_argument("--remote", default="origin")
+    s.add_argument("--destination", default="main", metavar="BRANCH",
+                   help="local tracking branch to annotate in commit findings (default: main)")
     s.add_argument("--source-reviews", type=Path, help="local path/hash-specific authored-source review JSON")
     s.add_argument("--limit", type=int, default=200, help="findings to print")
     s.set_defaults(func=command)

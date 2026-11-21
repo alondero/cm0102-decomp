@@ -1,5 +1,8 @@
 """Session safety: failures gate machine jobs, receipts survive, writers exclude."""
 import json
+import os
+import subprocess
+import sys
 from contextlib import nullcontext
 
 import pytest
@@ -127,6 +130,51 @@ def test_status_limits_steps_and_does_not_expand_arbitrary_nested_fields(tmp_pat
     report = session.receipt_status(receipt)
     assert report["step_count"] == 100 and report["omitted_steps"] == 92
     assert len(json.dumps(report)) < 11000
+
+
+def test_status_distinguishes_missing_process_from_recorded_running(tmp_path, monkeypatch):
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(json.dumps({"state": "running", "pid": 123, "steps": [
+        {"state": "finished", "pid": 789, "exit_code": 0},
+        {"state": "running", "pid": 456},
+        {"state": "starting"},
+        {"state": "running", "pid": 777},
+    ]}), encoding="utf-8")
+    original = receipt.read_bytes()
+    queried = []
+
+    def observe(pid):
+        queried.append(pid)
+        return {123: "absent", 456: "present", 777: "unknown"}[pid]
+
+    monkeypatch.setattr(session, "_observe_pid", observe)
+    report = session.receipt_status(receipt)
+    assert report["state"] == "running" and report["exit_code"] is None
+    assert report["pid_observation"] == "absent"
+    assert [step.get("pid_observation") for step in report["steps"]] == [
+        None, "present", "unknown", "unknown"]
+    assert queried == [123, 456, 777]
+    assert receipt.read_bytes() == original
+
+
+def test_status_cli_observes_exited_runner_and_child_without_finishing_receipt(tmp_path):
+    receipt = tmp_path / "receipt.json"
+    child_code = 259 if os.name == "nt" else 3
+    runner = subprocess.Popen([sys.executable, "-c", "pass"])
+    child = subprocess.Popen([sys.executable, "-c", f"raise SystemExit({child_code})"])
+    assert runner.wait(timeout=10) == 0
+    assert child.wait(timeout=10) == child_code
+    receipt.write_text(json.dumps({"pid": runner.pid, "state": "running", "steps": [
+        {"pid": child.pid, "state": "running"},
+    ]}), encoding="utf-8")
+    original = receipt.read_bytes()
+    result = subprocess.run([sys.executable, session.__file__, "status", str(receipt)],
+                            cwd=tmp_path, capture_output=True, check=True, timeout=10)
+    report = json.loads(result.stdout)
+    for row in (report, report["steps"][0]):
+        assert row["pid_observation"] == "absent"
+        assert row["state"] == "running" and row["exit_code"] is None
+    assert receipt.read_bytes() == original
 
 
 @pytest.mark.parametrize("raw", [[], {"steps": "wrong"}, {"steps": [None]},

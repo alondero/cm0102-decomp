@@ -42,6 +42,22 @@ operations. Keep the VM, pinned original code and all declared live inputs fixed
 vary initial data only, retain receipts and leave resource headroom. These probes
 inform inputs; C validation and acceptance wait for the required gate.
 
+## Private inventory comparisons
+
+For a named function, compare the canonical pins and a candidate export
+without accepting or modifying either inventory:
+
+```powershell
+py -3.13 scripts/cmre_inventory_compare.py fn_XXXXXXXX --candidate EXPORT/delta.json --output NEW_LOCAL_DIRECTORY
+```
+
+The manifest carries `candidate_sha256` for `functions.tsv`, `calls.tsv`,
+and `module-candidates.json` beside it. Add `--source PATH` to compare a C
+candidate at both optimization levels. The two fresh processes retain both
+pin identities, entry deltas and gate reports. The command can complete
+successfully even when one or both gates fail; read the two statuses. This
+diagnostic cannot authorize a pin change or replace inventory revalidation.
+
 ## Tooling changes
 
 1. Bound the requested change and inspect existing worktree changes. For a defect,
@@ -158,6 +174,22 @@ inform inputs; C validation and acceptance wait for the required gate.
 Docs-only work can preserve an observed failing baseline and report it; it
 cannot label that session green. Keep failing contracts intact. Finish through
 the parent [playbook](PLAYBOOK.md#3-close-the-session).
+
+## Page-write diagnostics
+
+When `cmre explain` reports a memory-page difference, retain the bounded guest
+write observations for that case:
+
+```powershell
+py -3.13 scripts/cmre_page_writes.py fn_XXXXXXXX --c --case N --page 0x00ae2000
+```
+
+Use the same candidate and replay options as `explain` (`--source`, `--opt`,
+`--profile`, `--budget`, `--cases`, `--window`). The probe records instruction
+addresses and values for at most 256 guest write attempts per side, including
+stores that fault. It reports only the final attempt if the recovered run
+retries with a higher budget. Host writes, including seeded import outputs, are
+not observed. The report is local diagnostic evidence, not an acceptance result.
 
 ## Validation scope
 

@@ -50,6 +50,34 @@ def coverage() -> dict:
     return {k: summary[k] for k in PROGRESS_KEYS}
 
 
+def _observe_windows_pid(pid: int) -> str:
+    import _winapi
+
+    try:
+        handle = _winapi.OpenProcess(_winapi.SYNCHRONIZE, False, pid)
+    except OSError as exc:
+        return "absent" if exc.winerror == 87 else "unknown"
+    try:
+        result = _winapi.WaitForSingleObject(handle, 0)
+    except OSError:
+        return "unknown"
+    finally:
+        _winapi.CloseHandle(handle)
+    return {_winapi.WAIT_OBJECT_0: "absent", _winapi.WAIT_TIMEOUT: "present"}.get(result, "unknown")
+
+
+def _observe_pid(pid: int) -> str:
+    if os.name == "nt":
+        return _observe_windows_pid(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "absent"
+    except OSError:
+        return "unknown"
+    return "present"
+
+
 def receipt_status(path: Path) -> dict:
     """Bounded navigation view; raw input inventories stay in the receipt."""
     path = path.resolve()
@@ -69,11 +97,19 @@ def receipt_status(path: Path) -> dict:
                 raise ValueError(f"Invalid session status field: {name}")
         return result
 
+    def status_fields(record, names):
+        result = fields(record, names)
+        if result["state"] in ("starting", "running"):
+            pid = result["pid"]
+            result["pid_observation"] = _observe_pid(pid) if type(pid) is int and 0 < pid < 2**31 else "unknown"
+        return result
+
+    owner = status_fields(data, ("mode", "state", "pid", "exit_code", "started", "ended"))
     steps = []
     for index, step in enumerate(data["steps"][:8], 1):
         if not isinstance(step, dict):
             raise ValueError("Session receipt steps must be objects")
-        row = fields(step, ("state", "pid", "exit_code", "started", "ended", "evidence"))
+        row = status_fields(step, ("state", "pid", "exit_code", "started", "ended", "evidence", "detail"))
         command = step.get("command", [])
         if not isinstance(command, list) or not all(isinstance(word, str) for word in command):
             raise ValueError("Session step command must be a string list")
@@ -84,10 +120,10 @@ def receipt_status(path: Path) -> dict:
                 raise ValueError("Session step log must be a local filename")
             row["log"] = str(path.parent / log)
         steps.append(row)
-    return {"receipt": str(path), **fields(data, ("mode", "state", "pid", "exit_code", "started", "ended")),
+    return {"receipt": str(path), **owner,
             "step_count": len(data["steps"]), "steps": steps,
             "omitted_steps": max(0, len(data["steps"]) - len(steps)),
-            "note": "Recorded state only; no current-input validation or process ownership proof."}
+             "note": "State and exit code are recorded. PID observations do not prove ownership or current inputs."}
 
 
 def last_start(sessions: Path, exclude: Path) -> dict | None:

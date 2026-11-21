@@ -223,6 +223,18 @@ def test_commit_scan_covers_removed_files_in_reachable_history(originals, repo):
     assert [(f.path, f.kind) for f in findings] == [("a.txt", "original-bytes")]
 
 
+def test_commit_scan_marks_removed_content_already_in_local_tracking_history(originals, repo):
+    tracked = _commit(repo, {"a.txt": originals["image"][100:140].hex().encode()}, "copy")
+    tracking = "refs/remotes/origin/fresh"
+    _git(repo, "update-ref", tracking, tracked)
+    _commit(repo, {"a.txt": None, "b.txt": b"clean\n"}, "remove")
+
+    _, findings = pub.scan_commit(repo, "fresh", originals["index"], private_refs=(), tracking_ref=tracking)
+    finding, = findings
+    assert finding.kind == "original-bytes"
+    assert "history" in finding.detail and tracking in finding.detail
+
+
 def test_commit_scan_rejects_history_shared_with_private_refs(originals, repo):
     _commit(repo, {"a.txt": b"old local history\n"}, "old")
     _git(repo, "branch", "private")

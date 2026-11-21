@@ -9,7 +9,7 @@ from cmre.import_observe import MemoryRead
 from cmre.file_time_observe import output_span
 from native_crt_import_results import (
     ROOT, NativeCrtResultsProfile, Unavailable, build_native_crt_results, classify_output,
-    observe_native_crt_results, verify_caller,
+    observe_native_crt_results, verify_caller, verify_last_error_followup,
 )
 
 
@@ -90,6 +90,22 @@ def test_native_caller_requires_two_u32_pushes_and_real_import_binding():
                       {slot: "KERNEL32.dll!FindFirstFileA"})
 
 
+def test_native_find_error_sample_requires_direct_followup():
+    slot, start, output = 0x402000, 0x401000, 0x403100
+    raw = b"\xa3\x00\x30\x40\x00\xff\x15" + struct.pack("<I", slot) + b"\xa3" + struct.pack("<I", output)
+    fields = dict(continuation=start, last_error_continuation=start + 11,
+                  last_error_iat=slot, last_error_storage=output)
+    imports = {slot: "KERNEL32.dll!GetLastError"}
+    report = verify_last_error_followup(fields, lambda a, n: raw[:n], imports)
+    assert report == {"iat": slot, "continuation": start + 11, "storage": output, "caller_bytes_hex": raw.hex()}
+    with pytest.raises(ValueError):
+        verify_last_error_followup(fields, lambda a, n: raw, {slot: "KERNEL32.dll!GetTickCount"})
+    with pytest.raises(ValueError):
+        verify_last_error_followup(fields, lambda a, n: b"\x90" + raw[1:], imports)
+    with pytest.raises(ValueError):
+        verify_last_error_followup({**fields, "last_error_storage": output + 4}, lambda a, n: raw[:n], imports)
+
+
 @pytest.fixture(scope="module")
 def native_crt_results():
     directory = ROOT / "local/native-crt-import-results" / uuid.uuid4().hex
@@ -127,8 +143,31 @@ def test_real_file_and_time_api_results(native_crt_results, scenario):
         assert info == result["output_classification"][name]
         assert record["state"] == "returned-incomplete"  # explicit observation-only gap
     first, next_record, local, system = records
-    assert (first["return"]["registers"]["eax"] != 0xffffffff) == (scenario != "error")
+    first_handle = first["return"]["registers"]["eax"]
+    assert (first_handle != 0xffffffff) == (scenario != "error")
     assert bool(next_record["return"]["registers"]["eax"]) == (scenario == "success")
+    next_args = next(item for item in next_record["entry"]["memory"]
+                     if item["purpose"] == "FindNextFileA.stack-arguments")
+    assert struct.unpack("<II", bytes.fromhex(next_args["data_hex"]))[0] == first_handle
+    for name in ("FindFirstFileA", "FindNextFileA"):
+        followup = result["resolved_imports"][name]["abi"]["last_error_followup"]
+        assert followup["continuation"] == result["manifest"][name]["last_error_continuation"]
+    first_error = child["FindFirstFileA"]
+    next_error = child["FindNextFileA"]
+    for outcome in (first_error, next_error):
+        assert type(outcome["last_error"]) is int and 0 <= outcome["last_error"] <= 0xffffffff
+    assert first_error["last_error_defined"] == (scenario == "error")
+    assert next_error["last_error_defined"] == (scenario != "success")
+    if scenario == "error":
+        assert first_error["last_error"] == 2  # ERROR_FILE_NOT_FOUND
+        assert next_error["last_error"] == 6   # ERROR_INVALID_HANDLE
+        assert child["FindClose"] == {"called": False}
+    else:
+        assert child["FindClose"]["called"] is True
+        assert child["FindClose"]["handle"] == first_handle
+        assert child["FindClose"]["eax"] != 0
+        if scenario == "exhausted":
+            assert next_error["last_error"] == 18  # ERROR_NO_MORE_FILES
     # Host timezone is deliberately not an expected-value oracle.
     assert bool(system["return"]["registers"]["eax"]) == (scenario != "error")
     first_input = next(r for r in first["entry"]["memory"] if r["purpose"].endswith(".input"))

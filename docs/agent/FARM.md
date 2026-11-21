@@ -139,6 +139,22 @@ failing case for mismatches). Work the lane with the most bytes that you own:
 
 ### Lift lane
 
+When supply stalls, run `py -3.13 scripts/cmre_farm.py lanes RUN --actionable`.
+It links the farm, lift, and latest session records. It lists up to five
+unlifted functions with existing fixtures and no matching current gate
+receipt, even if no runtime capture exists. Near-threshold lifts with a
+matching receipt show the first uncovered instruction and its decoded
+incoming edges. The receipt can come from the automatic lane or a manual gate
+for a function with retained fixtures. Treat the edge as a starting point, not
+proof that a particular input reaches it. The view never runs gates or modifies
+the queue.
+If either list contains an item with a scheduling hold, follow its `work show`
+command and retry condition before running a gate or probing the uncovered edge.
+An exhausted tool-error retry cap is reported with the retained error instead of
+suggesting another manual gate.
+Input proposals keep their evidence link and show any current work hold beside it.
+Check the hold before applying a retained proposal.
+
 `scripts/cmre_lift_lane.py once` takes every function with stored captures
 (ADR 0009) and no accepted record whose capture set changed since its last
 pass. It runs `cmre capture expand`, `cmre capture apply` (the unchanged
@@ -281,15 +297,22 @@ Coordinator procedure:
    equivalence; reading callee C does not silently add a global dependency hash.
 3. None confirmed: after the identity check in step 5, finish with
    `DISMISS <review_receipt> <reason citing VAs>`.
-4. Otherwise copy the claimed `source` to `RUN/hand/fn_X.c` (the only file you may
-   write), fix only the confirmed findings under the "Worker rules", and test with
-   `py -3.13 scripts/cmre_farm.py test RUN fn_X RUN/hand/fn_X.c` (add `--case N`
+4. Otherwise use `py -3.13 scripts/cmre_farm.py prepare-hand RUN fn_X --review-receipt PATH --claim-scoped`.
+    It returns a claim-specific `source` under `RUN/hand/` without overwriting
+    prior work. The command supports runs directly under `CM0102/Analysis/cmre/farm/`.
+   For a nonstandard run, the coordinator prepares and edits the scratch copy
+   manually; the generated worker has no edit permission there. Rerun
+   `install-agents` before dispatching workers that need the
+   new shell permission. If it reports a conflict, preserve the file and ask the
+   coordinator to reconcile the retained work. Edit only that hand file and only
+   for confirmed findings under the "Worker rules", then test with
+    `py -3.13 scripts/cmre_farm.py test RUN fn_X SOURCE` (add `--case N`
    to explain a case). Five failed tests end the attempt.
 5. Repeat `review RUN fn_X`. If `identity` or `open_findings` changed, evidence became unbound,
    or acceptance is quarantined, finish `UNRESOLVED` and request fresh review.
    A legacy/fresh-review branch may finish only after the complete current-code
    review and an unchanged identity, never on the old verdict alone.
-   Finish with one line: `ADOPT RUN/hand/fn_X.c <review_receipt> <what changed>` after a pass,
+    Finish with one line: `ADOPT <source> <review_receipt> <what changed>` after a pass,
    else `UNRESOLVED <first remaining mismatch or why>`.
 
 ## Run by hand (Claude Code, Codex)

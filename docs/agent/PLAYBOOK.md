@@ -73,8 +73,13 @@ are for tool-less model workers only.
 - Inspect JSON keys and project scalar status/exit/path fields before opening
   nested payloads. Keep fixture corpora and `inputs_before` behind artifact
   paths. For session receipts, use `py -3.13 scripts/cmre_session.py status RECEIPT`;
-  it prints bounded recorded steps, PIDs and log paths without starting work.
-  This view does not prove live process ownership or current-input validity.
+  it prints bounded recorded steps and log paths without starting work. For an
+  displayed unfinished row, `pid_observation` reports whether its recorded
+  process ID is present, absent or unknown. If the recorded IDs are absent,
+  treat the receipt as interrupted evidence and use the normal preflight or
+  closing gate; check the writer lease before assuming nothing is running.
+  Status exit 0 means the receipt was displayed, not validated; a present
+  process ID does not prove ownership.
   Check command help when syntax is unknown.
 - Keep harness modules (`HARNESS_MODULES` in `cmre/recover.py`) frozen during a
   recovery session. Prepare tooling changes separately and use the validation

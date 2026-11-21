@@ -22,6 +22,13 @@ not a host-global setting. Handles are closed by that child.
 * `exhausted`: one matching file, then real FindNextFileA returns false.
 * `error`: unmatched FindFirstFileA, then real FindNextFileA with the returned
   INVALID_HANDLE_VALUE. Both failure buffers remain observations, not outputs.
+* The child samples `GetLastError` immediately after each find call. A verified
+  scalar store is the only intervening instruction, and the returned value
+  is stored in the declared sample. Failure codes distinguish no match,
+  exhaustion and an invalid search handle. Error state after success is
+  retained raw, not treated as defined. The child reports the actual
+  `FindClose` result using the same valid handle passed to `FindNextFileA`;
+  it skips close if the first find failed.
 * Every case also calls real FileTimeToLocalFileTime and FileTimeToSystemTime.
   Successful enumeration supplies its observed last-write FILETIME to the local
   conversion. The next conversion receives those actual local bytes. The error
@@ -59,8 +66,9 @@ child and observer bytes, never a hardcoded host-timezone conversion.
 All records explicitly remain observational/incomplete and `replayable: false`.
 No import transcript, all-effects completeness, original CRT frame recovery,
 game execution, standalone runtime, or native game parity is established.
-GetLastError and external OS effects are not observed; failure reasons are not
-inferred from the scalar alone.
+`GetLastError` samples and `FindClose` results are authored-child output,
+not separately observed import endpoints. External OS effects and handle
+identities in the original game are not established.
 
 ## Running and retention
 
