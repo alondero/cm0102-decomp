@@ -389,6 +389,14 @@ def main(argv=None):
         else:
             proposal = a.proposal or a.spec.with_suffix('.proposal.json')
             out = gate_spec(va, spec, spec_bytes, proposal, a.model)
+            if a.proposal is None and out['status'] in ('pass', 'fail'):
+                from cmre.coordination import atomic_bytes
+                receipt = {key: out[key] for key in ('fn', 'status', 'prior_sha256')}
+                receipt['spec_sha256'] = hashlib.sha256(spec_bytes).hexdigest()
+                try:
+                    atomic_bytes(a.spec.with_suffix('.probe-result.json'), json.dumps(receipt).encode('utf-8'))
+                except OSError as exc:
+                    print(f'Could not write optional probe result: {exc}', file=sys.stderr)
     except (OSError, ValueError, KeyError, TypeError, MemoryError) as exc:
         print(json.dumps({'status': 'error', 'error': f'{type(exc).__name__}: {exc}'[:600]}))
         return 2

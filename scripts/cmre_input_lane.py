@@ -382,6 +382,13 @@ class Lane:
                     handle.kill()   # a stopping farm does not wait 30 minutes for inputs
                     self.event('interrupted', fn=job['fn'], n=job['n'], reason='stop')
                     continue
+                terminal = self._snapshot_terminal_probe(job)
+                if terminal is not None:
+                    snapshot, status = terminal
+                    handle.kill()
+                    self._record_limit(job, handle)
+                    self._submit_gate({**job, 'spec': str(snapshot)}, status, 'probe-complete')
+                    continue
                 activity = handle.last_activity() if hasattr(handle, 'last_activity') else None
                 stalled = activity is not None and time.monotonic() - activity > self.stall_seconds
                 if self.clock() - started > self.attempt_seconds or stalled:
@@ -393,6 +400,23 @@ class Lane:
             self._worker_done(job, handle, None)
         self.running = still
 
+    def _snapshot_terminal_probe(self, job):
+        spec = Path(job['spec'])
+        try:
+            receipt = json.loads(spec.with_suffix('.probe-result.json').read_bytes())
+            if (receipt['fn'] != job['fn'] or receipt['status'] not in ('pass', 'fail')
+                    or (receipt['prior_sha256'] or ABSENT) != job['hints_sha256']):
+                return None
+            data = spec.read_bytes()
+            if hashlib.sha256(data).hexdigest() != receipt['spec_sha256']:
+                return None
+            snapshot = spec.with_suffix('.lane-spec.json')
+            with snapshot.open('xb') as out:
+                out.write(data)
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+        return snapshot, receipt['status']
+
     def _worker_line(self, handle):
         try:
             text = Path(handle.log).read_text(encoding='utf-8', errors='replace')
@@ -401,16 +425,22 @@ class Lane:
         found = RESULT.findall(text.replace('\\n', '\n'))
         return found[-1] if found else ''
 
-    def _worker_done(self, job, handle, interrupted):
+    def _record_limit(self, job, handle):
         limit = handle.limit_error() if hasattr(handle, 'limit_error') else None
-        if limit:
-            message, seconds = limit
-            self.state['limited'][job['model'].split('/', 1)[0]] = self.clock() + seconds
-            self.event('model-limited', fn=job['fn'], n=job['n'], model=job['model'], seconds=seconds,
-                       message=message)
-            self.save()
+        if not limit:
+            return False
+        message, seconds = limit
+        self.state['limited'][job['model'].split('/', 1)[0]] = self.clock() + seconds
+        self.event('model-limited', fn=job['fn'], n=job['n'], model=job['model'], seconds=seconds, message=message)
+        self.save()
+        return True
+
+    def _worker_done(self, job, handle, interrupted):
+        if self._record_limit(job, handle):
             return   # not an attempt: the function returns to the queue on the next refresh
-        claimed = self._worker_line(handle)
+        self._submit_gate(job, self._worker_line(handle), interrupted)
+
+    def _submit_gate(self, job, claimed, interrupted):
         future = self.gates.submit(self.ops.gate, job['fn'], Path(job['spec']), job['model'])
         self.gating.append((job, claimed, interrupted, future))
 
@@ -439,6 +469,13 @@ class Lane:
         fn = job['fn']
         row = self.state['functions'].setdefault(fn, {'key': job['key']})
         status, coverage = result.get('status'), result.get('coverage')
+        if status in ('pass', 'fail') and (result.get('prior_sha256') or ABSENT) != job['hints_sha256']:
+            row['accept'] = 'hints-changed'
+            self.event('result', fn=fn, n=job['n'], model=job['model'], status='hints-changed',
+                       gated_status=status, coverage=coverage, claimed=claimed, interrupted=interrupted)
+            self.refreshed = None
+            self.save()
+            return
         attempt = {'n': job['n'], 'model': job['model'], 'status': status, 'coverage': coverage,
                    'claimed': claimed, 'interrupted': interrupted, 'at': self.clock()}
         row.setdefault('attempts', []).append(attempt)
@@ -450,13 +487,6 @@ class Lane:
         self.event('result', fn=fn, n=job['n'], model=job['model'], status=status, coverage=coverage,
                    claimed=claimed, interrupted=interrupted)
         if status == 'pass':
-            base = result.get('prior_sha256') or ABSENT
-            if base != job['hints_sha256']:
-                # The hints the lane gated on are not the ones this job was dispatched with.
-                row['accept'] = 'hints-changed'
-                self.event('apply-refused', fn=fn, n=job['n'], reason='hints changed during the job')
-                self.save()
-                return
             pending = {'proposal': result['proposal'], 'expected': job['hints_sha256'],
                        'sha256': result.get('proposal_sha256'), 'bytes': job['bytes'], 'model': job['model'],
                        'coverage': coverage}

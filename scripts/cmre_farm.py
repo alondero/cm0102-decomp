@@ -427,8 +427,9 @@ def translate_prompt(root, job):
     ]
     if job.get('prior'):
         p = job['prior']
-        lines += ['', f'Previous attempt ({p["model"]}) failed: {p["detail"][:1500]}',
-                  f'Its source is already in {src}; start from it.']
+        lines += ['', f'Previous attempt ({p["model"]}) failed: {p["detail"][:1500]}']
+        lines.append(f'Its source is already in {src}; start from it.' if job.get('_seed_bytes')
+                     else 'No C source was carried forward; start from the draft and write the C source.')
     elif job.get('seeded'):
         lines += ['', f'{src} already holds an earlier unaccepted source; start from it.']
     return '\n'.join(lines) + _hold_text(job.get('hold')) + '\n'

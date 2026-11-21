@@ -2313,6 +2313,21 @@ def test_failed_attempt_restores_previous_source_and_escalates_model(root):
     # The second prompt carries the first attempt's failure and its source path.
     second_prompt = launcher.started[1][1]
     assert 'Previous attempt' in second_prompt and 'mismatch' in second_prompt
+    assert 'Its source is already in' in second_prompt
+
+
+def test_retry_after_worker_wrote_no_source_starts_from_the_draft(root):
+    def behaviour(job, _):
+        if job['model'] == 'm/strong':
+            Path(job['source']).write_text(GOOD)
+
+    f, cmre, launcher = make(root, [item('fn_00401000')], behaviour, workers=1)
+    drain(f)
+    second_prompt = launcher.started[1][1]
+    assert 'worker wrote no source' in second_prompt
+    assert 'Its source is already in' not in second_prompt
+    assert 'No C source was carried forward; start from the draft' in second_prompt
+    assert cmre.accepted == ['fn_00401000']
 
 
 def test_failure_restores_exact_prior_bytes(root):
