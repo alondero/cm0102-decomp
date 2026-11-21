@@ -341,7 +341,8 @@ Coordinator procedure:
    `set RUN ...` changes workers, audit workers, size bounds, ladder, audit and
    confirmation models, `--include-held`, skip ranges and the deadline on the
    running farm. The settings live in `RUN/control.json` and apply again after a
-   restart.
+   restart. A new `start` replaces any setting it names explicitly (for example
+   `--ladder`) and keeps the other `set` values.
 
    A candidate that compiles and runs with no mismatch but whose test inputs
    cover too little of the function is **input-bound**: coverage counts original
