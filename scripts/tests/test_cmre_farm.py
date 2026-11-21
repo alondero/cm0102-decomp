@@ -5051,3 +5051,33 @@ def test_an_exit_when_empty_farm_stops_its_input_lane_before_exiting(root):
     procs[0].code = 0
     f.tick()
     assert f.drained()
+
+
+def test_start_settings_replace_a_stale_live_control(root, monkeypatch):
+    """21 Nov: `start --ladder hy4,...` ran MiniMax first because an older `set` ladder in
+    control.json overrode it on the first tick. Explicit start settings win; others stay."""
+    class Proc:
+        pid = 1
+
+    monkeypatch.setattr(farm.subprocess, 'Popen', lambda command, **kw: Proc())
+    run = root / 'run'
+    run.mkdir()
+    old = {'ladder': ['m/old'], 'workers': 3, 'audit_workers': 2, 'include_held': False,
+           'add_hours': [{'id': '1', 'hours': 1.0}]}
+    (run / 'control.json').write_text(json.dumps(old))
+    assert farm.main(['start', str(run), '--ladder', 'm/new', '--audit-workers=4', '--include-held',
+                      '--hours', '0']) == 0
+    control = json.loads((run / 'control.json').read_text())
+    assert control == {'workers': 3, 'add_hours': [{'id': '1', 'hours': 1.0}]}
+
+
+def test_an_abbreviated_start_setting_also_replaces_the_live_control(root, monkeypatch):
+    class Proc:
+        pid = 1
+
+    monkeypatch.setattr(farm.subprocess, 'Popen', lambda command, **kw: Proc())
+    run = root / 'run'
+    run.mkdir()
+    (run / 'control.json').write_text(json.dumps({'ladder': ['m/old'], 'workers': 3}))
+    assert farm.main(['start', str(run), '--lad', 'm/new']) == 0   # argparse accepts unique prefixes
+    assert json.loads((run / 'control.json').read_text()) == {'workers': 3}

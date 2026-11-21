@@ -4198,6 +4198,35 @@ def _wmi_launch(command, cwd):
     return int(result.stdout.strip())
 
 
+def _release_started_settings(run_dir, run_args):
+    """Drop live-control keys that this `start` sets explicitly.
+
+    control.json is applied on every tick and would otherwise override the new command line
+    with an older `set` value (21 Nov: a stale MiniMax-first ladder hid the documented
+    Hy4-first one). Only `start` does this: supervised restarts reuse the same arguments,
+    and a later `set` still wins over them."""
+    flags = {f'--{key.replace("_", "-")}': key for key in CONTROL_KEYS}
+    flags.update({f'--no-{key.replace("_", "-")}': key for key in CONTROL_KEYS})
+    given = set()
+    for arg in run_args:
+        head = arg.split('=', 1)[0]
+        if not head.startswith('--') or len(head) < 3:
+            continue
+        keys = {flags[head]} if head in flags else {key for flag, key in flags.items() if flag.startswith(head)}
+        if len(keys) == 1:   # argparse also accepts a unique prefix (`--lad` for `--ladder`)
+            given |= keys
+    path = run_dir / 'control.json'
+    try:
+        control = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return
+    kept = {key: value for key, value in control.items() if key not in given}
+    if kept != control:
+        tmp = path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(kept, indent=1), encoding='utf-8')
+        _replace(tmp, path)
+
+
 def start(run_dir, run_args):
     """Launch the supervised farm detached from the caller, with a hidden console that its
     `py -m cmre` children share (a fully detached farm opens a console window per child).
@@ -4206,6 +4235,7 @@ def start(run_dir, run_args):
     child dies silently with the shell or session that started it, so the fallback is WMI."""
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    _release_started_settings(run_dir, run_args)
     command = [sys.executable, '-u', str(Path(__file__).resolve()), 'supervise', str(run_dir), *run_args]
     if os.name != 'nt':
         pid, how = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
