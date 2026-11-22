@@ -917,6 +917,12 @@ class Farm:
             # The retry restarts from the same seed, so a draft-seeded job stays in repair mode.
             again['_from_draft'] = bool(job.get('draft_seeded'))
         again['_seed'] = job.get('_seed_bytes')
+        written = _read(job['source']) if job['kind'] == 'translate' and job.get('source') else None
+        if written and written != job.get('_seed_bytes'):
+            # A worker stopped by a provider limit may already have written its source (review
+            # 2026-11-22): the retry continues from it, as escalation does from a prior attempt.
+            again['_seed'] = written
+            self._event('draft-kept', fn=job['fn'], n=job['n'], bytes=len(written))
         self.pending.insert(0, again)
 
     def _transaction(self, job, phase=None, **updates):
@@ -3773,6 +3779,7 @@ LIMIT_ERROR = re.compile(r'usage limit|rate limit|too many requests|go-limit', r
 # OpenCode 2.x waits out a provider error with `retry` rows. A rate limit it would wait on for longer
 # than this is a limit to pause the model for; a brief one is waited out as before.
 LIMIT_WAIT_SECONDS = 120
+MAX_RETRY_PAUSE_SECONDS = 24 * 3600   # a provider's retry-after beyond a day is not believed
 _PENDING = ('retry', 'step_start', 'error')   # rows that are not progress after a retry
 
 
@@ -3786,13 +3793,23 @@ def _retry_limit(row):
     if not (data.get('status') == 429 or LIMIT_ERROR.search(f"{data.get('type', '')} {message}")):
         return None
     seconds = 0
-    if data.get('retryAfterMs'):
-        seconds = int(data['retryAfterMs']) // 1000
-    elif row.get('nextRetryAt') and row.get('timestamp'):
-        seconds = int(row['nextRetryAt'] - row['timestamp']) // 1000
+    for value in (data.get('retryAfterMs'), _difference(row.get('nextRetryAt'), row.get('timestamp'))):
+        try:
+            seconds = int(float(value)) // 1000
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if seconds > 0:
+            break
     if seconds <= LIMIT_WAIT_SECONDS:
         return None
-    return message[:300], seconds
+    return message[:300], min(seconds, MAX_RETRY_PAUSE_SECONDS)
+
+
+def _difference(later, earlier):
+    try:
+        return float(later) - float(earlier)
+    except (TypeError, ValueError):
+        return None
 
 
 def _scan_retry(state, line):

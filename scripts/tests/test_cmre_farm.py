@@ -3575,6 +3575,34 @@ def test_the_farm_stops_a_worker_waiting_out_a_limit_at_once(root, monkeypatch):
     assert limited and limited[0]['until'] == pytest.approx(1000.0 + 32932)
 
 
+def test_a_limited_translation_keeps_its_written_draft_for_the_retry(root, monkeypatch):
+    """Review 2026-11-22: a worker can write its source and then meet the 429 on its last turn."""
+    now = [1000.0]
+    monkeypatch.setattr(farm.time, 'time', lambda: now[0])
+    draft = b'/* draft: half the loop recovered */\n'
+
+    def plan(job):
+        Path(job['source']).parent.mkdir(parents=True, exist_ok=True)
+        Path(job['source']).write_bytes(draft)
+        return WaitingHandle(code=None)
+
+    f, cmre, launcher = scripted_farm(root, plan, lambda: 0.0, ladder=['go/a'])
+    f.tick()
+    f.tick()
+    again = [j for j in f.pending if j['fn'] == 'fn_00401000']
+    assert again and again[0]['_seed'] == draft           # as escalation carries a prior source
+    assert 'fn_00401000' not in f.state['attempts']
+    assert any(e['event'] == 'draft-kept' for e in events(f.run_dir))
+
+
+def test_a_malformed_or_huge_retry_after_is_bounded(tmp_path):
+    log = tmp_path / 'w.jsonl'
+    log.write_text(STEP + '\n' + retry_row(after_ms='soon') + '\n')
+    assert farm.OpencodeHandle(None, log).pending_limit()[1] == 900          # falls back to nextRetryAt
+    log.write_text(STEP + '\n' + retry_row(after_ms=10 ** 12) + '\n')
+    assert farm.OpencodeHandle(None, log).limit_error()[1] == farm.MAX_RETRY_PAUSE_SECONDS
+
+
 def test_usage_limit_pauses_the_provider_and_requeues_without_an_attempt(root, monkeypatch):
     # Four backlog fix attempts were spent on the limit and reported as unchanged sources.
     now = [1000.0]
