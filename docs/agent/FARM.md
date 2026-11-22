@@ -228,7 +228,12 @@ Coordinator procedure:
    - `model-unavailable`: the farm already moved to the next rung; probe once and
      tell Adam if a key needs renewal.
    - `model-limited`: a provider usage limit (OpenCode Go: 5 hours, shared by every
-     DeepSeek model) paused that provider until the time `status` shows. The farm
+     DeepSeek model; also monthly) paused that provider until the time `status` shows.
+     A limit whose message says to switch to a free model pauses only paid models,
+     shown as `LIMITED provider (paid)`; `-free` models keep running, and their own
+     limits pause only the free tier (`provider:free`). A `provider.no-route`
+     ("Model unavailable") pauses only that model for one hour (`LIMITED provider/model`);
+     the input lane still gates a spec the worker changed before the error. The farm
      requeues without spending attempts and falls through to an available provider.
      A failed attempt whose remaining rungs are all paused waits for them instead of
      parking, and a failure while the farm stops is left for the next run's scan.

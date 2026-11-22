@@ -335,6 +335,110 @@ def test_a_usage_limit_pauses_the_provider_without_spending_an_attempt(tmp_path)
     assert [job['model'] for job, _, _ in launcher.started][-1] == 'q/strong'
 
 
+GO_MONTHLY = ('OpenCode Go monthly usage limit reached. Switch to a free model, or turn on Extra Usage '
+              'on the Go page in OpenCode Console to keep going.')
+
+
+def test_a_paid_usage_limit_leaves_free_models_usable(tmp_path):
+    l, _, _, _ = make_lane(tmp_path, {})
+    l._pause('p/paid', GO_MONTHLY, 600)
+    assert not l._available('p/paid')
+    assert l._available('p/hy4-flash-free')
+    l._pause('p/hy4-flash-free', 'Too Many Requests', 60)
+    assert not l._available('p/hy4-flash-free')
+    assert not l._available('p/paid')
+    l._pause('q/paid', 'quota', 600)
+    assert not l._available('q/other-free')
+
+
+class WorkingLauncher(Launcher):
+    """The worker writes a new spec, then its stream ends with a limit (job 31, 2026-11-21:
+    5.5 minutes of work, a passing spec, then provider.no-route)."""
+
+    def start(self, job, prompt, agent):
+        handle = super().start(job, prompt, agent)
+        Path(job['spec']).write_text('{"fixtures": [{"new": 1}]}\n')
+        return handle
+
+
+def test_a_limit_after_real_work_still_gates_the_written_spec(tmp_path):
+    l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1,
+                                        gate={'fn_00401000': {'status': 'pass', 'coverage': 0.7}})
+    l.launcher = WorkingLauncher(tmp_path, limit=('Model unavailable: p/cheap', 3600))
+    l.tick()
+    l.drain_gates()
+    assert ops.gates == [('fn_00401000', 'p/cheap')]
+    assert ops.applies and l.state['functions']['fn_00401000']['status'] == 'accepted'
+    assert not l._available('p/cheap')
+
+
+class AuthLauncher(Launcher):
+    def start(self, job, prompt, agent):
+        handle = super().start(job, prompt, agent)
+        handle.infra_error = lambda: 'This API key has expired. Create a new API key in OpenCode Console'
+        return handle
+
+
+def test_an_expired_key_pauses_the_provider_and_spends_no_attempt(tmp_path):
+    # 2026-11-21 23:04: jobs 39-50 died on "401 api_key_expired"; each spent an attempt.
+    l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1)
+    l.launcher = AuthLauncher(tmp_path)
+    l.tick()
+    l.tick()
+    assert ops.gates == [] and l.state['functions']['fn_00401000'].get('attempts', []) == []
+    assert not l._available('p/cheap') and not l._available('p/other')
+    assert any(e['event'] == 'model-unavailable' for e in
+               map(json.loads, (l.dir / 'events.jsonl').read_text().splitlines()))
+
+
+def test_a_quota_limit_that_also_looks_like_infra_stays_a_timed_limit(tmp_path):
+    # MiniMax "Token Plan usage limit" is type provider.quota: it matches both detectors.
+    l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1)
+    l.launcher = AuthLauncher(tmp_path, limit=('The Token Plan usage limit has been reached.', 900))
+    l.tick()
+    l.tick()
+    assert l.state['limited'] == {'p': pytest.approx(1900.0)}
+    names = [json.loads(x)['event'] for x in (l.dir / 'events.jsonl').read_text().splitlines()]
+    assert 'model-limited' in names and 'model-unavailable' not in names
+
+
+def test_an_expired_key_on_a_free_model_pauses_the_whole_provider(tmp_path):
+    l, _, _, _ = make_lane(tmp_path, {})
+    l.ladder = ['p/x-free']
+    l._pause_provider('p/x-free', 'This API key has expired', 3600)
+    assert not l._available('p/x-free') and not l._available('p/paid')
+
+
+def test_the_farm_lane_summary_ends_a_job_on_model_unavailable(tmp_path):
+    import cmre_farm
+    l, _, _, _ = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1)
+    l.launcher = AuthLauncher(tmp_path)
+    l.tick()
+    l.tick()
+    # the key failure ended job 1; job 2 (the next rung) is the only one still running
+    assert [job['model'] for job, _, _ in l.running] == ['q/strong']
+    assert cmre_farm.input_lane_summary(l.run_dir)['running'] == 1
+
+
+def test_handle_infra_error_reports_the_error_message(tmp_path):
+    import cmre_farm
+    log = tmp_path / 'w.jsonl'
+    log.write_text(json.dumps({'type': 'error', 'error': {
+        'type': 'provider.auth', 'status': 401,
+        'message': 'This API key has expired. Create a new API key in OpenCode Console.'}}) + '\n')
+    assert cmre_farm.OpencodeHandle(None, log).infra_error().startswith('This API key has expired')
+
+
+def test_a_no_route_pauses_only_that_model_and_spends_no_attempt(tmp_path):
+    l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1,
+                                        limit=('Model unavailable: p/cheap', 3600))
+    l.tick()
+    l.tick()
+    assert ops.gates == [] and l.state['functions']['fn_00401000'].get('attempts', []) == []
+    assert not l._available('p/cheap') and l._available('p/other')
+    assert [job['model'] for job, _, _ in launcher.started][-1] == 'q/strong'
+
+
 def test_a_busy_writer_leaves_the_pass_for_a_later_apply(tmp_path):
     l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, apply='busy',
                                         gate={'fn_00401000': {'status': 'pass', 'coverage': 0.7}})

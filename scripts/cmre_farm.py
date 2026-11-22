@@ -73,6 +73,36 @@ MAX_RESTARTS_PER_HOUR = 5    # more than this is a crash loop: stop and wake the
 # OpenCode Go has a 5-hour usage limit per account (HTTP 429, hit 2026-11-13 evening); it pauses
 # every model of that provider until it resets. Without a reset time, retry after this long.
 DEFAULT_LIMIT_SECONDS = 900
+# A limit message that says "Switch to a free model" (the Go monthly limit, 2026-11-21) covers
+# paid models only. A message without that phrase keeps pausing the provider's free models too.
+FREE_EXEMPT = re.compile(r'switch to a free model', re.I)
+
+
+# A provider that no longer routes one model (2026-11-21 22:58: "provider.no-route: Model
+# unavailable: opencode-go/hy4-flash-free") pauses that model only; it is retried after this long.
+NO_ROUTE = re.compile(r'provider\.no-route|model unavailable', re.I)
+NO_ROUTE_SECONDS = 3600
+
+
+def _is_free_model(model):
+    return model.split('#', 1)[0].endswith('-free')
+
+
+def _limit_labels(limits, now):
+    """Active limits for status display; a paid-only limit is labelled so."""
+    return {f"{key} (paid)" if ':' not in key and FREE_EXEMPT.search(data.get('message', '')) else key:
+            data['until']
+            for key, data in limits.items() if data['until'] > now}
+
+
+def _limit_key(model, message=''):
+    """limited_providers key: the provider, provider:free for its free tier, or the model itself
+    when the provider stopped routing just that model."""
+    if NO_ROUTE.search(message or ''):
+        return model.split('#', 1)[0]
+    provider = model.split('/', 1)[0]
+    return f'{provider}:free' if _is_free_model(model) else provider
+
 STALE_SECONDS = 600   # state.json is saved every tick; older than this means the farm is gone
 HARD_HOLDS = ('harness-blocker', 'evidence-needed')
 MAX_FIX_ROUNDS = 1
@@ -1041,8 +1071,7 @@ class Farm:
                 'next_scan': next_scan, 'deadline': self.state.get('deadline_at'),
                 'supply_empty_since': self.state.get('supply_empty_since') if self.supply_empty else None,
                 'unavailable': sorted(self.state['unavailable_models']),
-                'limited': {p: data['until'] for p, data in self.state['limited_providers'].items()
-                            if data['until'] > now},
+                'limited': _limit_labels(self.state['limited_providers'], now),
                 'translation_model': self._rung_model(0)[0],
                 'audit_model': self._audit_model(self.config.audit_model) if self.config.audit_model else None,
             },
@@ -1145,8 +1174,7 @@ class Farm:
                  'boundaries': sorted(self.state.get('boundaries', {})),
                  'quarantined': dict(self.state.get('quarantined', {})),
                 'unavailable_models': dict(self.state['unavailable_models']),
-                'limited': {p: v['until'] for p, v in self.state.get('limited_providers', {}).items()
-                            if v['until'] > time.time()},
+                'limited': _limit_labels(self.state.get('limited_providers', {}), time.time()),
                 'input_lane': input_lane_summary(self.run_dir),
                 'stopping': self.stopping()}
 
@@ -1196,9 +1224,16 @@ class Farm:
         return None
 
     def _limited_until(self, model):
-        """Wall-clock end of the model's provider usage limit, or None when it is usable."""
-        limit = self.state['limited_providers'].get(model.split('/', 1)[0])
-        return limit['until'] if limit and limit['until'] > time.time() else None
+        """Wall-clock end of the model's provider usage limit, or None when it is usable.
+        A paid-usage limit whose message exempts free models does not pause the free tier."""
+        provider = model.split('/', 1)[0]
+        limits = self.state['limited_providers']
+        found = [limits.get(_limit_key(model)), limits.get(model.split('#', 1)[0])]
+        if _is_free_model(model):
+            paid = limits.get(provider)
+            found.append(None if paid and FREE_EXEMPT.search(paid.get('message', '')) else paid)
+        ends = [limit['until'] for limit in found if limit and limit['until'] > time.time()]
+        return max(ends) if ends else None
 
     def _available(self, model):
         return model not in self.state['unavailable_models'] and self._limited_until(model) is None
@@ -1620,7 +1655,7 @@ class Farm:
         if detail:
             self._invalidate_fix(job, detail)
         safe = not detail and (job['kind'] == 'audit' or self._running_inputs_match(job))
-        provider = job['model'].split('/', 1)[0]
+        provider = _limit_key(job['model'], message)
         until = time.time() + max(60, seconds)
         self.state['limited_providers'][provider] = {'until': until, 'message': message[:300]}
         self._event('model-limited', provider=provider, model=job['model'], until=until,
@@ -3349,7 +3384,7 @@ def input_lane_summary(run_dir):
         name, key = event.get('event'), (event.get('fn'), event.get('n'))
         if name == 'dispatch':
             running.add(key)
-        elif name in ('result', 'model-limited'):
+        elif name in ('result', 'model-limited', 'model-unavailable'):
             running.discard(key)
         elif name in ('lane-start', 'lane-exit', 'interrupted'):
             if name == 'interrupted':
@@ -3535,6 +3570,8 @@ class OpencodeHandle:
                 continue
             message = str(data.get('message') or (data.get('data') or {}).get('message') or '')
             body = str((data.get('response') or {}).get('body') or '')
+            if NO_ROUTE.search(f"{data.get('type', '')} {message}"):
+                return f"provider.no-route: {message}"[:300], NO_ROUTE_SECONDS
             if data.get('status') == 429 or LIMIT_ERROR.search(f"{data.get('type', '')} {message}"):
                 if data.get('retryAfterMs'):
                     return message[:300], int(data['retryAfterMs']) // 1000
@@ -3553,7 +3590,8 @@ class OpencodeHandle:
             if '"type":"error"' in line.replace(' ', '') and INFRA_ERROR.search(line):
                 try:
                     data = json.loads(line)['error']
-                    return str((data.get('data') or {}).get('message') or data.get('name'))
+                    return str(data.get('message') or (data.get('data') or {}).get('message')
+                               or data.get('name') or data.get('type'))
                 except (ValueError, KeyError, TypeError, AttributeError):
                     return line[:300]
         return None
