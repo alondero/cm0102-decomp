@@ -48,6 +48,9 @@ CLAIM_PREFIX = 'defect-lane-'
 SMOKE_PREFIX = 'defect-smoke-'   # --no-submit runs: own state under defect-lane/smoke/, own claims
 LAUNCH_PAUSE_SECONDS = 300
 STALE_FIX_SECONDS = 2 * 3600   # a fix dispatch this old with no open-defect after it: the farm died mid-fix
+# A surviving operand mutant means the gate inputs never expose that x87 operand: no source
+# rewrite fixes it, so the defect waits for inputs instead of spending its last attempt.
+NEEDS_INPUTS = re.compile(r'\bsurvivor\b', re.I)
 WAITING = ('submitted', 'submit-unknown')   # a request that may still be waiting for the farm
 RESULT = re.compile(r'^\s*`*(ADOPT|DISMISS|UNRESOLVED)\b[ \t]*(.*?)`*\s*$')
 
@@ -89,8 +92,8 @@ def plan(candidates, rows, active=(), now=None):
                 continue
             if row.get('status') in WAITING and now - row.get('submitted_at', 0) < SUBMIT_GRACE_SECONDS:
                 continue
-            if row.get('status') in ('recorded', 'applied'):
-                continue   # a smoke run stops after one recorded result; the farm took an applied one
+            if row.get('status') in ('recorded', 'applied', 'needs-inputs'):
+                continue   # smoke: one recorded result; applied: the farm took it; needs-inputs: no fix helps
         todo.append((-info['bytes'], fn))
     return [fn for _, fn in sorted(todo)]
 
@@ -309,9 +312,9 @@ class Lane:
                 if name == 'request-failed' and outcome.get('kind') == kind:
                     detail = str(outcome.get('detail', ''))[:600]
                     attempt['farm'] = {'outcome': 'refused', 'detail': detail}
-                    row['status'] = 'farm-refused'
+                    row['status'] = 'needs-inputs' if NEEDS_INPUTS.search(detail) else 'farm-refused'
                     self.event('farm-refused', fn=fn, n=attempt.get('n'), verb=attempt.get('verb'),
-                               detail=detail[:300])
+                               route=row['status'], detail=detail[:300])
                     break
                 if (kind == 'adopt' and name == 'accepted' and outcome.get('kind') == 'adopt') or \
                         (kind == 'dismiss' and name == 'dismissed'):

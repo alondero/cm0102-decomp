@@ -446,4 +446,42 @@ def test_farm_ops_reads_request_outcomes_from_the_run_events(tmp_path):
 def test_defect_workers_are_told_to_keep_x87_calls_out_of_macros(tmp_path):
     job = {'fn': 'fn_00401000', 'hand': str(tmp_path / 'run/hand/fn_00401000-c.c')}
     text = lane.agent_text(tmp_path, job)
-    assert 'cm_x87_' in text and '#define' in text and 'call sites' in text
+    assert 'cm_x87_CIpow' in text and '#define' in text and 'call sites' in text
+
+
+SURVIVOR = ('BLOCKER: x87 operand mutant base for call 1 (line 291) survivor: '
+            'differential-mismatch-not-observed; evidence x')
+
+
+def test_an_operand_survivor_is_not_given_to_another_worker(tmp_path):
+    """Review 2026-11-22: no source rewrite makes the gate inputs expose an operand."""
+    l, ops, launcher = submitted_once(tmp_path)
+    ops._outcomes = {'fn_00401000': [{'at': time.time() + 1, 'event': 'request-failed', 'kind': 'adopt',
+                                      'detail': SURVIVOR}]}
+    l.refreshed = None
+    drain(l, ticks=3)
+    row = l.state['functions']['fn_00401000']
+    assert row['status'] == 'needs-inputs' and len(launcher.started) == 1
+    assert lane.lane_summary(l.run_dir)['refused'] == 1
+
+
+def test_a_verdict_recorded_while_submit_runs_still_counts(tmp_path):
+    """Review 2026-11-22: the farm can apply a request before the submit command returns."""
+    l, ops, launcher = make(tmp_path, {'fn_00401000': cand()}, adopt_line)
+    l.workers = 1
+    ticks = {'now': 1000.0}
+
+    def clock():
+        ticks['now'] += 1
+        return ticks['now']
+    l.clock = clock
+
+    def submit(command):
+        ops._outcomes = {'fn_00401000': [{'at': clock(), 'event': 'request-failed', 'kind': 'adopt',
+                                          'detail': X87}]}
+        return 0, 'queued'
+    ops.submit = submit
+    drain(l, ticks=2)
+    l.refreshed = None
+    drain(l, ticks=1)
+    assert l.state['functions']['fn_00401000']['attempts'][0]['farm']['outcome'] == 'refused'

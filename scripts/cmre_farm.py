@@ -3058,8 +3058,9 @@ DEFECT_AGENT_BODY = """
 You resolve one open CM0102 audit defect. The coordinator gives you RUN (a farm run
 directory) and fn_X. Follow docs/agent/FARM.md section "Defect subagent" exactly and
 finish with its one result line.
-The farm's x87 operand safeguard (ADR 0010) mutates each cm_x87_* call separately and
-refuses an adopt with a cm_x87_* call inside a #define. Write each such call at its
+The farm's x87 operand safeguard (ADR 0010) perturbs each cm_x87_CIpow call's base and
+exponent and needs the gate to notice. It refuses a cm_x87_CIpow inside a #define or
+anywhere that is not a plain two-operand call. Write each cm_x87_CIpow call at its
 call sites: expand a macro like `#define cm_fn_X(a, b) cm_x87_CIpow(a, b)` there, even
 when the accepted source has it.
 First run `py -3.13 scripts/cmre_farm.py review RUN fn_X --claim NAME` with a
