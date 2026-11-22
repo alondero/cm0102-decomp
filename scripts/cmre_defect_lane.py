@@ -45,6 +45,9 @@ MANUAL_CLAIM_SECONDS = 6 * 3600   # someone else's recent review claim: leave th
 INFRA_PAUSE_SECONDS = 3600
 CANDIDATE_REFRESH_SECONDS = 300
 CLAIM_PREFIX = 'defect-lane-'
+SMOKE_PREFIX = 'defect-smoke-'   # --no-submit runs: own state under defect-lane/smoke/, own claims
+LAUNCH_PAUSE_SECONDS = 300
+WAITING = ('submitted', 'submit-unknown')   # a request that may still be waiting for the farm
 RESULT = re.compile(r'^\s*`*(ADOPT|DISMISS|UNRESOLVED)\b[ \t]*(.*?)`*\s*$')
 
 
@@ -83,8 +86,10 @@ def plan(candidates, rows, active=(), now=None):
         if row.get('key') == info['key']:
             if len(row.get('attempts', [])) >= MAX_ATTEMPTS:
                 continue
-            if row.get('status') == 'submitted' and now - row.get('submitted_at', 0) < SUBMIT_GRACE_SECONDS:
+            if row.get('status') in WAITING and now - row.get('submitted_at', 0) < SUBMIT_GRACE_SECONDS:
                 continue
+            if row.get('status') == 'recorded':
+                continue   # a smoke run stops after one recorded result
         todo.append((-info['bytes'], fn))
     return [fn for _, fn in sorted(todo)]
 
@@ -100,31 +105,42 @@ def parse_result(text):
 
 
 def final_text(log):
-    """The worker's last text part from an `opencode run --format json` stream."""
+    """The worker's closing text from an `opencode run --format json` stream, or ''.
+
+    Only text that no tool call follows is a result: a worker that writes its planned
+    verdict and keeps working has not finished (review 2026-11-22)."""
     last = ''
     try:
         lines = Path(log).read_text(encoding='utf-8', errors='replace').splitlines()
     except OSError:
         return ''
     for line in lines:
-        if '"type":"text"' not in line.replace(' ', ''):
-            continue
         try:
-            part = json.loads(line).get('part') or {}
+            row = json.loads(line)
         except ValueError:
             continue
-        if part.get('type') == 'text' and part.get('text'):
+        if not isinstance(row, dict):
+            continue
+        part = row.get('part') or {}
+        if row.get('type') == 'tool_use' or part.get('type') == 'tool':
+            last = ''
+        elif row.get('type') == 'text' and part.get('type') == 'text' and part.get('text'):
             last = part['text']
     return last
 
 
-def decide(job, verb, rest):
-    """Check a result line against the job's fixed paths: ('adopt'|'dismiss', args) or ('none', why)."""
+def decide(job, verb, rest, root=None):
+    """Check a result line against the job's fixed paths: ('adopt'|'dismiss', args) or ('none', why).
+
+    Relative paths are read against the repository root, as the prompt writes them."""
     receipt, hand = job['receipt'], job['hand']
 
     def same(given, expected):
+        path = Path(given)
+        if not path.is_absolute() and root is not None:
+            path = Path(root) / path
         try:
-            return Path(given).resolve() == Path(expected).resolve()
+            return path.resolve() == Path(expected).resolve()
         except (OSError, ValueError):
             return False
 
@@ -170,7 +186,7 @@ def prompt(root, job):
         f'   Its review_receipt is {receipt}. Never create another claim.',
         f"2. For a confirmed defect: `{PY} scripts/cmre_farm.py prepare-hand {run} {job['fn']} "
         f'--review-receipt {receipt} --claim-scoped`, which creates {hand}. Edit only that file and gate it with',
-        f"   `{PY} scripts/cmre_farm.py test {run} {job['fn']} --source {hand}` "
+        f"   `{PY} scripts/cmre_farm.py test {run} {job['fn']} {hand}` "
         f"(add `--case N` to explain one case).",
         '3. Finish with exactly one of these as your last line:',
         f'   ADOPT {hand} {receipt} <one-line note: what you fixed and the gate result>',
@@ -213,7 +229,9 @@ class Lane:
                  attempt_minutes=ATTEMPT_MINUTES, stall_minutes=STALL_MINUTES, root=ROOT, only=None,
                  submit=True):
         self.run_dir, self.ops, self.launcher, self.clock = Path(run_dir), ops, launcher, clock
-        self.dir = self.run_dir / 'defect-lane'
+        # A --no-submit smoke run keeps its own state, events and claims beside the live lane's.
+        self.dir = self.run_dir / 'defect-lane' if submit else self.run_dir / 'defect-lane' / 'smoke'
+        self.prefix = CLAIM_PREFIX if submit else SMOKE_PREFIX
         self.state_path = self.dir / 'state.json'
         self.state = _load(self.state_path)
         for key, default in (('functions', {}), ('limited', {}), ('counter', 0)):
@@ -284,14 +302,21 @@ class Lane:
             attempts = row.setdefault('attempts', [])
             self.state['counter'] += 1
             n = self.state['counter']
-            claim = f'{CLAIM_PREFIX}{n}-{fn[3:]}'
+            claim = f'{self.prefix}{n}-{fn[3:]}'
             job = {'fn': fn, 'n': n, 'kind': 'defect', 'model': self.model, 'bytes': info['bytes'],
                    'key': info['key'], 'claim': claim, 'run_dir': str(self.run_dir),
                    'receipt': str(self.run_dir / 'reviews' / claim / 'receipt.json'),
                    'hand': str(self.run_dir / 'hand' / f'{fn}-{claim}.c')}
             if attempts:
                 job['prior'] = {'detail': attempts[-1].get('detail', '')}
-            handle = self.launcher.start(job, prompt(self.root, job), agent_text(self.root, job))
+            try:
+                handle = self.launcher.start(job, prompt(self.root, job), agent_text(self.root, job))
+            except Exception as exc:   # a broken launcher must not crash-loop the lane every 5 minutes
+                self.state['limited'][self.model.split('#', 1)[0]] = self.clock() + LAUNCH_PAUSE_SECONDS
+                self.event('launch-failed', fn=fn, n=n, model=self.model, error=f'{type(exc).__name__}: {exc}'[:300])
+                self.queue.insert(0, fn)
+                self.save()
+                return
             self.running.append((job, handle, self.clock()))
             row['status'] = 'running'
             self.event('dispatch', fn=fn, n=n, model=self.model, bytes=info['bytes'], claim=claim)
@@ -345,9 +370,12 @@ class Lane:
             if infra:
                 return self._pause(job, job['model'].split('/', 1)[0], INFRA_PAUSE_SECONDS,
                                    'model-unavailable', infra)
-        action, detail = decide(job, verb, rest)
-        if action == 'none' and verb is None and interrupted:
-            detail = f'{interrupted} with no result line'
+        if interrupted:
+            # A killed worker had not finished: whatever it wrote so far is not its result.
+            action, detail = 'none', f'{interrupted}: worker killed before finishing'
+            verb, rest = None, ''
+        else:
+            action, detail = decide(job, verb, rest, root=self.root)
         row = self.state['functions'].setdefault(job['fn'], {'key': job['key']})
         attempt = {'n': job['n'], 'model': job['model'], 'verb': verb, 'at': self.clock(),
                    'claim': job['claim'], 'detail': (verb + ' ' + rest if verb else detail)[:600]}
@@ -368,7 +396,7 @@ class Lane:
             return
         code, output = self.ops.submit(command)
         attempt['submit'] = {'code': code, 'output': output[-400:]}
-        row['status'] = 'submitted' if code == 0 else 'submit-refused'
+        row['status'] = 'submitted' if code == 0 else 'submit-unknown' if code is None else 'submit-refused'
         row['submitted_at'] = self.clock()
         self.event('result', fn=job['fn'], n=job['n'], model=job['model'], verb=verb, outcome=row['status'],
                    code=code, output=output[-300:])
@@ -436,7 +464,8 @@ def lane_summary(run_dir):
         elif name in ('result', 'model-limited', 'model-unavailable', 'interrupted'):
             running.discard(key)
             if name == 'result':
-                verbs[event.get('verb') or 'none'] = verbs.get(event.get('verb') or 'none', 0) + 1
+                verb = event.get('verb') if event.get('outcome') == 'submitted' else None
+                verbs[verb or 'none'] = verbs.get(verb or 'none', 0) + 1
         elif name in ('lane-start', 'lane-exit'):
             running.clear()
     return {'running': len(running), 'adopt': verbs.get('ADOPT', 0), 'dismiss': verbs.get('DISMISS', 0),
@@ -455,9 +484,23 @@ class FarmOps:
         except OSError:
             return None
 
+    def _fixing(self):
+        """Functions whose farm fix job was dispatched after their last open-defect event.
+
+        _defect records the defect and queues its one automatic fix in the same step, so a
+        defect is the lane's only once the farm reports it open (review 2026-11-22)."""
+        import cmre_farm as farm
+        last = {}
+        events, _ = farm._read_events(self.run_dir / 'events.jsonl', 0)
+        for event in events:
+            if event.get('event') == 'open-defect' or (event.get('event') == 'dispatch'
+                                                       and event.get('kind') == 'fix'):
+                last[event.get('fn')] = event.get('event')
+        return {fn for fn, name in last.items() if name == 'dispatch'}
+
     def _others_busy(self):
-        """Functions with a queued request or someone else's recent review claim."""
-        busy = set()
+        """Functions with a queued request, a farm fix in flight, or someone else's recent claim."""
+        busy = self._fixing()
         for path in (self.run_dir / 'requests').glob('*.json'):
             try:
                 busy.add(json.loads(path.read_bytes())['fn'])
@@ -465,7 +508,7 @@ class FarmOps:
                 continue
         reviews = self.run_dir / 'reviews'
         for receipt in reviews.glob('*/receipt.json'):
-            if receipt.parent.name.startswith(CLAIM_PREFIX):
+            if receipt.parent.name.startswith((CLAIM_PREFIX, SMOKE_PREFIX)):
                 continue
             try:
                 if self.clock() - receipt.stat().st_mtime < MANUAL_CLAIM_SECONDS:
@@ -503,8 +546,11 @@ class FarmOps:
                        '--reason', f"defect lane {job['claim']} ({job['model']}): {args['reason']}"]
 
     def submit(self, command):
-        done = subprocess.run(command, cwd=self.root, capture_output=True, text=True, encoding='utf-8',
-                              errors='replace', timeout=600)
+        try:
+            done = subprocess.run(command, cwd=self.root, capture_output=True, text=True, encoding='utf-8',
+                                  errors='replace', timeout=600)
+        except subprocess.TimeoutExpired:
+            return None, 'submit timed out after 600 s; the request state is unknown'
         return done.returncode, (done.stdout or '') + (done.stderr or '')
 
 
@@ -567,7 +613,7 @@ def main(argv=None):
         print(f'{len(lane.queue)} defects, {sum(lane.candidates[f]["bytes"] for f in lane.queue)} B')
         return 0
     import cmre_input_lane
-    lane_dir = a.run_dir / 'defect-lane'
+    lane_dir = a.run_dir / 'defect-lane' / ('smoke' if a.no_submit else '')
     with cmre_input_lane.LaneLock(lane_dir):
         lane = Lane(a.run_dir, ops, Launcher(ROOT, a.run_dir), workers=a.workers, model=a.model,
                     attempt_minutes=a.attempt_minutes, only=[f for f in a.only.split(',') if f] or None,

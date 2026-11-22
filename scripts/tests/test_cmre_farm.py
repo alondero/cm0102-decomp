@@ -3931,6 +3931,17 @@ def test_input_bound_failure_parks_without_spending_the_stronger_model(root):
     assert needed and needed[0]['fn'] == 'fn_00401000' and needed[0]['coverage'] == 0.3669
 
 
+def test_an_input_bound_must_not_accept_candidate_waits_for_inputs(root):
+    # Review 2026-11-22: a stronger model cannot add test inputs; it parks for the input lane.
+    declared = 'u32 cm_fn_00401000(u32 a) { return a; } /* must not be accepted: coverage */\n'
+    f, cmre, launcher = make(root, [item('fn_00401000')], writes(declared), workers=1)
+    cmre.test = lambda fn, source=None: input_bound_report()
+    drain(f)
+    assert [j['model'] for j, _, _ in launcher.started] == ['m/cheap']
+    assert f.state['parked']['fn_00401000']['detail'].startswith('input-bound')
+    assert 'fn_00401000' in f.state['input_needed'] and cmre.accepted == []
+
+
 def park_input_bound(root):
     f, cmre, launcher = make(root, [item('fn_00401000')], writes(passing), workers=1,
                              continuous=True, rescan_seconds=0)
@@ -5368,11 +5379,22 @@ def test_a_hand_pause_of_the_defect_lane_is_respected(root):
     assert procs == []
 
 
+def test_status_names_the_defect_lane_only_while_it_is_switched_on(root):
+    # Review 2026-11-22: the coordinator leaves open defects to the lane when status names it.
+    f, clock, procs = defect_farm(root, workers=0)
+    lane_dir = f.run_dir / 'defect-lane'
+    lane_dir.mkdir(parents=True)
+    (lane_dir / 'events.jsonl').write_text(json.dumps({'event': 'lane-exit'}) + '\n')
+    assert 'defects lane' not in farm.status_line(f.summary())
+    (f.run_dir / 'control.json').write_text(json.dumps({'defect_lane_workers': 2}))
+    assert 'defects lane' in farm.status_line(f.summary())      # `status` reads the live setting
+
+
 def test_status_shows_defect_lane_results(root):
     f, clock, procs = defect_farm(root)
     lane_dir = f.run_dir / 'defect-lane'
     lane_dir.mkdir(parents=True)
-    rows = [{'event': 'dispatch', 'fn': 'fn_a', 'n': 1}, {'event': 'result', 'fn': 'fn_a', 'n': 1, 'verb': 'ADOPT'},
+    rows = [{'event': 'dispatch', 'fn': 'fn_a', 'n': 1}, {'event': 'result', 'fn': 'fn_a', 'n': 1, 'verb': 'ADOPT', 'outcome': 'submitted'},
             {'event': 'dispatch', 'fn': 'fn_b', 'n': 2}]
     (lane_dir / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
     assert 'defects lane: running 1, adopt 1, dismiss 0, unresolved 0' in farm.status_line(f.summary())

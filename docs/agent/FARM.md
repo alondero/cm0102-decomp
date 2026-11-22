@@ -689,18 +689,24 @@ the model; the lane's default is `openai/gpt-6.2-sol`). Each job's claim name
 dispatch. A final `ADOPT` or `DISMISS` line naming exactly those paths becomes
 the farm's checked `adopt`/`dismiss` request; anything else is recorded as
 unresolved. A defect gets two looks per (accepted source, hints, findings); a
-change to any of them starts again. The lane skips quarantined functions,
-functions with a queued request, and functions someone else claimed for review
-in the last 6 hours, so a coordinator working a defect by hand is not raced.
-Provider limits pause the model without spending an attempt.
+change to any of them starts again. The lane takes a defect only after the farm
+reports it open (its own automatic fix has finished), and skips quarantined
+functions, functions with a queued request, and functions someone else claimed
+for review in the last 6 hours, so a coordinator working a defect by hand is not
+raced. Only closing text that no tool call follows counts as a result; a worker
+killed at its time limit submits nothing. Provider limits pause the model
+without spending an attempt.
 
 - `py -3.13 scripts/cmre_defect_lane.py plan RUN` lists what it would work;
-  `status RUN` gives counts. `status` on the farm shows `defects lane: running N,
-  adopt A, dismiss D, unresolved U`.
+  `status RUN` gives counts. While `--defect-lane-workers` is above 0, `status`
+  on the farm shows `defects lane: running N, adopt A, dismiss D, unresolved U`
+  (adopt and dismiss count submitted requests).
 - Smoke runs on a live farm: `run RUN --only fn_X --workers 1 --no-submit`
-  records each adopt/dismiss command in `RUN/defect-lane/state.json` without
-  queuing it. Claims and hand files are new immutable files under `RUN/reviews/`
-  and `RUN/hand/`; nothing else in the run changes.
+  records each adopt/dismiss command in `RUN/defect-lane/smoke/state.json`
+  without queuing it, stops after one recorded result per defect, and leaves the
+  live lane's state and attempts alone. Its `defect-smoke-…` claims and hand
+  files are new immutable files under `RUN/reviews/` and `RUN/hand/`; nothing
+  else in the run changes.
 - With the lane on, the coordinator no longer sends `cm-defect` for
   `open-defect` events; `UNRESOLVED` rows in `status RUN` go to the handoff.
 - Stopping: the lane obeys `RUN/STOP` and `RUN/defect-lane/STOP`; a hand-written

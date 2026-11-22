@@ -1227,8 +1227,17 @@ class Farm:
                 'unavailable_models': dict(self.state['unavailable_models']),
                 'limited': _limit_labels(self.state.get('limited_providers', {}), time.time()),
                 'input_lane': input_lane_summary(self.run_dir),
-                'defect_lane': defect_lane_summary(self.run_dir),
+                'defect_lane': defect_lane_summary(self.run_dir) if self._defect_lane_on() else None,
                 'stopping': self.stopping()}
+
+    def _defect_lane_on(self):
+        """The live setting decides: `status` builds a zero-worker config, so read control.json too."""
+        try:
+            control = json.loads((self.run_dir / 'control.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            control = {}
+        workers = control.get('defect_lane_workers', self.config.defect_lane_workers)
+        return isinstance(workers, int) and workers > 0
 
     # -- supply
     def _scan_due(self):
@@ -1852,13 +1861,10 @@ class Farm:
             # evidence gap: the next rung continues from this candidate.
             return 'worker self-declared unfinished: ' + '; '.join(declared)
         report = self.cmre.test(fn, str(source))
-        if must_not:
+        if must_not and report.get('status') == 'pass':
             # A gate pass is exactly what "must not be accepted" says is not enough: triage it.
-            # A gate fail is an unfinished attempt (96 of 162 safeguard parks on 22 Nov).
-            if report.get('status') == 'pass':
-                job['_safeguard_blocker'] = True
-                return 'BLOCKER: ' + '; '.join(declared) + '; the gate passes'
-            return 'worker self-declared unfinished: ' + '; '.join(declared) + ' | ' + report_detail(report)
+            job['_safeguard_blocker'] = True
+            return 'BLOCKER: ' + '; '.join(declared) + '; the gate passes'
         if report.get('status') != 'pass':
             coverage = input_bound(report)
             if coverage is not None and job['kind'] == 'translate':
@@ -1867,6 +1873,9 @@ class Farm:
                     return 'candidate inputs changed during verification'
                 job['_input_bound'] = coverage
                 return 'input-bound: ' + report_detail(report)
+            if must_not:
+                # A gate fail is an unfinished attempt (96 of 162 safeguard parks on 22 Nov).
+                return 'worker self-declared unfinished: ' + '; '.join(declared) + ' | ' + report_detail(report)
             return report_detail(report)
         try:
             detail = self._x87_operand_check(job, text_bytes, report)
@@ -3543,8 +3552,12 @@ def _request(run_dir, fn, kind, **data):
 
 def defect_lane_summary(run_dir):
     """Defect-lane counts from RUN/defect-lane/events.jsonl, or None when the lane never ran."""
-    from cmre_defect_lane import lane_summary
-    return lane_summary(run_dir)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('_cmre_defect_lane_summary',
+                                                  Path(__file__).resolve().parent / 'cmre_defect_lane.py')
+    module = importlib.util.module_from_spec(spec)   # works whether this file is scripts.cmre_farm or cmre_farm
+    spec.loader.exec_module(module)
+    return module.lane_summary(run_dir)
 
 
 def input_lane_summary(run_dir):
