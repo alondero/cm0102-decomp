@@ -659,7 +659,10 @@ before writing. Then:
   same OpenCode 2.x session, told to repair and test the source, unless the farm
   is stopping or under two minutes of the attempt remain. The continuation keeps
   the attempt's deadline and logs `nudged` (or `nudge-failed` when there is no
-  session). On 22 Nov 18 of 75 Terra translations quit inside
+  session). A translator that reports `FARM-RESULT: fail` after fewer than
+  five gate runs, with ten minutes or more of the attempt left, is continued the
+  same way once, told to explain and fix the first difference (`nudged` with
+  `reason: early-fail` and its gate-run count, for measuring whether it helps). On 22 Nov 18 of 75 Terra translations quit inside
   3 minutes without editing.
 
 ## Audit checklist
