@@ -118,6 +118,8 @@ MAX_AUDIT_ROUNDS = 2
 DEFAULT_STALL_MINUTES = 15   # opencode 2.x is silent while a step thinks; 8 min killed real work
 FRONTIER_LIMIT = 5000   # cmre returns smallest-first; ask for the whole queue
 CONTINUE_MIN_SECONDS = 120   # a translator is continued only with this much of its attempt left
+EARLY_FAIL_MIN_SECONDS = 600   # ...and an early "fail" only with this much
+GATE_RUN_BUDGET = 5   # the translate prompt's "Stop after 5 failed gate runs"
 PY = 'py -3.13'
 
 WORKER_COMMANDS = ('brief', 'test', 'explain', 'show', 'disasm', 'family', 'work show', 'trace-check')
@@ -485,8 +487,8 @@ def translate_prompt(root, job):
          f'2. Write {src} from the draft or the starting source below; check every statement against the listing.'),
         f'3. {PY} -m cmre test {fn} --c --source {src}',
         f'4. On a mismatch: {PY} -m cmre explain {fn} --c --source {src} --case N   then fix the first difference.',
-        ('   Stop after 5 failed gate runs; build failures of the seeded draft do not count.'
-         if job.get('draft_seeded') else '   Stop after 5 failed tests. Build failures count.'),
+        (f'   Stop after {GATE_RUN_BUDGET} failed gate runs; build failures of the seeded draft do not count.'
+         if job.get('draft_seeded') else f'   Stop after {GATE_RUN_BUDGET} failed tests. Build failures count.'),
         '',
         'Finish with exactly one line: FARM-RESULT: pass | FARM-RESULT: fail <first remaining mismatch> | '
         'FARM-RESULT: evidence-needed <private hint proposal needs parent>',
@@ -519,6 +521,17 @@ def continue_message(root, job):
             f'attempt has not been tested. {seed} Then run {PY} -m cmre test {fn} --c --source {src} '
             'and fix mismatches one at a time, as your instructions say. Finish with exactly one '
             'FARM-RESULT line.')
+
+
+def early_fail_message(root, job, gate_runs, seconds_left):
+    fn, src = job['fn'], _rel(root, job['source'])
+    return (f'You reported fail after {gate_runs} of {GATE_RUN_BUDGET} gate runs, with about '
+            f'{int(seconds_left // 60)} minutes of this attempt left. A first mismatch is the next thing '
+            f'to fix, not a result. Run {PY} -m cmre explain {fn} --c --source {src} --case N on the '
+            'failing case, compare the first difference with the listing, fix it in place and test '
+            f'again with {PY} -m cmre test {fn} --c --source {src}. Report fail only after '
+            f'{GATE_RUN_BUDGET} failed gate runs or when you can name the blocker that stops you. '
+            'Finish with exactly one FARM-RESULT line.')
 
 
 def fix_prompt(root, job):
@@ -2143,31 +2156,41 @@ class Farm:
         """Continue a translator's session once when it exits without editing its starting source.
 
         22 Nov: 18 of 75 Terra translations ended inside 3 minutes with the machine draft untouched,
-        each spending a ladder rung. The continued worker keeps the attempt's original deadline."""
-        if job['kind'] != 'translate' or job.get('_nudged') or job.get('_seed_from_attempt'):
+        each spending a ladder rung. Also when the worker reports fail with gate runs and time to
+        spare: after 19:27 that day 75 of ~100 Terra failures stopped after 1-2 of 5 gate runs.
+        The continued worker keeps the attempt's original deadline."""
+        if job['kind'] != 'translate' or job.get('_nudged'):
             return False
         left = self.config.attempt_minutes * 60 - (self.clock() - started)
         if left < CONTINUE_MIN_SECONDS or self.stopping():
-            return False
-        seed = job.get('_seed_bytes')
-        if seed is None or _read(job['source']) != seed:
             return False
         if job.get('_hint_dispatched') and _read(job['hint_source']) != job['_snap']['hint']:
             return False   # a private input proposal is the worker's result
         resume = getattr(self.launcher, 'resume', None)
         if resume is None:
             return False
+        seed = job.get('_seed_bytes')
+        report = getattr(handle, 'worker_report', lambda: None)() or {}
+        if (not job.get('_seed_from_attempt') and seed is not None and _read(job['source']) == seed):
+            reason, message = 'unchanged', continue_message(self.root, job)
+        elif ((report.get('result') or '').startswith('FARM-RESULT: fail')
+              and report.get('gate_runs', GATE_RUN_BUDGET) < GATE_RUN_BUDGET
+              and left >= EARLY_FAIL_MIN_SECONDS):
+            reason = 'early-fail'
+            message = early_fail_message(self.root, job, report['gate_runs'], left)
+        else:
+            return False
         job['_nudged'] = True
         try:
-            again = resume(job, handle, continue_message(self.root, job))
+            again = resume(job, handle, message)
         except Exception as exc:   # a failed continuation falls back to the unchanged-source failure
             self._event('nudge-failed', fn=job['fn'], n=job['n'], error=str(exc)[:300])
             return False
         if again is None:
             self._event('nudge-failed', fn=job['fn'], n=job['n'], error='no session to continue')
             return False
-        self._event('nudged', fn=job['fn'], n=job['n'], model=job['model'],
-                    minutes=round((self.clock() - started) / 60, 1))
+        self._event('nudged', fn=job['fn'], n=job['n'], model=job['model'], reason=reason,
+                    gate_runs=report.get('gate_runs'), minutes=round((self.clock() - started) / 60, 1))
         still.append((job, again, started))
         return True
 
@@ -3914,6 +3937,27 @@ class OpencodeHandle:
             except ValueError:
                 continue
         return reason
+
+    def worker_report(self):
+        """{'result': the last FARM-RESULT line, 'gate_runs': cmre test calls}, or None without a log."""
+        try:
+            text = self.log.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            return None
+        result, runs = None, 0
+        for line in text.splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            part = row.get('part') or {} if isinstance(row, dict) else {}
+            if row.get('type') == 'tool_use' and part.get('tool') == 'shell':
+                command = str(((part.get('state') or {}).get('input') or {}).get('command') or '')
+                runs += ' -m cmre test ' in f' {command} '
+            elif row.get('type') == 'text':
+                found = re.findall(r'^\s*(FARM-RESULT:.*?)\s*$', part.get('text') or '', re.M)
+                result = found[-1] if found else result
+        return {'result': result, 'gate_runs': runs}
 
     def last_activity(self):
         """Log mtime expressed on the farm's monotonic clock."""

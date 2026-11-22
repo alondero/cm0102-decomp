@@ -2907,6 +2907,96 @@ def test_a_worker_that_edited_its_seed_is_not_continued(root):
     assert launcher.resumed == [] and cmre.accepted == ['fn_00401000']
 
 
+class ReportingHandle(ScriptedHandle):
+    """A finished worker that edited its source and reported a verdict after N gate runs."""
+
+    def __init__(self, result, gate_runs, code=0):
+        super().__init__(code=code)
+        self.report = {'result': result, 'gate_runs': gate_runs}
+
+    def worker_report(self):
+        return self.report
+
+
+def early_fail_farm(root, first, again, now):
+    def worker(job):
+        Path(job['source']).write_text('int cm_fn_00401000(void) { return 2; } /* edited */\n')
+        return first
+    launcher = ResumingLauncher(worker, again)
+    f, cmre, _ = scripted_farm(root, None, lambda: now[0], ladder=['m/cheap'])
+    f.launcher = launcher
+    job = f._new_job('translate', 'fn_00401000', 'm/cheap', 0, bytes=200)
+    job['_seed'] = SEED.encode()
+    f.pending.append(job)
+    return f, cmre, launcher
+
+
+def test_a_worker_that_reports_fail_early_is_continued_once(root):
+    """22 Nov: 75 of ~100 Terra failures stopped after 1-2 of 5 gate runs, ~6 minutes in."""
+    now = [0.0]
+    f, cmre, launcher = early_fail_farm(root, ReportingHandle('FARM-RESULT: fail case 3 event 22', 2),
+                                        write_source(GOOD), now)
+    drain(f, 6)
+    assert len(launcher.resumed) == 1
+    message = launcher.resumed[0][1]
+    assert '2 of 5' in message and 'cmre explain' in message and 'FARM-RESULT' in message
+    assert cmre.accepted == ['fn_00401000']
+    nudged = [e for e in events(f.run_dir) if e['event'] == 'nudged']
+    assert nudged and nudged[0]['reason'] == 'early-fail' and nudged[0]['gate_runs'] == 2
+
+
+def test_a_worker_that_used_its_gate_runs_is_not_continued(root):
+    now = [0.0]
+    f, cmre, launcher = early_fail_farm(root, ReportingHandle('FARM-RESULT: fail case 1', 5),
+                                        write_source(GOOD), now)
+    drain(f, 6)
+    assert launcher.resumed == [] and cmre.accepted == []
+
+
+def test_an_early_fail_with_little_time_left_is_not_continued(root):
+    now = [0.0]
+    f, cmre, launcher = early_fail_farm(root, ReportingHandle('FARM-RESULT: fail case 1', 1),
+                                        write_source(GOOD), now)
+    f.tick()
+    now[0] = 21 * 60                      # 9 minutes of a 30-minute attempt left
+    drain(f, 5)
+    assert launcher.resumed == []
+
+
+def test_a_reported_pass_or_evidence_request_is_not_continued(root):
+    for result in ('FARM-RESULT: pass', 'FARM-RESULT: evidence-needed hint proposal', None):
+        sub = root / (result or 'none').split()[-1].replace(':', '')
+        sub.mkdir()
+        now = [0.0]
+        f, cmre, launcher = early_fail_farm(sub, ReportingHandle(result, 1), write_source(GOOD), now)
+        drain(f, 6)
+        assert launcher.resumed == [], result
+
+
+def test_an_early_fail_is_continued_only_once(root):
+    now = [0.0]
+    f, cmre, launcher = early_fail_farm(root, ReportingHandle('FARM-RESULT: fail case 1', 1),
+                                        lambda job: ReportingHandle('FARM-RESULT: fail case 1', 2), now)
+    drain(f, 8)
+    assert len(launcher.resumed) == 1 and cmre.accepted == []
+
+
+def test_the_handle_reports_gate_runs_and_the_last_farm_result(root, tmp_path):
+    def tool(tool, **inp):
+        return {'type': 'tool_use', 'part': {'tool': tool, 'state': {'status': 'completed', 'input': inp}}}
+    rows = [tool('read', path='bundle.md'),
+            tool('shell', command='py -3.13 -m cmre test fn_1 --c --source a.c'),
+            tool('shell', command='py -3.13 -m cmre explain fn_1 --c --source a.c --case 3'),
+            {'type': 'text', 'part': {'text': 'thinking\nFARM-RESULT: fail first try'}},
+            tool('shell', command='py -3.13 -m cmre test fn_1 --c --source a.c --opt=-O2'),
+            {'type': 'text', 'part': {'text': 'Done.\nFARM-RESULT: fail case 3 event 22'}}]
+    log = tmp_path / 'w.jsonl'
+    log.write_text('\n'.join(json.dumps(r) for r in rows) + '\nnot json\n', encoding='utf-8')
+    report = farm.OpencodeHandle(None, log).worker_report()
+    assert report == {'result': 'FARM-RESULT: fail case 3 event 22', 'gate_runs': 2}
+    assert farm.OpencodeHandle(None, tmp_path / 'missing.jsonl').worker_report() is None
+
+
 def test_auth_error_marks_model_unavailable_without_spending_an_attempt(root):
     def plan(job):
         if job['model'] == 'm/cheap':
