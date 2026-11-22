@@ -89,8 +89,8 @@ def plan(candidates, rows, active=(), now=None):
                 continue
             if row.get('status') in WAITING and now - row.get('submitted_at', 0) < SUBMIT_GRACE_SECONDS:
                 continue
-            if row.get('status') == 'recorded':
-                continue   # a smoke run stops after one recorded result
+            if row.get('status') in ('recorded', 'applied'):
+                continue   # a smoke run stops after one recorded result; the farm took an applied one
         todo.append((-info['bytes'], fn))
     return [fn for _, fn in sorted(todo)]
 
@@ -198,8 +198,11 @@ def prompt(root, job):
     ]
     prior = job.get('prior')
     if prior:
-        lines += ['', f"An earlier attempt on these same findings ended: {prior['detail'][:600]}",
-                  'Start again from the claimed inputs; do not reuse its claim or hand file.']
+        lines += ['', f"An earlier attempt on these same findings ended: {prior['detail'][:600]}"]
+        if prior.get('refused'):
+            lines += [f"The farm refused that result when it applied it: {prior['refused'][:600]}",
+                      'A source the gate passes can still fail the farm\'s own checks: fix what the refusal names.']
+        lines += ['Start again from the claimed inputs; do not reuse its claim or hand file.']
     return '\n'.join(lines) + '\n'
 
 
@@ -280,10 +283,42 @@ class Lane:
         if not force and self.refreshed is not None and self.clock() - self.refreshed < CANDIDATE_REFRESH_SECONDS:
             return
         self.refreshed = self.clock()
+        self.reconcile()
         self.candidates = self.ops.candidates()
         if self.only is not None:
             self.candidates = {fn: info for fn, info in self.candidates.items() if fn in self.only}
         self.queue = plan(self.candidates, self.state['functions'], self._busy(), now=self.clock())
+
+    def reconcile(self):
+        """Settle submitted requests from the farm's own verdict on them.
+
+        The farm applies a request on a later tick and records `accepted`/`dismissed` or
+        `request-failed`. On 22 Nov it refused two gate-passing fn_006ec010 adopts (a cm_x87_*
+        call inside a #define) while the lane still counted them as submitted; a refusal now
+        frees the defect at once and its reason reaches the next worker."""
+        outcomes = self.ops.outcomes() if hasattr(self.ops, 'outcomes') else {}
+        for fn, row in self.state['functions'].items():
+            if row.get('status') not in WAITING or not row.get('attempts'):
+                continue
+            attempt = row['attempts'][-1]
+            kind = (attempt.get('verb') or '').lower()
+            for outcome in outcomes.get(fn, []):
+                if outcome.get('at', 0) < row.get('submitted_at', 0):
+                    continue
+                name = outcome.get('event')
+                if name == 'request-failed' and outcome.get('kind') == kind:
+                    detail = str(outcome.get('detail', ''))[:600]
+                    attempt['farm'] = {'outcome': 'refused', 'detail': detail}
+                    row['status'] = 'farm-refused'
+                    self.event('farm-refused', fn=fn, n=attempt.get('n'), verb=attempt.get('verb'),
+                               detail=detail[:300])
+                    break
+                if (kind == 'adopt' and name == 'accepted' and outcome.get('kind') == 'adopt') or \
+                        (kind == 'dismiss' and name == 'dismissed'):
+                    attempt['farm'] = {'outcome': 'applied'}
+                    row['status'] = 'applied'
+                    self.event('farm-applied', fn=fn, n=attempt.get('n'), verb=attempt.get('verb'))
+                    break
 
     def dispatch(self):
         if self.stopping():
@@ -310,6 +345,8 @@ class Lane:
                    'hand': str(self.run_dir / 'hand' / f'{fn}-{claim}.c')}
             if attempts:
                 job['prior'] = {'detail': attempts[-1].get('detail', '')}
+                if attempts[-1].get('farm', {}).get('outcome') == 'refused':
+                    job['prior']['refused'] = attempts[-1]['farm'].get('detail', '')
             try:
                 handle = self.launcher.start(job, prompt(self.root, job), agent_text(self.root, job))
             except Exception as exc:   # a broken launcher must not crash-loop the lane every 5 minutes
@@ -395,10 +432,11 @@ class Lane:
                        command=command)
             self.save()
             return
+        submitted_at = self.clock()   # before submit: the farm may apply it before submit returns
         code, output = self.ops.submit(command)
         attempt['submit'] = {'code': code, 'output': output[-400:]}
         row['status'] = 'submitted' if code == 0 else 'submit-unknown' if code is None else 'submit-refused'
-        row['submitted_at'] = self.clock()
+        row['submitted_at'] = submitted_at
         self.event('result', fn=job['fn'], n=job['n'], model=job['model'], verb=verb, outcome=row['status'],
                    code=code, output=output[-300:])
         self.save()
@@ -457,10 +495,12 @@ def lane_summary(run_dir):
     path = Path(run_dir) / 'defect-lane' / 'events.jsonl'
     if not path.exists():
         return None
-    running, verbs = set(), {}
+    running, verbs, farm = set(), {}, {'farm-applied': 0, 'farm-refused': 0}
     for event in _events(path):
         name, key = event.get('event'), (event.get('fn'), event.get('n'))
-        if name == 'dispatch':
+        if name in farm:
+            farm[name] += 1
+        elif name == 'dispatch':
             running.add(key)
         elif name in ('result', 'model-limited', 'model-unavailable', 'interrupted'):
             running.discard(key)
@@ -470,7 +510,8 @@ def lane_summary(run_dir):
         elif name in ('lane-start', 'lane-exit'):
             running.clear()
     return {'running': len(running), 'adopt': verbs.get('ADOPT', 0), 'dismiss': verbs.get('DISMISS', 0),
-            'unresolved': verbs.get('UNRESOLVED', 0) + verbs.get('none', 0)}
+            'unresolved': verbs.get('UNRESOLVED', 0) + verbs.get('none', 0),
+            'applied': farm['farm-applied'], 'refused': farm['farm-refused']}
 
 
 # --- the real repository ---------------------------------------------------------
@@ -502,6 +543,20 @@ class FarmOps:
         now = self.clock()
         return {fn for fn, (name, at) in last.items()
                 if name == 'open-defect' or now - at > STALE_FIX_SECONDS}
+
+    def outcomes(self):
+        """The farm's verdicts on adopt/dismiss requests, per function, in event order."""
+        import cmre_farm as farm
+        out = {}
+        events, _ = farm._read_events(self.run_dir / 'events.jsonl', 0)
+        for event in events:
+            name = event.get('event')
+            if (name == 'request-failed' and event.get('kind') in ('adopt', 'dismiss')) or name == 'dismissed' \
+                    or (name == 'accepted' and event.get('kind') == 'adopt'):
+                out.setdefault(event.get('fn'), []).append(
+                    {'at': event.get('at') or 0, 'event': name, 'kind': event.get('kind'),
+                     'detail': str(event.get('detail', ''))[:600]})
+        return out
 
     def _others_busy(self):
         """Functions with a queued request or someone else's recent review claim."""

@@ -51,6 +51,10 @@ class Launcher:
 class Ops:
     def __init__(self, candidates, code=0):
         self._candidates, self.code, self.submitted = candidates, code, []
+        self._outcomes = {}
+
+    def outcomes(self):
+        return json.loads(json.dumps(self._outcomes))
 
     def candidates(self):
         return json.loads(json.dumps(self._candidates))
@@ -192,7 +196,8 @@ def test_status_summary_counts_results(tmp_path):
                    lambda job: adopt_line(job) if job['fn'] == 'fn_00401000' else 'UNRESOLVED x')
     drain(l, ticks=2)
     # The UNRESOLVED defect is already back for its second look.
-    assert lane.lane_summary(l.run_dir) == {'running': 1, 'adopt': 1, 'dismiss': 0, 'unresolved': 1}
+    assert lane.lane_summary(l.run_dir) == {'running': 1, 'adopt': 1, 'dismiss': 0, 'unresolved': 1,
+                                            'applied': 0, 'refused': 0}
 
 
 def test_agent_edits_only_its_hand_file_and_denies_shell_chaining(tmp_path):
@@ -356,3 +361,89 @@ def test_a_launch_failure_pauses_the_model_instead_of_crashing(tmp_path):
     launcher.start = broken
     drain(l, ticks=2)
     assert l.state['limited']['openai/m'] > time.time() and not l.running
+
+
+# --- farm verdicts on submitted requests (22 Nov: fn_006ec010 refused twice) -------
+
+X87 = ('BLOCKER: x87 operand safeguard: unsupported: cm_x87_CIpow inside a preprocessor directive '
+       'cannot be mutated per call')
+
+
+def submitted_once(tmp_path, behaviour=adopt_line):
+    l, ops, launcher = make(tmp_path, {'fn_00401000': cand()}, behaviour)
+    l.workers = 1
+    drain(l, ticks=2)
+    assert l.state['functions']['fn_00401000']['status'] == 'submitted' and len(launcher.started) == 1
+    return l, ops, launcher
+
+
+def test_a_farm_refusal_frees_the_defect_at_once_and_the_next_worker_is_told_why(tmp_path):
+    l, ops, launcher = submitted_once(tmp_path)
+    ops._outcomes = {'fn_00401000': [{'at': time.time() + 1, 'event': 'request-failed', 'kind': 'adopt',
+                                      'detail': X87}]}
+    l.refreshed = None
+    drain(l, ticks=1)
+    row = l.state['functions']['fn_00401000']
+    assert row['attempts'][0]['farm'] == {'outcome': 'refused', 'detail': X87}
+    assert len(launcher.started) == 2            # not held for SUBMIT_GRACE_SECONDS
+    second = launcher.started[1][1]
+    assert 'The farm refused' in second and 'preprocessor directive' in second
+    assert any(e['event'] == 'farm-refused' for e in lane._events(l.dir / 'events.jsonl'))
+
+
+def test_an_applied_request_is_final_for_its_key(tmp_path):
+    l, ops, launcher = submitted_once(tmp_path)
+    ops._outcomes = {'fn_00401000': [{'at': time.time() + 1, 'event': 'accepted', 'kind': 'adopt'}]}
+    l.refreshed = None
+    drain(l, ticks=3)
+    assert l.state['functions']['fn_00401000']['status'] == 'applied' and len(launcher.started) == 1
+
+
+def test_older_or_other_verb_outcomes_do_not_settle_a_submission(tmp_path):
+    l, ops, launcher = submitted_once(tmp_path)
+    ops._outcomes = {'fn_00401000': [
+        {'at': time.time() - 3600, 'event': 'request-failed', 'kind': 'adopt', 'detail': 'old'},
+        {'at': time.time() + 1, 'event': 'request-failed', 'kind': 'dismiss', 'detail': 'someone else'},
+        {'at': time.time() + 1, 'event': 'dismissed'}]}
+    l.refreshed = None
+    drain(l, ticks=1)
+    assert l.state['functions']['fn_00401000']['status'] == 'submitted' and len(launcher.started) == 1
+
+
+def test_a_dismiss_is_settled_by_the_farm_dismissed_event(tmp_path):
+    def dismiss(job):
+        return f"DISMISS {job['receipt']} VA 0x401010 disproves it"
+    l, ops, _ = submitted_once(tmp_path, dismiss)
+    ops._outcomes = {'fn_00401000': [{'at': time.time() + 1, 'event': 'dismissed'}]}
+    l.refreshed = None
+    drain(l, ticks=1)
+    assert l.state['functions']['fn_00401000']['status'] == 'applied'
+
+
+def test_status_counts_what_the_farm_applied_and_refused(tmp_path):
+    l, ops, _ = submitted_once(tmp_path)
+    ops._outcomes = {'fn_00401000': [{'at': time.time() + 1, 'event': 'request-failed', 'kind': 'adopt',
+                                      'detail': X87}]}
+    l.refreshed = None
+    drain(l, ticks=1)
+    summary = lane.lane_summary(l.run_dir)
+    assert summary['refused'] == 1 and summary['applied'] == 0
+
+
+def test_farm_ops_reads_request_outcomes_from_the_run_events(tmp_path):
+    run = tmp_path / 'run'
+    run.mkdir()
+    rows = [{'at': 1, 'event': 'request-failed', 'fn': 'fn_a', 'kind': 'adopt', 'detail': X87},
+            {'at': 2, 'event': 'accepted', 'fn': 'fn_a', 'kind': 'adopt'},
+            {'at': 3, 'event': 'accepted', 'fn': 'fn_b', 'kind': 'translate'},
+            {'at': 4, 'event': 'dismissed', 'fn': 'fn_c', 'reason': 'r'}]
+    (run / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows), encoding='utf-8')
+    out = lane.FarmOps(run, root=tmp_path).outcomes()
+    assert [o['event'] for o in out['fn_a']] == ['request-failed', 'accepted'] and out['fn_a'][0]['detail'] == X87
+    assert 'fn_b' not in out and out['fn_c'][0]['event'] == 'dismissed'
+
+
+def test_defect_workers_are_told_to_keep_x87_calls_out_of_macros(tmp_path):
+    job = {'fn': 'fn_00401000', 'hand': str(tmp_path / 'run/hand/fn_00401000-c.c')}
+    text = lane.agent_text(tmp_path, job)
+    assert 'cm_x87_' in text and '#define' in text and 'call sites' in text

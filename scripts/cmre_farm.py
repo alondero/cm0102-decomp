@@ -3058,6 +3058,10 @@ DEFECT_AGENT_BODY = """
 You resolve one open CM0102 audit defect. The coordinator gives you RUN (a farm run
 directory) and fn_X. Follow docs/agent/FARM.md section "Defect subagent" exactly and
 finish with its one result line.
+The farm's x87 operand safeguard (ADR 0010) mutates each cm_x87_* call separately and
+refuses an adopt with a cm_x87_* call inside a #define. Write each such call at its
+call sites: expand a macro like `#define cm_fn_X(a, b) cm_x87_CIpow(a, b)` there, even
+when the accepted source has it.
 First run `py -3.13 scripts/cmre_farm.py review RUN fn_X --claim NAME` with a
 new unique claim name. Read the returned immutable source/hints paths and keep
 review_receipt. For status "bound", also read the returned review/first_review
@@ -3647,6 +3651,7 @@ def status_line(s):
                f"{s['input_lane']['accepted_bytes']} B" if s.get('input_lane') else '')
             + (f" | defects lane: running {s['defect_lane']['running']}, adopt {s['defect_lane']['adopt']}, "
                f"dismiss {s['defect_lane']['dismiss']}, unresolved {s['defect_lane']['unresolved']}"
+               f" (farm applied {s['defect_lane'].get('applied', 0)}, refused {s['defect_lane'].get('refused', 0)})"
                if s.get('defect_lane') else '')
             + (f" | SUPPLY EMPTY {round((time.time() - s['supply_empty_since']) / 60)} min: work the supply lane"
                if s.get('supply_empty_since') and not s['stopping'] else '')
