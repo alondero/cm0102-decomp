@@ -337,9 +337,40 @@ instruction relation and a complete read-only recovered-only page witness.
 Do not fold fault classes generally, remove inputs, or change the link base to
 hide a collision. Readable/executable page collisions are not solved by this rule.
 
+The semantic profile treats a stack-probe fault below the test stack as one
+location: a data fault whose instruction lies in the pinned original probe
+(`0x00945610..0x0094563E`) and whose address lies in the page below the stack
+(`semantic.GUARD_START`; the return push faults in its last dword). The offset in that
+page is the caller's frame depth. Access class, width and every other address
+still compare raw.
+
 `cmre explain --window N` shows raw event context and read sites. Semantic and
 ABI comparisons filter import events, so `event_context` records their separate
 raw indices rather than treating a filtered index as a raw trace position.
+
+### Dead-stack reads in C comparisons
+
+The semantic profile treats the stack as compiler layout. A random case can still
+aim a data pointer or loop at the live stack (an unaligned dword composed from two
+arena words can name a stack address), so the original's callee reads frames that
+earlier or deeper calls left below ESP, and passes those leftovers to an import.
+The C wrapper's frame holds different saved registers, so the import arguments
+differ although the function is right. Cases run without tracking. A semantic-profile
+case that differs is re-run once on the original machine with tracking, which
+records each stack read wholly below the live ESP (`Result.dead_stack_reads`); a
+re-run that does not reproduce the first run exactly is ignored. The rule:
+
+- For an event difference, a dead read qualifies only if it precedes the original's
+  raw event for the first differing import call.
+- For a difference in the outcome, fault detail, registers or memory, any dead read
+  qualifies.
+- Reads by the CRT `__chkstk` probe (`STACK_PROBE_CODE`) never qualify.
+
+A qualifying case is `inconclusive`, is listed under `stack_layout_cases` /
+`stack_layout_examples` (kept in the C acceptance record), and contributes no
+instruction coverage. Above `STACK_LAYOUT_LIMIT` (2% of cases) the differences stay
+mismatches (`kind: stack-layout-excess`). Cases without a difference are
+unaffected, and lifted and `abi` runs do not use the rule.
 
 ## Codex preservation hook
 
