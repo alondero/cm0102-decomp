@@ -134,7 +134,7 @@ failing case for mismatches). Work the lane with the most bytes that you own:
 | `budget-bound` | Adam | C exhausts the 200k budget; a raised budget changes shared hints of an accepted lift |
 | `safeguard-blocker` | `cm-triage` | resolve the `BLOCKER:` the candidate declares, then `retry` |
 | `worker-failure` | coordinator | `retry RUN fn_X --reason ...` |
-| `open-defect` | defect lane | [Defect subagent](#defect-subagent) |
+| `open-defect` | defect lane | [Defect lane](#defect-lane) (`--defect-lane-workers`), or the [defect subagent](#defect-subagent) by hand |
 | `boundary` | none | explicit unknown; a defect only with consumer evidence |
 
 ### Lift lane
@@ -204,8 +204,9 @@ Coordinator procedure:
 3. Run `py -3.13 scripts/cmre_farm.py wait RUN --minutes 60` as a **background**
    shell command and end your turn; OpenCode resumes you when it returns. Act on
    the reason it prints, in one short line per event:
-   - `open-defect fn_X`: send one `cm-defect` subagent the prompt `RUN fn_X`
-     (at most 3 at once). Its last line decides: `ADOPT <path> <review_receipt> <note>` →
+   - `open-defect fn_X`: when `status` shows `defects lane:`, the farm's
+     [defect lane](#defect-lane) takes it; do nothing. Otherwise send one
+     `cm-defect` subagent the prompt `RUN fn_X` (at most 3 at once). Its last line decides: `ADOPT <path> <review_receipt> <note>` →
      `py -3.13 scripts/cmre_farm.py adopt RUN fn_X --source <path> --review-receipt <review_receipt> --note "<note>"`;
      `DISMISS <review_receipt> <reason>` →
      `py -3.13 scripts/cmre_farm.py dismiss RUN fn_X --review-receipt <review_receipt> --reason "<reason>"`;
@@ -629,10 +630,13 @@ before writing. Then:
   `UNVALIDATED CANDIDATE`, `must not be accepted` or `BLOCKER:` statement.
   The farm refuses such a source; never delete a disclaimer merely to get it
   accepted. Resolve the boundary, or leave the candidate blocked for the parent
-  input lane. A `BLOCKER:` or `must not be accepted` statement parks the
-  function as `safeguard-blocker`; an `UNVALIDATED CANDIDATE` statement alone is
-  a failed attempt that escalates to the next rung and, at the top, parks as
-  `worker-failure`.
+  input lane. A `BLOCKER:` statement parks the function as `safeguard-blocker`.
+  A `must not be accepted` statement is gated first: a pass parks as
+  `safeguard-blocker` (the worker says the gate cannot see the problem), and a
+  fail is a failed attempt. A failed attempt with an `UNVALIDATED CANDIDATE` or
+  `must not be accepted` statement escalates to the next rung and, at the top,
+  parks as `worker-failure`. Before 22 Nov a failing `must not be accepted`
+  candidate parked without a gate: 96 of 162 safeguard parks.
 
 ## Audit checklist
 
@@ -673,6 +677,43 @@ Audit workers do not run `cmre mutate` (it outlives the worker shell's 2-minute
 timeout). When triaging an open defect by hand, `cmre mutate fn_X` shows operator
 mutants that survive the corpus; a surviving mutant on a line the listing proves
 is a weak test, not a defect by itself.
+
+### Defect lane
+
+`scripts/cmre_defect_lane.py run RUN` runs the [defect subagent](#defect-subagent)
+procedure headless, one open defect per job, largest accepted function first.
+The farm keeps it running while `--defect-lane-workers` is above 0 (default 0;
+`set RUN --defect-lane-workers 2` turns it on live, `--defect-lane-model` picks
+the model; the lane's default is `openai/gpt-6.2-sol`). Each job's claim name
+(`defect-lane-N-…`), review receipt and hand-source path are fixed before
+dispatch. A final `ADOPT` or `DISMISS` line naming exactly those paths becomes
+the farm's checked `adopt`/`dismiss` request; anything else is recorded as
+unresolved. A defect gets two looks per (accepted source, hints, findings); a
+change to any of them starts again. The lane takes a defect only after the farm
+reports it open (its last event is `open-defect`, or its automatic fix was
+dispatched over 2 hours ago with no result, when the farm died mid-fix); a defect
+with neither event stays with the coordinator. It skips quarantined
+functions, functions with a queued request, and functions someone else claimed
+for review in the last 6 hours, so a coordinator working a defect by hand is not
+raced. Only closing text that no tool call follows counts as a result; a worker
+killed at its time limit submits nothing. Provider limits pause the model
+without spending an attempt.
+
+- `py -3.13 scripts/cmre_defect_lane.py plan RUN` lists what it would work;
+  `status RUN` gives counts. While `--defect-lane-workers` is above 0, `status`
+  on the farm shows `defects lane: running N, adopt A, dismiss D, unresolved U`
+  (adopt and dismiss count submitted requests).
+- Smoke runs on a live farm: `run RUN --only fn_X --workers 1 --no-submit`
+  records each adopt/dismiss command in `RUN/defect-lane/smoke/state.json`
+  without queuing it, stops after one recorded result per defect, and leaves the
+  live lane's state and attempts alone. Its `defect-smoke-…` claims and hand
+  files are new immutable files under `RUN/reviews/` and `RUN/hand/`; nothing
+  else in the run changes.
+- With the lane on, the coordinator no longer sends `cm-defect` for
+  `open-defect` events; `UNRESOLVED` rows in `status RUN` go to the handoff.
+- Stopping: the lane obeys `RUN/STOP` and `RUN/defect-lane/STOP`; a hand-written
+  `defect-lane/STOP` pauses it until deleted. State and worker logs are local
+  evidence under `RUN/defect-lane/`; never publish them.
 
 ### Input lane
 

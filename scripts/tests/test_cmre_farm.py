@@ -3931,6 +3931,17 @@ def test_input_bound_failure_parks_without_spending_the_stronger_model(root):
     assert needed and needed[0]['fn'] == 'fn_00401000' and needed[0]['coverage'] == 0.3669
 
 
+def test_an_input_bound_must_not_accept_candidate_waits_for_inputs(root):
+    # Review 2026-11-22: a stronger model cannot add test inputs; it parks for the input lane.
+    declared = 'u32 cm_fn_00401000(u32 a) { return a; } /* must not be accepted: coverage */\n'
+    f, cmre, launcher = make(root, [item('fn_00401000')], writes(declared), workers=1)
+    cmre.test = lambda fn, source=None: input_bound_report()
+    drain(f)
+    assert [j['model'] for j, _, _ in launcher.started] == ['m/cheap']
+    assert f.state['parked']['fn_00401000']['detail'].startswith('input-bound')
+    assert 'fn_00401000' in f.state['input_needed'] and cmre.accepted == []
+
+
 def park_input_bound(root):
     f, cmre, launcher = make(root, [item('fn_00401000')], writes(passing), workers=1,
                              continuous=True, rescan_seconds=0)
@@ -4442,7 +4453,7 @@ def test_run_only_limits_the_frontier_to_named_functions(root):
 
 @pytest.mark.parametrize('marker', ['UNVALIDATED CANDIDATE', 'UNVALIDATED candidate',
                                     'BLOCKER: unresolved x87 operand boundary',
-                                    'must not be accepted', 'MUST NOT be accepted'])
+                                    'BLOCKER: x87 boundary; must not be accepted'])
 def test_candidate_self_disclaimer_is_refused_before_the_gate(root, marker):
     source = GOOD.replace('return a + 1;', f'return a + 1; /* {marker} */')
     f, cmre, _ = make(root, [item('fn_00401000')], writes(source), workers=1, ladder=['m/cheap'])
@@ -4451,12 +4462,42 @@ def test_candidate_self_disclaimer_is_refused_before_the_gate(root, marker):
     assert cmre.tests == []
     assert not (root / 'recovery/c/fn_00401000.c').exists()
     detail = f.state['parked']['fn_00401000']['detail']
-    # A gate pass is exactly what "must not be accepted" says is not enough: it parks for triage.
-    parks = 'BLOCKER' in marker or 'accepted' in marker.lower()
+    parks = 'BLOCKER' in marker
     assert detail.startswith('BLOCKER:' if parks else 'worker self-declared unfinished:')
     assert 'candidate self-declares' in detail
     assert farm.parked_lane('fn_00401000', detail, f.state) == (
         'safeguard-blocker' if parks else 'worker-failure')
+
+
+@pytest.mark.parametrize('marker', ['must not be accepted', 'MUST NOT be accepted',
+                                    'UNVALIDATED CANDIDATE: case 3 differs; must not be accepted'])
+def test_a_must_not_accept_candidate_that_fails_the_gate_escalates(root, marker):
+    # 22 Nov: 96 of 162 safeguard parks carried "must not be accepted" beside a failing gate.
+    # Only a gate pass is what the statement says is not enough; a fail is an unfinished attempt.
+    declared = GOOD.replace('return a + 1;', f'return a + 2; /* {marker} */')
+
+    def behaviour(job, root):
+        writes(declared if job['model'] == 'm/cheap' else GOOD)(job, root)
+
+    f, cmre, launcher = make(root, [item('fn_00401000')], behaviour, workers=1)
+    drain(f)
+    assert [j['model'] for j, _, _ in launcher.started] == ['m/cheap', 'm/strong']
+    prior = launcher.started[1][0]['prior']['detail']
+    assert prior.startswith('worker self-declared unfinished:') and 'mismatch' in prior
+    assert cmre.accepted == ['fn_00401000']
+    assert 'must not' not in (root / 'recovery/c/fn_00401000.c').read_text().lower()
+
+
+def test_a_must_not_accept_candidate_that_passes_the_gate_parks_for_triage(root):
+    declared = GOOD.replace('return a + 1;', 'return a + 1; /* PASS; must not be accepted: x87 */')
+    f, cmre, launcher = make(root, [item('fn_00401000')], writes(declared), workers=1)
+    drain(f)
+    assert [j['model'] for j, _, _ in launcher.started] == ['m/cheap']
+    assert cmre.tests and cmre.accepted == []
+    assert not (root / 'recovery/c/fn_00401000.c').exists()
+    detail = f.state['parked']['fn_00401000']['detail']
+    assert detail.startswith('BLOCKER:') and 'gate passes' in detail
+    assert farm.parked_lane('fn_00401000', detail, f.state) == 'safeguard-blocker'
 
 
 def x87_gate(root, cmre, outcome, *, drift=None):
@@ -5281,6 +5322,92 @@ def test_actionable_view_names_failed_checks_and_quarantine_journal(root, monkey
     text = capsys.readouterr().out
     assert 'push destination visibility is unknown' in text
     assert 'example.invalid' not in text
+
+
+# --- defect lane (open audit defects -> adopt/dismiss requests) ----------------
+
+def defect_farm(root, workers=2, **cfg):
+    clock = {'now': 0.0}
+    f, cmre, launcher = make(root, [], writes(GOOD), defect_lane_workers=workers, continuous=True,
+                             hours=None, **cfg)
+    f.clock = lambda: clock['now']
+    procs = []
+    f.defect_launch = lambda command: procs.append(FakeLiftProc(command)) or procs[-1]
+    return f, clock, procs
+
+
+def test_the_defect_lane_is_off_by_default_and_live_settable(root):
+    """22 Nov: 126 open defects waited for a coordinator sending one cm-defect at a time."""
+    f, clock, procs = defect_farm(root, workers=0)
+    f.tick()
+    assert procs == []
+    (f.run_dir / 'control.json').write_text(json.dumps({'defect_lane_workers': 3,
+                                                        'defect_lane_model': 'openai/m-sol'}))
+    f.tick()
+    assert len(procs) == 1
+    command = procs[0].command
+    assert command[1].endswith('cmre_defect_lane.py') and command[2] == 'run'
+    assert command[command.index('--workers') + 1] == '3'
+    assert command[command.index('--model') + 1] == 'openai/m-sol'
+    assert 'defect-lane-start' in [e['event'] for e in events(f.run_dir)]
+
+
+def test_the_defect_lane_relaunches_after_an_exit_and_a_stopping_farm_waits_for_it(root):
+    f, clock, procs = defect_farm(root)
+    f.tick()
+    procs[0].code = 1
+    clock['now'] = 10
+    f.tick()
+    assert len(procs) == 1
+    clock['now'] = 400
+    f.tick()
+    assert len(procs) == 2
+    (f.run_dir / 'STOP').write_text('stop')
+    f.tick()
+    assert not f.finished()
+    assert (f.run_dir / 'defect-lane/STOP').read_text() == farm.FARM_LANE_STOP
+    procs[1].code = 0
+    f.tick()
+    assert f.finished() and len(procs) == 2
+
+
+def test_a_hand_pause_of_the_defect_lane_is_respected(root):
+    f, clock, procs = defect_farm(root)
+    (f.run_dir / 'defect-lane').mkdir(parents=True)
+    (f.run_dir / 'defect-lane/STOP').write_text('paused by hand')
+    f.tick()
+    assert procs == []
+
+
+def test_status_names_the_defect_lane_only_while_it_is_switched_on(root):
+    # Review 2026-11-22: the coordinator leaves open defects to the lane when status names it.
+    f, clock, procs = defect_farm(root, workers=0)
+    lane_dir = f.run_dir / 'defect-lane'
+    lane_dir.mkdir(parents=True)
+    (lane_dir / 'events.jsonl').write_text(json.dumps({'event': 'lane-exit'}) + '\n')
+    assert 'defects lane' not in farm.status_line(f.summary())
+    (f.run_dir / 'control.json').write_text(json.dumps({'defect_lane_workers': 2}))
+    assert 'defects lane' in farm.status_line(f.summary())      # `status` reads the live setting
+
+
+def test_status_sees_a_defect_lane_started_from_the_command_line(root):
+    # Review 2026-11-22: `start --defect-lane-workers 2` leaves no control.json key behind.
+    f, clock, procs = defect_farm(root, workers=2)
+    f.tick()
+    f.save()
+    config = farm.FarmConfig(0, ['-'], 0, None, 1, None, 0, None, False, f.config.owner)
+    view = farm.Farm(f.run_dir, root, None, None, config, reconcile=False)
+    assert view._defect_lane_on()
+
+
+def test_status_shows_defect_lane_results(root):
+    f, clock, procs = defect_farm(root)
+    lane_dir = f.run_dir / 'defect-lane'
+    lane_dir.mkdir(parents=True)
+    rows = [{'event': 'dispatch', 'fn': 'fn_a', 'n': 1}, {'event': 'result', 'fn': 'fn_a', 'n': 1, 'verb': 'ADOPT', 'outcome': 'submitted'},
+            {'event': 'dispatch', 'fn': 'fn_b', 'n': 2}]
+    (lane_dir / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+    assert 'defects lane: running 1, adopt 1, dismiss 0, unresolved 0' in farm.status_line(f.summary())
 
 
 # --- input lane (authored inputs -> accepted lifts; ADR 0013) -----------------
