@@ -74,6 +74,9 @@ MAX_RESTARTS_PER_HOUR = 5    # more than this is a crash loop: stop and wake the
 # every model of that provider until it resets. Without a reset time, retry after this long.
 DEFAULT_LIMIT_SECONDS = 900
 STALE_SECONDS = 600   # state.json is saved every tick; older than this means the farm is gone
+HY4_FREE_MODEL = 'opencode-go/hy4-flash-free'
+GO_PAID_LIMIT_KEY = 'opencode-go:paid'
+GO_PAID_MONTHLY_LIMIT_PREFIX = 'OpenCode Go monthly usage limit reached. Switch to a free model'
 HARD_HOLDS = ('harness-blocker', 'evidence-needed')
 MAX_FIX_ROUNDS = 1
 MAX_AUDIT_ROUNDS = 2
@@ -676,6 +679,8 @@ class Farm:
             self.state = {'schema': 'cmre-farm/1', 'started_at': time.time(), 'owner': config.owner,
                           'attempts': {}, 'accepted': {}, 'parked': {}, 'skipped': {}, 'audits': {},
                           'defects': {}, 'fix_rounds': {}, 'unavailable_models': {}}
+        if launcher is not None:
+            self.state['owner'] = config.owner
         self.state.setdefault('unavailable_models', {})
         self.state.setdefault('limited_providers', {})
         self.deadline = None if config.hours is None else clock() + config.hours * 3600
@@ -1197,8 +1202,15 @@ class Farm:
 
     def _limited_until(self, model):
         """Wall-clock end of the model's provider usage limit, or None when it is usable."""
-        limit = self.state['limited_providers'].get(model.split('/', 1)[0])
-        return limit['until'] if limit and limit['until'] > time.time() else None
+        limits = self.state['limited_providers']
+        provider = model.split('/', 1)[0]
+        provider_limit = limits.get(provider)
+        if (model == HY4_FREE_MODEL and provider_limit
+                and provider_limit.get('message', '').startswith(GO_PAID_MONTHLY_LIMIT_PREFIX)):
+            provider_limit = None
+        paid_limit = limits.get(GO_PAID_LIMIT_KEY) if provider == 'opencode-go' and model != HY4_FREE_MODEL else None
+        until = max((row['until'] for row in (provider_limit, limits.get(model), paid_limit) if row), default=0)
+        return until if until > time.time() else None
 
     def _available(self, model):
         return model not in self.state['unavailable_models'] and self._limited_until(model) is None
@@ -1622,7 +1634,16 @@ class Farm:
         safe = not detail and (job['kind'] == 'audit' or self._running_inputs_match(job))
         provider = job['model'].split('/', 1)[0]
         until = time.time() + max(60, seconds)
-        self.state['limited_providers'][provider] = {'until': until, 'message': message[:300]}
+        limits = self.state['limited_providers']
+        key = provider
+        if provider == 'opencode-go' and message.startswith(GO_PAID_MONTHLY_LIMIT_PREFIX):
+            key = HY4_FREE_MODEL if job['model'] == HY4_FREE_MODEL else GO_PAID_LIMIT_KEY
+        if key == 'opencode-go':
+            legacy = limits.get(key, {})
+            if (legacy.get('message', '').startswith(GO_PAID_MONTHLY_LIMIT_PREFIX)
+                    and legacy['until'] > limits.get(GO_PAID_LIMIT_KEY, {}).get('until', 0)):
+                limits[GO_PAID_LIMIT_KEY] = legacy
+        limits[key] = {'until': until, 'message': message[:300]}
         self._event('model-limited', provider=provider, model=job['model'], until=until,
                     message=message[:300], fn=job['fn'], n=job['n'])
         if not safe:

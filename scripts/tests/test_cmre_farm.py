@@ -2,6 +2,7 @@
 
 No test starts a paid model or runs the real gate.
 """
+from dataclasses import replace
 import importlib.util
 import hashlib
 import json
@@ -3410,6 +3411,26 @@ def test_hand_test_runs_as_the_farm_claim_owner(root, monkeypatch):
     assert seen['command'][-5:] == ['test', 'fn_00401000', '--c', '--source', 'some/path.c']
 
 
+def test_hand_test_uses_the_current_claim_owner_after_a_run_is_resumed(root, monkeypatch):
+    old, _, _ = make(root, [], writes(GOOD), owner='farm-before-run-move')
+    old.save()
+    active, _, _ = make(root, [], writes(GOOD), owner='farm-current')
+    active.save()
+    seen = {}
+    monkeypatch.setattr(farm.subprocess, 'call',
+                        lambda command, **kw: seen.update(kw['env']) or 0)
+    assert farm.main(['test', str(active.run_dir), 'fn_00401000', 'some/path.c']) == 0
+    assert seen['CMRE_CLAIM_OWNER'] == 'farm-current'
+
+
+def test_offline_farm_does_not_replace_the_saved_claim_owner(root):
+    active, cmre, _ = make(root, [], writes(GOOD), owner='farm-current')
+    active.save()
+    offline = replace(active.config, owner='offline-reader')
+    observed = farm.Farm(active.run_dir, root, cmre, None, offline, reconcile=False)
+    assert observed.state['owner'] == 'farm-current'
+
+
 def test_workers_zero_run_ends_when_nothing_is_left(root, monkeypatch):
     monkeypatch.setattr(farm.time, 'sleep', lambda s: None)
     f, cmre, launcher = make(root, [item('fn_00401000')], writes(GOOD), workers=0)
@@ -3516,6 +3537,71 @@ def test_a_limited_provider_falls_through_to_another_providers_rung(root, monkey
     assert [j['model'] for j, _, _ in launcher.started] == ['go/a', 'mm/b']
     assert cmre.accepted == ['fn_00401000']
     assert [r['model'] for r in f.state['attempts']['fn_00401000']] == ['mm/b']
+
+
+def test_saved_go_monthly_limit_keeps_the_explicit_free_lane_available(root, monkeypatch):
+    monkeypatch.setattr(farm.time, 'time', lambda: 1000.0)
+    free = 'opencode-go/hy4-flash-free'
+    paid = 'opencode-go/minimax-m3.1-flash'
+    f, cmre, launcher = make(root, [item('fn_00401000')], writes(GOOD), ladder=[paid, free])
+    f.state['limited_providers']['opencode-go'] = {
+        'until': 4600,
+        'message': 'OpenCode Go monthly usage limit reached. Switch to a free model, or turn on Extra Usage.',
+    }
+    drain(f)
+    assert [job['model'] for job, _, _ in launcher.started] == [free]
+    assert cmre.accepted == ['fn_00401000']
+    assert f._limited_until(paid) == 4600
+
+
+@pytest.mark.parametrize('message', ['usage limit reached', 'OpenCode Go monthly usage limit reached. Switch to a free model.'])
+def test_hy4_respects_a_limit_returned_for_its_own_request(root, monkeypatch, message):
+    monkeypatch.setattr(farm.time, 'time', lambda: 1000.0)
+    free = 'opencode-go/hy4-flash-free'
+    f, _, _ = make(root, [], writes(GOOD), ladder=[free, 'openai/gpt-6.1-terra'])
+    f._limited(f._new_job('audit', 'fn_00401000', free, 0), message, 3600)
+    assert f._limited_until(free) == 4600
+    assert f._rung_model(0)[0] == 'openai/gpt-6.1-terra'
+
+
+def test_go_provider_wide_limit_still_pauses_hy4(root, monkeypatch):
+    monkeypatch.setattr(farm.time, 'time', lambda: 1000.0)
+    free = 'opencode-go/hy4-flash-free'
+    f, _, _ = make(root, [], writes(GOOD), ladder=[free, 'openai/gpt-6.1-terra'])
+    f.state['limited_providers']['opencode-go'] = {'until': 4600, 'message': 'usage limit reached'}
+    assert f._rung_model(0)[0] == 'openai/gpt-6.1-terra'
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+def test_go_monthly_and_provider_wide_deadlines_survive_in_either_order(root, monkeypatch, reverse):
+    monkeypatch.setattr(farm.time, 'time', lambda: 1000.0)
+    free = 'opencode-go/hy4-flash-free'
+    paid = 'opencode-go/minimax-m3.1-flash'
+    f, _, _ = make(root, [], writes(GOOD), ladder=[free, paid])
+    replies = [
+        (free, 'too many requests', 900),
+        (paid, 'OpenCode Go monthly usage limit reached. Switch to a free model.', 3600),
+    ]
+    for model, message, duration in reversed(replies) if reverse else replies:
+        f._limited(f._new_job('audit', 'fn_00401000', model, 0), message, duration)
+    f.save()
+    reloaded, _, _ = make(root, [], writes(GOOD), ladder=[free, paid])
+    assert reloaded._limited_until(free) == 1900
+    assert reloaded._limited_until(paid) == 4600
+
+
+def test_provider_wide_limit_does_not_erase_the_legacy_go_monthly_deadline(root, monkeypatch):
+    monkeypatch.setattr(farm.time, 'time', lambda: 1000.0)
+    free = 'opencode-go/hy4-flash-free'
+    paid = 'opencode-go/minimax-m3.1-flash'
+    f, _, _ = make(root, [], writes(GOOD), ladder=[free, paid])
+    f.state['limited_providers']['opencode-go'] = {
+        'until': 4600,
+        'message': 'OpenCode Go monthly usage limit reached. Switch to a free model.',
+    }
+    f._limited(f._new_job('audit', 'fn_00401000', free, 0), 'too many requests', 900)
+    assert f._limited_until(free) == 1900
+    assert f._limited_until(paid) == 4600
 
 
 @pytest.mark.parametrize('source, accepted', [(GOOD, True), (GOOD.replace('a + 1', 'a + 2'), False)])
