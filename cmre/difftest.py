@@ -30,7 +30,7 @@ import unicorn
 
 import zlib
 
-from . import emu, env, image, inventory, semantic, x87_transport
+from . import emu, env, image, inventory, return_transport, semantic, x87_transport
 
 POOL_FIXED = (0, 1, 2, 3, 4, 7, 8, 0x10, 0x20, 0x7F, 0x80, 0xFF, 0x100, 0x7FFF, 0x8000, 0xFFFF,
               0x10000, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0xFFFFFFFE, 0xFFFF8000)
@@ -490,7 +490,10 @@ def _normalize_semantic(result: emu.Result, amap: emu.AddressMap | None, returns
     canon = semantic.canonical
     detail, regs = result.detail, ()
     if result.outcome == "fault":
-        (access, address, size), _eip = detail
+        (access, address, size), eip = detail
+        if (access in DATA_FAULTS and return_transport.STACK_PROBE <= eip <= return_transport.STACK_PROBE_RET
+                and semantic.GUARD_START <= address < emu.STACK):
+            address = semantic.STACK_GUARD_MARK  # probe fault below the stack: offset is frame depth
         detail = (access, canon(address if access in DATA_FAULTS else loc(address)), size)
     elif result.outcome in semantic.INDIRECT_STOPS:
         target, _site, ecx, words, own = detail

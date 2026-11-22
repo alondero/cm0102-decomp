@@ -337,6 +337,13 @@ instruction relation and a complete read-only recovered-only page witness.
 Do not fold fault classes generally, remove inputs, or change the link base to
 hide a collision. Readable/executable page collisions are not solved by this rule.
 
+The semantic profile treats a stack-probe fault below the test stack as one
+location: a data fault whose instruction lies in the pinned original probe
+(`0x00945610..0x0094563E`) and whose address lies in the page below the stack
+(`semantic.GUARD_START`; the return push faults in its last dword). The offset in that
+page is the caller's frame depth. Access class, width and every other address
+still compare raw.
+
 `cmre explain --window N` shows raw event context and read sites. Semantic and
 ABI comparisons filter import events, so `event_context` records their separate
 raw indices rather than treating a filtered index as a raw trace position.
