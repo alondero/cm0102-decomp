@@ -607,7 +607,7 @@ before writing. Then:
   validation/application; a worker test is not evidence for that proposal.
 - Start from the draft path `cmre brief` prints, or from the source already
   in your scratch file. Check every statement against the listing.
-- A translation of 2,000 bytes or more with no accepted `recovery/c` source,
+- A translation of 2,000 bytes or more with no `recovery/c` source,
   no earlier candidate and no resume candidate starts with the `cmre draft`
   output already in its scratch source. Repair that file in place and still
   check every statement against the listing; the first test run of a seeded

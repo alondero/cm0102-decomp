@@ -4248,6 +4248,14 @@ def test_a_draft_lineage_job_without_a_seed_starts_from_the_draft(root):
     job = f._new_job('translate', 'fn_00401000', 'm/strong', bytes=6000)
     job['_from_draft'] = True
     job['_snap'] = {'c': None, 'hint': None}
+    # A resume row must not leave a lineage job with an empty source and a bundle without the draft.
+    saved = f.run_dir / 'retained.c'
+    saved.parent.mkdir(parents=True, exist_ok=True)
+    saved.write_bytes(GOOD.encode())
+    (f.run_dir / 'resume-candidates.json').write_text(json.dumps({
+        'schema': 'cmre-farm-resume-candidates/1',
+        'sources': {'fn_00401000': {'path': saved.name,
+                                    'sha256': hashlib.sha256(saved.read_bytes()).hexdigest()}}}))
     assert f._draft_seed(job, cmre.brief('fn_00401000')) == DRAFT_REL
 
 
@@ -4332,6 +4340,8 @@ def test_a_draft_seeded_prompt_allows_a_long_gate(root):
     assert 'timeout of 600000' in prompt and farm.DEFAULT_STALL_MINUTES * 60 * 1000 > 600000
     # Review 2026-11-22: repair in place still checks every statement, edited or not.
     assert 'check every statement against the listing' in prompt
+    step2 = next(line for line in prompt.splitlines() if line.startswith('2. '))
+    assert 'check every statement against the listing' in step2.lower()
     # Trial 2026-11-21: Terra quit after the first expected build failure; MiniMax read the
     # 9,600-line capture hints file and then stalled silently.
     assert 'a build failure of the seeded draft is not a result' in prompt.lower()
