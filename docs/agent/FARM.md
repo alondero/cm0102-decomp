@@ -132,7 +132,7 @@ failing case for mismatches). Work the lane with the most bytes that you own:
 | `gate-mismatch`, `contract` | expert session | `cm-decompile` from the retained `RUN/src` candidate, then `cmre accept fn_X --c` |
 | `input-needed`, `hint-evidence` | input lane | evidenced hints; the farm re-gates by itself |
 | `budget-bound` | Adam | C exhausts the 200k budget; a raised budget changes shared hints of an accepted lift |
-| `safeguard-blocker` | `cm-triage` | resolve the declared blocker, then `retry` |
+| `safeguard-blocker` | `cm-triage` | resolve the `BLOCKER:` the candidate declares, then `retry` |
 | `worker-failure` | coordinator | `retry RUN fn_X --reason ...` |
 | `open-defect` | defect lane | [Defect subagent](#defect-subagent) |
 | `boundary` | none | explicit unknown; a defect only with consumer evidence |
@@ -341,7 +341,9 @@ Coordinator procedure:
    `SUPPLY EMPTY` in `status`), fetches the queue again every `--rescan-minutes`
    (default 2) and dispatches what appears (`supply-resumed`). It ends on `stop`
    or the `--hours` deadline (`--hours 0`: no deadline). `--exit-when-empty`
-   restores the old run-once behaviour for smoke tests.
+   restores the old run-once behaviour for smoke tests. `run --only fn_A,fn_B`
+   limits a trial run's frontier to the named functions; use your own `RUN` and
+   leave functions the live farm is working on alone.
 
    `set RUN ...` changes workers, audit workers, size bounds, ladder, audit and
    confirmation models, `--include-held`, skip ranges and the deadline on the
@@ -605,6 +607,13 @@ before writing. Then:
   validation/application; a worker test is not evidence for that proposal.
 - Start from the draft path `cmre brief` prints, or from the source already
   in your scratch file. Check every statement against the listing.
+- A translation of 2,000 bytes or more with no earlier candidate starts with
+  the `cmre draft` output already in its scratch source. Repair that file in
+  place; a build failure of the seeded draft is the first thing to fix, not a
+  result. The next rung, and a retry after a usage limit, keep repairing the
+  same lineage. A retried candidate that only declares itself unfinished and
+  is under a quarter of the draft's size is replaced by the draft. The draft
+  is translation input, never evidence: the gate and audit decide as before.
 - Never shape code generation to pass: no `register`, no optimize attributes,
   no volatile locals added only to change register allocation, no inline
   assembly. A frame layout or a pass at one optimization level is not evidence.
@@ -615,7 +624,9 @@ before writing. Then:
   `UNVALIDATED CANDIDATE`, `must not be accepted` or `BLOCKER:` statement.
   The farm refuses such a source; never delete a disclaimer merely to get it
   accepted. Resolve the boundary, or leave the candidate blocked for the parent
-  input lane.
+  input lane. A `BLOCKER:` statement parks the function as `safeguard-blocker`;
+  any other unfinished-work statement is a failed attempt that escalates to the
+  next rung and, at the top, parks as `worker-failure`.
 
 ## Audit checklist
 
