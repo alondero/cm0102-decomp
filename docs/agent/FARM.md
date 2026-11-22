@@ -654,6 +654,12 @@ before writing. Then:
   that candidate is gated too, and only an unchanged machine draft or existing
   source fails as "worker left the starting source unchanged". On 22 Nov
   fn_007d8120 and fn_00414420 were lost to both rules with candidates that passed.
+- Before that failure, a translator that exits with its machine draft or
+  existing source untouched (and no input proposal) is continued once in the
+  same OpenCode 2.x session, told to repair and test the source. The
+  continuation keeps the attempt's deadline and logs `nudged` (or `nudge-failed`
+  when there is no session). On 22 Nov 18 of 75 Terra translations quit inside
+  3 minutes without editing.
 
 ## Audit checklist
 

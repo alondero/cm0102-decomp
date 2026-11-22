@@ -508,6 +508,15 @@ def translate_prompt(root, job):
     return '\n'.join(lines) + _hold_text(job.get('hold')) + '\n'
 
 
+def continue_message(root, job):
+    fn, src = job['fn'], _rel(root, job['source'])
+    return (f'You finished without editing {src}. The farm rejects an unchanged starting source, so this '
+            'attempt has not been tested. The source is your starting point, not a result: a seeded draft '
+            'that does not build is expected. Fix its build errors from the listing, then run '
+            f'{PY} -m cmre test {fn} --c --source {src} and fix mismatches one at a time, as your '
+            'instructions say. Finish with exactly one FARM-RESULT line.')
+
+
 def fix_prompt(root, job):
     fn, src = job['fn'], _rel(root, job['source'])
     findings = json.dumps(job.get('findings', []), indent=1)[:4000]
@@ -2115,6 +2124,8 @@ class Farm:
             if infra:
                 self._infra(job, infra)
                 continue
+            if not timed_out and not stalled and self._continue(job, handle, started, still):
+                continue
             if stalled:
                 job['_stalled'] = True
             job['_finish'] = getattr(handle, 'finish_reason', lambda: None)()
@@ -2123,6 +2134,35 @@ class Farm:
             else:
                 self._verify(job, timed_out)
         self.running = still
+
+    def _continue(self, job, handle, started, still):
+        """Continue a translator's session once when it exits without editing its starting source.
+
+        22 Nov: 18 of 75 Terra translations ended inside 3 minutes with the machine draft untouched,
+        each spending a ladder rung. The continued worker keeps the attempt's original deadline."""
+        if job['kind'] != 'translate' or job.get('_nudged') or job.get('_seed_from_attempt'):
+            return False
+        seed = job.get('_seed_bytes')
+        if seed is None or _read(job['source']) != seed:
+            return False
+        if job.get('_hint_dispatched') and _read(job['hint_source']) != job['_snap']['hint']:
+            return False   # a private input proposal is the worker's result
+        resume = getattr(self.launcher, 'resume', None)
+        if resume is None:
+            return False
+        job['_nudged'] = True
+        try:
+            again = resume(job, handle, continue_message(self.root, job))
+        except Exception as exc:   # a failed continuation falls back to the unchanged-source failure
+            self._event('nudge-failed', fn=job['fn'], n=job['n'], error=str(exc)[:300])
+            return False
+        if again is None:
+            self._event('nudge-failed', fn=job['fn'], n=job['n'], error='no session to continue')
+            return False
+        self._event('nudged', fn=job['fn'], n=job['n'], model=job['model'],
+                    minutes=round((self.clock() - started) / 60, 1))
+        still.append((job, again, started))
+        return True
 
     def _x87_evidence_path(self, job, digest):
         """Deterministic, hash-bound receipt location for one job's operand mutants."""
@@ -4012,6 +4052,30 @@ class OpencodeV2Launcher:
                                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, creationflags=flags)
         out.close()
         return OpencodeV2Handle(process, logs / f'{stem}.jsonl', agent, self.executable)
+
+    def resume(self, job, handle, message):
+        """Send one more message to the worker's session; output appends to the same log.
+        None when the handle has no session to continue."""
+        sid = getattr(handle, 'session_id', lambda: None)()
+        if not sid:
+            return None
+        logs = self.run_dir / 'logs'
+        stem = f"{job['fn']}-{job['kind']}-{job['n']}"
+        (logs / f'{stem}.continue.txt').write_text(message, encoding='utf-8')
+        name = re.sub(r'[^A-Za-z0-9-]', '-', f"farm-{self.run_dir.name}-{stem}")
+        agent = self.root / '.opencode/agents' / f'{name}.md'
+        agent.parent.mkdir(parents=True, exist_ok=True)
+        agent.write_text(v2_agent(self.root, job), encoding='utf-8')   # removed when the first run exited
+        self._wait_for_agent(name)
+        command = [self.executable, 'run', '--session', sid, '--agent', name, '-m', job['model'],
+                   '--format', 'json', message]
+        flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == 'nt' else 0
+        log = logs / f'{stem}.jsonl'
+        out = log.open('ab')
+        process = subprocess.Popen(command, cwd=self.root, env=dict(os.environ), stdout=out,
+                                   stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, creationflags=flags)
+        out.close()
+        return OpencodeV2Handle(process, log, agent, self.executable)
 
     def _wait_for_agent(self, name, attempts=30):
         """The shared service picks up a new agent file after a short delay; launching

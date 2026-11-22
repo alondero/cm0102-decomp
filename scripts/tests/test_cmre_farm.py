@@ -2752,6 +2752,102 @@ def scripted_farm(root, plan, clock, **cfg):
     return farm.Farm(root / 'run', root, cmre, launcher, farm.FarmConfig(**options), clock=clock), cmre, launcher
 
 
+class ResumingLauncher(ScriptedLauncher):
+    """Continues a worker's session once; `again` scripts what the continued worker does."""
+
+    def __init__(self, plan, again):
+        super().__init__(plan)
+        self.again, self.resumed = again, []
+
+    def resume(self, job, handle, message):
+        self.resumed.append((job, message))
+        h = self.again(job)
+        if h is not None:
+            self.handles.append(h)
+        return h
+
+
+SEED = 'int cm_fn_00401000(void) { return 1; } /* machine draft */\n'
+
+
+def seeded_farm(root, again, now, attempt=False, **cfg):
+    """One translate job seeded with SEED; its first worker exits without editing it."""
+    launcher = ResumingLauncher(lambda job: ScriptedHandle(code=0), again)
+    f, cmre, _ = scripted_farm(root, None, lambda: now[0], ladder=['m/cheap'], **cfg)
+    f.launcher = launcher
+    job = f._new_job('translate', 'fn_00401000', 'm/cheap', 0, bytes=200)
+    job['_seed'] = SEED.encode()
+    if attempt:
+        job['_seed_from_attempt'] = True
+    f.pending.append(job)
+    return f, cmre, launcher
+
+
+def write_source(text):
+    def worker(job):
+        Path(job['source']).write_text(text)
+        return ScriptedHandle(code=0)
+    return worker
+
+
+def test_a_worker_that_quits_without_editing_its_seed_is_continued_once(root):
+    """22 Nov: 18 of 75 Terra translations quit inside 3 minutes without editing the draft."""
+    now = [0.0]
+    f, cmre, launcher = seeded_farm(root, write_source(GOOD), now)
+    drain(f, 6)
+    assert len(launcher.started) == 1 and len(launcher.resumed) == 1
+    message = launcher.resumed[0][1]
+    assert 'without editing' in message and 'FARM-RESULT' in message
+    assert cmre.accepted == ['fn_00401000']
+    nudged = [e for e in events(f.run_dir) if e['event'] == 'nudged']
+    assert nudged and nudged[0]['fn'] == 'fn_00401000'
+
+
+def test_a_continued_worker_that_still_leaves_its_seed_unchanged_fails_as_before(root):
+    now = [0.0]
+    f, cmre, launcher = seeded_farm(root, lambda job: ScriptedHandle(code=0), now)
+    drain(f, 6)
+    assert len(launcher.resumed) == 1 and cmre.accepted == []
+    assert 'worker left the starting source unchanged' in json.dumps(f.state['parked'])
+
+
+def test_a_continued_worker_keeps_the_original_attempt_deadline(root):
+    now = [0.0]
+    f, cmre, launcher = seeded_farm(root, lambda job: ScriptedHandle(code=None), now)
+    drain(f, 2)
+    assert len(launcher.resumed) == 1
+    now[0] = 31 * 60
+    drain(f, 4)
+    assert launcher.handles[-1].killed and 'timeout after 30 min' in json.dumps(f.state['parked'])
+
+
+def test_an_unchanged_earlier_attempt_is_gated_not_continued(root):
+    now = [0.0]
+    f, cmre, launcher = seeded_farm(root, write_source(GOOD), now, attempt=True)
+    drain(f, 6)
+    assert launcher.resumed == [] and 'unchanged' not in json.dumps(f.state['parked'])
+
+
+def test_no_continuation_when_the_launcher_cannot_resume(root):
+    now = [0.0]
+    f, cmre, launcher = seeded_farm(root, lambda job: None, now)
+    drain(f, 6)
+    assert len(launcher.resumed) == 1 and cmre.accepted == []
+    assert 'worker left the starting source unchanged' in json.dumps(f.state['parked'])
+
+
+def test_a_worker_that_edited_its_seed_is_not_continued(root):
+    now = [0.0]
+    launcher = ResumingLauncher(write_source(GOOD), write_source(GOOD))
+    f, cmre, _ = scripted_farm(root, None, lambda: now[0], ladder=['m/cheap'])
+    f.launcher = launcher
+    job = f._new_job('translate', 'fn_00401000', 'm/cheap', 0, bytes=200)
+    job['_seed'] = SEED.encode()
+    f.pending.append(job)
+    drain(f, 6)
+    assert launcher.resumed == [] and cmre.accepted == ['fn_00401000']
+
+
 def test_auth_error_marks_model_unavailable_without_spending_an_attempt(root):
     def plan(job):
         if job['model'] == 'm/cheap':
@@ -3100,6 +3196,51 @@ def test_v2_launcher_runs_the_job_agent_and_removes_it_when_done(root, monkeypat
     assert handle.poll() is None and agent.exists()
     proc.code = 0
     assert handle.poll() == 0 and not agent.exists()
+
+
+def test_v2_launcher_resumes_the_same_session_into_the_same_log(root, monkeypatch):
+    calls = []
+
+    class Proc:
+        pid, code = 1, None
+
+        def poll(self):
+            return self.code
+
+    def popen(command, **kw):
+        calls.append(command)
+        return Proc()
+
+    monkeypatch.setattr(farm.subprocess, 'Popen', popen)
+    monkeypatch.setattr(farm.subprocess, 'run',
+                        lambda command, **kw: farm.subprocess.CompletedProcess(command, 0))
+    launcher = farm.OpencodeV2Launcher(root, root / 'run', executable='oc2')
+    job = _job(root)
+    first = launcher.start(job, 'PROMPT', {})
+    first.log.write_text('{"type":"step_start","sessionID":"ses_abc123"}\n', encoding='utf-8')
+    first.process.code = 0
+    first.poll()
+    again = launcher.resume(job, first, 'NUDGE')
+    cmd = calls[-1]
+    name = cmd[cmd.index('--agent') + 1]
+    assert cmd[cmd.index('--session') + 1] == 'ses_abc123' and cmd[-1] == 'NUDGE'
+    assert cmd[cmd.index('-m') + 1] == job['model'] and (root / '.opencode/agents' / f'{name}.md').exists()
+    assert again.log == first.log and 'ses_abc123' in again.log.read_text(encoding='utf-8')
+
+
+def test_v2_launcher_does_not_resume_without_a_session_id(root, monkeypatch):
+    class Proc:
+        pid, code = 1, 0
+
+        def poll(self):
+            return self.code
+
+    monkeypatch.setattr(farm.subprocess, 'Popen', lambda command, **kw: Proc())
+    monkeypatch.setattr(farm.subprocess, 'run',
+                        lambda command, **kw: farm.subprocess.CompletedProcess(command, 0))
+    launcher = farm.OpencodeV2Launcher(root, root / 'run', executable='oc2')
+    first = launcher.start(_job(root), 'PROMPT', {})
+    assert launcher.resume(_job(root), first, 'NUDGE') is None
 
 
 def test_v1_launcher_raises_the_output_cap(root, monkeypatch):
