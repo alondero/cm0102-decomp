@@ -721,9 +721,27 @@ def _reads_own_code(result: emu.Result, region, data_spans) -> bool:
     return False
 
 
-def _classify(na, nb, original: emu.Result, amap, region, data_spans, *, fault_mapping=None) -> tuple[str, dict]:
-    """equal | code-as-data | mismatch. Relocated code cannot reproduce its own
-    instruction bytes when the original reads them as data: a hazard, not a mismatch."""
+# CRT __chkstk (preferred-image VAs, SHA-256 0c78e7da...f86): `test [ecx], eax` probes the pages
+# below ESP and discards the value, so those reads say nothing about frame layout.
+STACK_PROBE_CODE = ((0x00945610, 0x00945640),)
+STACK_LAYOUT_LIMIT = 0.02  # fraction of cases; above it the layout-dependent mismatches stay mismatches
+
+
+def _reads_dead_stack(result: emu.Result) -> bool:
+    """The original loaded stack bytes wholly below the live ESP, other than a stack probe.
+
+    Those bytes are leftovers of earlier or deeper frames. Their values follow the frame
+    layout the compiler chose, which a faithful C function is free to change (ADR 0002)."""
+    return any(not any(lo <= eip < hi for lo, hi in STACK_PROBE_CODE)
+               for _index, _address, eip in result.dead_stack_reads)
+
+
+def _classify(na, nb, original: emu.Result, amap, region, data_spans, *, fault_mapping=None,
+              layout_hazard=False) -> tuple[str, dict]:
+    """equal | code-as-data | stack-layout | mismatch. Relocated code cannot reproduce its own
+    instruction bytes when the original reads them as data: a hazard, not a mismatch. With
+    `layout_hazard` (C tier), a difference after the original read dead stack bytes is likewise
+    a hazard: the case depends on the compiler's frame layout, not on the function's behaviour."""
     if original.outcome == 'error' and original.detail and str(original.detail[0]).startswith('import transcript'):
         return 'mismatch', {'field': 'import-transcript', 'original': original.detail}
     if nb[0] == 'error' and nb[1] and str(nb[1][0]).startswith('import transcript'):
@@ -733,6 +751,8 @@ def _classify(na, nb, original: emu.Result, amap, region, data_spans, *, fault_m
         return "equal", {}
     if _reads_own_code(original, region, data_spans):
         return "code-as-data", difference
+    if layout_hazard and _reads_dead_stack(original):
+        return "stack-layout", difference
     return "mismatch", difference
 
 
@@ -762,6 +782,7 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
     original = emu.Machine(img, watch=region, arena_size=opts.hints.get("arena_size", emu.ARENA_SIZE))
     recovered = emu.Machine(img, built.image, watch=region, escape=True,
                             arena_size=opts.hints.get("arena_size", emu.ARENA_SIZE))
+    original.track_dead_stack_reads = profile == "semantic"
     if profile == "semantic" and indirect is not None:
         _stop_indirect(original, recovered, region, built, indirect)
     text = built.image.text
@@ -776,6 +797,7 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
     covered: set[int] = set()
     import_calls = 0
     code_as_data = []
+    stack_layout = []
     mapping_faults = []
     global_inputs: set[int] = set()
     digest = hashlib.sha256()
@@ -816,17 +838,27 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
                                    "note": "Unresolved execution budget; investigate or raise the budget for both runs."})
             continue
         verdict, difference = _classify(na, nb, a, amap, region, data_spans,
-                                        fault_mapping=b.fault_mapping)
+                                        fault_mapping=b.fault_mapping, layout_hazard=profile == "semantic")
         if compare_fp and (fp_difference := x87_transport.difference(fp_a, fp_b)):
             verdict, difference = 'mismatch', fp_difference
         if verdict == "code-as-data":
             code_as_data.append(index)
+            continue
+        if verdict == "stack-layout":
+            stack_layout.append((index, difference))
             continue
         if verdict == "mismatch":
             if len(mismatches) < 5:
                 mismatches.append({"case": index, **difference})
             elif len(mismatches) == 5:
                 mismatches.append({"case": index, "note": "further mismatches omitted"})
+    excess_layout = len(stack_layout) > STACK_LAYOUT_LIMIT * opts.cases
+    if excess_layout:
+        # Too many cases lean on dead stack to call them hazards: they stay mismatches.
+        for index, difference in stack_layout[:max(0, 5 - len(mismatches))]:
+            mismatches.append({"case": index, "kind": "stack-layout-excess", **difference})
+    else:
+        inconclusive += len(stack_layout)
     coverage = len(covered & insn_starts) / len(insn_starts) if insn_starts else 0.0
     return {
         "profile": profile,
@@ -849,6 +881,8 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
         "import_calls": import_calls,
         "code_as_data_cases": len(code_as_data),
         "code_as_data_examples": code_as_data[:5],
+        **({"stack_layout_cases": len(stack_layout), "stack_layout_examples": [i for i, _ in stack_layout[:5]]}
+           if stack_layout else {}),
         **({'mapping_faults': mapping_faults} if mapping_faults else {}),
         "result_digest": digest.hexdigest(),
         "fp_registers_compared": list(x87_transport.FP_REGISTERS) if compare_fp else [],

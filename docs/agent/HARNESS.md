@@ -341,6 +341,22 @@ hide a collision. Readable/executable page collisions are not solved by this rul
 ABI comparisons filter import events, so `event_context` records their separate
 raw indices rather than treating a filtered index as a raw trace position.
 
+### Dead-stack reads in C comparisons
+
+The semantic profile treats the stack as compiler layout. A random case can still
+aim a data pointer or loop at the live stack (an unaligned dword composed from two
+arena words can name a stack address), so the original's callee reads frames that
+earlier or deeper calls left below ESP, and passes those leftovers to an import.
+The C wrapper's frame holds different saved registers, so the import arguments
+differ although the function is right. The original machine records each stack
+read wholly below the live ESP (`Result.dead_stack_reads`, original side only,
+semantic profile). A case that differs after such a read is `inconclusive` and is
+listed under `stack_layout_cases` / `stack_layout_examples`, not a mismatch. Reads
+by the CRT `__chkstk` probe (`STACK_PROBE_CODE`) do not count. Above
+`STACK_LAYOUT_LIMIT` (2% of cases) the differences stay mismatches
+(`kind: stack-layout-excess`). Cases without a difference are unaffected, and
+lifted and `abi` runs do not use the rule.
+
 ## Codex preservation hook
 
 `.codex/hooks.json` runs `cmre/guard.py --codex` for canonical `Bash` and
