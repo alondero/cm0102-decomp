@@ -2770,6 +2770,58 @@ def test_auth_error_marks_model_unavailable_without_spending_an_attempt(root):
     assert farm.status_line(f.summary()).count('UNAVAILABLE') == 1
 
 
+def test_a_timed_out_worker_that_wrote_a_passing_source_is_accepted(root):
+    """22 Nov: DeepSeek wrote gate-passing sources for fn_007d8120 and fn_00414420, then timed out."""
+    now = [0.0]
+
+    def plan(job):
+        Path(job['source']).parent.mkdir(parents=True, exist_ok=True)
+        Path(job['source']).write_text(GOOD)
+        return ScriptedHandle(code=None)
+
+    f, cmre, launcher = scripted_farm(root, plan, lambda: now[0], ladder=['m/cheap'])
+    f.tick()
+    now[0] = 31 * 60
+    drain(f, 3)
+    assert launcher.handles[0].killed and cmre.accepted == ['fn_00401000']
+
+
+def test_a_timed_out_worker_with_no_new_source_still_fails_as_a_timeout(root):
+    now = [0.0]
+    f, cmre, launcher = scripted_farm(root, lambda job: ScriptedHandle(code=None), lambda: now[0],
+                                      ladder=['m/cheap'])
+    f.tick()
+    now[0] = 31 * 60
+    drain(f, 3)
+    assert cmre.accepted == [] and 'timeout after 30 min' in json.dumps(f.state['parked'])
+
+
+def test_an_escalated_candidate_is_gated_even_when_the_next_rung_leaves_it_unchanged(root):
+    """22 Nov: Terra confirmed the previous rung's passing source and was failed as 'unchanged'."""
+    def plan(job):
+        Path(job['source']).parent.mkdir(parents=True, exist_ok=True)
+        if job['model'] == 'm/cheap':
+            Path(job['source']).write_text('int cm_fn_00401000(void) { return 0; } /* mismatch */\n')
+        return ScriptedHandle(code=0)    # the second rung writes nothing: its seed is kept
+
+    f, cmre, launcher = scripted_farm(root, plan, lambda: 0.0)
+    drain(f, 8)
+    jobs = [job for job, _, _ in launcher.started]
+    assert [j['model'] for j in jobs] == ['m/cheap', 'm/strong'] and jobs[1].get('_seed_from_attempt')
+    # The second rung's unchanged seed is gated: it fails on its merits, not as "unchanged".
+    parked = json.dumps(f.state['parked'])
+    assert 'fn_00401000' in f.state['parked'] and 'unchanged' not in parked and 'mismatch' in parked
+
+
+def test_an_unchanged_seed_from_an_earlier_attempt_that_passes_is_accepted(root):
+    f, cmre, launcher = scripted_farm(root, lambda job: ScriptedHandle(code=0), lambda: 0.0, ladder=['m/cheap'])
+    job = f._new_job('translate', 'fn_00401000', 'm/cheap', 0, bytes=200)
+    job['_seed'], job['_seed_from_attempt'] = GOOD.encode(), True
+    f.pending.append(job)
+    drain(f, 3)
+    assert cmre.accepted == ['fn_00401000']
+
+
 def test_stalled_worker_is_killed_before_the_attempt_timeout(root):
     now = [0.0]
     f, cmre, launcher = scripted_farm(root, lambda job: ScriptedHandle(code=None, activity=0.0),

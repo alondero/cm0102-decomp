@@ -922,6 +922,7 @@ class Farm:
             # A worker stopped by a provider limit may already have written its source (review
             # 2026-11-22): the retry continues from it, as escalation does from a prior attempt.
             again['_seed'] = written
+            again['_seed_from_attempt'] = True
             self._event('draft-kept', fn=job['fn'], n=job['n'], bytes=len(written))
         self.pending.insert(0, again)
 
@@ -1462,6 +1463,7 @@ class Farm:
             draft = _read(self.root / job['_draft_seed']) if job.get('_draft_seed') else None
             if draft:
                 job['draft_reseeded'] = seed is not None   # a self-declared stub was replaced
+                job.pop('_seed_from_attempt', None)        # the machine draft is not an attempt
                 seed = draft
                 job['draft_seeded'] = True
                 self._event('draft-seeded', fn=job['fn'], n=job['n'], draft=job['_draft_seed'],
@@ -1702,6 +1704,7 @@ class Farm:
                                 module=job.get('module'), hold=job.get('hold'),
                                 prior={'model': job['model'], 'detail': detail})
             nxt['_seed'] = prior_source
+            nxt['_seed_from_attempt'] = prior_source is not None and prior_source != job.get('_seed_bytes')
             nxt['_from_draft'] = bool(job.get('draft_seeded'))
             self.pending.append(nxt)
             self.state['parked'].pop(fn, None)
@@ -1814,6 +1817,12 @@ class Farm:
 
         Runs on a verifier thread: it reads the job and calls the gate; only the canonical copy
         into recovery/c/ is written here, and the main loop restores it on failure."""
+        detail = self._check_candidate(job, timed_out)
+        if detail and job.get('_late'):
+            return f"{detail} (gated after {job['_late']})"
+        return detail
+
+    def _check_candidate(self, job, timed_out):
         fn, source = job['fn'], Path(job['source'])
         detail = self._fix_evidence_error(job)
         if detail:
@@ -1821,10 +1830,15 @@ class Farm:
             return detail
         if job.get('_unowned_hint'):
             return 'canonical hints changed since dispatch; read-only input conflict'
-        if job.get('_stalled'):
-            return f'stalled: no worker output for {self.config.stall_minutes} min'
-        if timed_out:
-            return f'timeout after {self.config.attempt_minutes} min'
+        late = (f'stalled: no worker output for {self.config.stall_minutes} min' if job.get('_stalled')
+                else f'timeout after {self.config.attempt_minutes} min' if timed_out else None)
+        if late:
+            # 22 Nov: workers wrote gate-passing sources and then ran out of time. A translation the
+            # worker changed is gated like any other; the gate, safeguards and audit still decide.
+            written = _read(source) if job['kind'] == 'translate' else None
+            if written is None or written == job.get('_seed_bytes'):
+                return late
+            job['_late'] = late
         if job.get('_hint_dispatched'):
             proposal = _read(job['hint_source'])
             if proposal != job['_snap']['hint']:
@@ -1848,7 +1862,9 @@ class Farm:
             return 'worker wrote no source'
         if job.get('expected_source_sha256') and hashlib.sha256(text_bytes).hexdigest() != job['expected_source_sha256']:
             return 'queued candidate bytes changed; explicit resubmission required'
-        if text_bytes == job.get('_seed_bytes'):
+        if text_bytes == job.get('_seed_bytes') and not job.get('_seed_from_attempt'):
+            # An earlier attempt's candidate is unverified work, not a starting point the worker
+            # had to change: a rung that confirms it passes is gated (22 Nov: Terra on two).
             return 'worker left the starting source unchanged'
         text = text_bytes.decode('utf-8', errors='replace')
         from cmre import publication
