@@ -86,6 +86,8 @@ class Result:
     pristine: dict = field(default_factory=dict, repr=False)  # page -> initial bytes
     read_sites: dict = field(default_factory=dict)  # read event index -> EIP, when attribution is on
     fault_mapping: dict | None = None  # proof for a candidate extra-PE environment relation
+    # (read event index, address, EIP) for each stack read wholly below the live ESP, when tracking is on
+    dead_stack_reads: tuple = ()
 
 
 class Machine:
@@ -155,6 +157,10 @@ class Machine:
         # Record which instruction made each read (input discovery only; it costs a register read).
         self.attribute_reads = False
         self.read_sites: dict[int, int] = {}
+        # Record stack reads that lie wholly below the live ESP (the original side of a
+        # C comparison only; it costs a register read per stack read).
+        self.track_dead_stack_reads = False
+        self.dead_stack_reads: list[tuple[int, int, int]] = []
         # The public binding allocates both a ctypes buffer and a bytearray per
         # read. Reuse only host scratch; each hook still reads guest memory at
         # the same point and appends its own immutable integer observation.
@@ -352,6 +358,9 @@ class Machine:
             observed = self._read_value(address, size)
             if self.attribute_reads:
                 self.read_sites[len(self.events)] = uc.reg_read(R.UC_X86_REG_EIP)
+            if (self.track_dead_stack_reads and STACK <= address < STACK + STACK_SIZE
+                    and address + size <= uc.reg_read(R.UC_X86_REG_ESP)):
+                self.dead_stack_reads.append((len(self.events), address, uc.reg_read(R.UC_X86_REG_EIP)))
             self.events.append(("r", address, size, observed))
             if self.jump_runtime:
                 self.jump_runtime.observe_read(address, size, observed)
@@ -580,6 +589,7 @@ class Machine:
             uc.reg_write(R.UC_X86_REG_FPCW, case.fpcw)
         self.events, self.fault, self.stop_reason, self.covered, self.pending = [], None, None, set(), None
         self.read_sites = {}
+        self.dead_stack_reads = []
         self.import_seed, self.import_count = case.import_seed, 0
         self._budget_limit, self._budget_steps, self._budget_exhausted = budget, 0, False
         error = None
@@ -629,7 +639,7 @@ class Machine:
             if blob != self._initial_page(p):
                 memory[p] = blob
         return Result(outcome, detail, regs, self.events, memory, self.covered,
-                      self.pristine, self.read_sites, fault_mapping)
+                      self.pristine, self.read_sites, fault_mapping, tuple(self.dead_stack_reads))
 
 
 class AddressMap:
