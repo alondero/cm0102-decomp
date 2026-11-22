@@ -2,6 +2,7 @@
 
 No test starts a paid model or runs the real gate.
 """
+from dataclasses import replace
 import importlib.util
 import hashlib
 import json
@@ -3408,6 +3409,26 @@ def test_hand_test_runs_as_the_farm_claim_owner(root, monkeypatch):
     assert farm.main(['test', str(f.run_dir), 'fn_00401000', 'some/path.c']) == 0
     assert seen['env']['CMRE_CLAIM_OWNER'] == 'farm-t'
     assert seen['command'][-5:] == ['test', 'fn_00401000', '--c', '--source', 'some/path.c']
+
+
+def test_hand_test_uses_the_current_claim_owner_after_a_run_is_resumed(root, monkeypatch):
+    old, _, _ = make(root, [], writes(GOOD), owner='farm-before-run-move')
+    old.save()
+    active, _, _ = make(root, [], writes(GOOD), owner='farm-current')
+    active.save()
+    seen = {}
+    monkeypatch.setattr(farm.subprocess, 'call',
+                        lambda command, **kw: seen.update(kw['env']) or 0)
+    assert farm.main(['test', str(active.run_dir), 'fn_00401000', 'some/path.c']) == 0
+    assert seen['CMRE_CLAIM_OWNER'] == 'farm-current'
+
+
+def test_offline_farm_does_not_replace_the_saved_claim_owner(root):
+    active, cmre, _ = make(root, [], writes(GOOD), owner='farm-current')
+    active.save()
+    offline = replace(active.config, owner='offline-reader')
+    observed = farm.Farm(active.run_dir, root, cmre, None, offline, reconcile=False)
+    assert observed.state['owner'] == 'farm-current'
 
 
 def test_workers_zero_run_ends_when_nothing_is_left(root, monkeypatch):
