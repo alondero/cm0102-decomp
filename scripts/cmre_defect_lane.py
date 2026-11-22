@@ -47,6 +47,7 @@ CANDIDATE_REFRESH_SECONDS = 300
 CLAIM_PREFIX = 'defect-lane-'
 SMOKE_PREFIX = 'defect-smoke-'   # --no-submit runs: own state under defect-lane/smoke/, own claims
 LAUNCH_PAUSE_SECONDS = 300
+STALE_FIX_SECONDS = 2 * 3600   # a fix dispatch this old with no open-defect after it: the farm died mid-fix
 WAITING = ('submitted', 'submit-unknown')   # a request that may still be waiting for the farm
 RESULT = re.compile(r'^\s*`*(ADOPT|DISMISS|UNRESOLVED)\b[ \t]*(.*?)`*\s*$')
 
@@ -484,23 +485,27 @@ class FarmOps:
         except OSError:
             return None
 
-    def _fixing(self):
-        """Functions whose farm fix job was dispatched after their last open-defect event.
+    def _reported_open(self):
+        """Functions whose open defect the farm has handed over.
 
         _defect records the defect and queues its one automatic fix in the same step, so a
-        defect is the lane's only once the farm reports it open (review 2026-11-22)."""
+        defect belongs to the lane only once its last event is `open-defect`. A fix dispatch
+        older than STALE_FIX_SECONDS with nothing after it means the farm died during that fix,
+        which it never requeues (review 2026-11-22). A defect with neither event stays by hand."""
         import cmre_farm as farm
         last = {}
         events, _ = farm._read_events(self.run_dir / 'events.jsonl', 0)
         for event in events:
             if event.get('event') == 'open-defect' or (event.get('event') == 'dispatch'
                                                        and event.get('kind') == 'fix'):
-                last[event.get('fn')] = event.get('event')
-        return {fn for fn, name in last.items() if name == 'dispatch'}
+                last[event.get('fn')] = (event.get('event'), event.get('at') or 0)
+        now = self.clock()
+        return {fn for fn, (name, at) in last.items()
+                if name == 'open-defect' or now - at > STALE_FIX_SECONDS}
 
     def _others_busy(self):
-        """Functions with a queued request, a farm fix in flight, or someone else's recent claim."""
-        busy = self._fixing()
+        """Functions with a queued request or someone else's recent review claim."""
+        busy = set()
         for path in (self.run_dir / 'requests').glob('*.json'):
             try:
                 busy.add(json.loads(path.read_bytes())['fn'])
@@ -524,10 +529,11 @@ class FarmOps:
         except (OSError, ValueError):
             return {}
         busy = self._others_busy()
+        handed_over = self._reported_open()
         quarantined = state.get('quarantined', {})
         out = {}
         for fn, findings in state.get('defects', {}).items():
-            if fn in quarantined or fn in busy or not findings:
+            if fn in quarantined or fn in busy or fn not in handed_over or not findings:
                 continue
             c = self._read(self.root / 'recovery/c' / f'{fn}.c')
             if c is None:

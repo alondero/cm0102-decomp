@@ -690,7 +690,9 @@ dispatch. A final `ADOPT` or `DISMISS` line naming exactly those paths becomes
 the farm's checked `adopt`/`dismiss` request; anything else is recorded as
 unresolved. A defect gets two looks per (accepted source, hints, findings); a
 change to any of them starts again. The lane takes a defect only after the farm
-reports it open (its own automatic fix has finished), and skips quarantined
+reports it open (its last event is `open-defect`, or its automatic fix was
+dispatched over 2 hours ago with no result, when the farm died mid-fix); a defect
+with neither event stays with the coordinator. It skips quarantined
 functions, functions with a queued request, and functions someone else claimed
 for review in the last 6 hours, so a coordinator working a defect by hand is not
 raced. Only closing text that no tool call follows counts as a result; a worker

@@ -1236,7 +1236,8 @@ class Farm:
             control = json.loads((self.run_dir / 'control.json').read_text(encoding='utf-8'))
         except (OSError, ValueError):
             control = {}
-        workers = control.get('defect_lane_workers', self.config.defect_lane_workers)
+        workers = control.get('defect_lane_workers',
+                              self.state.get('defect_lane_workers', self.config.defect_lane_workers))
         return isinstance(workers, int) and workers > 0
 
     # -- supply
@@ -2472,6 +2473,7 @@ class Farm:
             self._event('defect-lane-exit', code=self.defect_proc.poll())
             self.defect_proc = None
         workers = self.config.defect_lane_workers or 0
+        self.state['defect_lane_workers'] = workers   # `status` reads it: start args leave no control key
         if workers <= 0 or self.stopping() or self.launcher is None or self.input_drain:
             return
         stop = self.run_dir / 'defect-lane' / 'STOP'

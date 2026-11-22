@@ -5390,6 +5390,16 @@ def test_status_names_the_defect_lane_only_while_it_is_switched_on(root):
     assert 'defects lane' in farm.status_line(f.summary())      # `status` reads the live setting
 
 
+def test_status_sees_a_defect_lane_started_from_the_command_line(root):
+    # Review 2026-11-22: `start --defect-lane-workers 2` leaves no control.json key behind.
+    f, clock, procs = defect_farm(root, workers=2)
+    f.tick()
+    f.save()
+    config = farm.FarmConfig(0, ['-'], 0, None, 1, None, 0, None, False, f.config.owner)
+    view = farm.Farm(f.run_dir, root, None, None, config, reconcile=False)
+    assert view._defect_lane_on()
+
+
 def test_status_shows_defect_lane_results(root):
     f, clock, procs = defect_farm(root)
     lane_dir = f.run_dir / 'defect-lane'

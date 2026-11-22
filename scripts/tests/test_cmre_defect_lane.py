@@ -214,10 +214,12 @@ def test_candidates_skip_quarantined_requested_and_recently_claimed_by_others(tm
     fns = ['fn_00401000', 'fn_00402000', 'fn_00403000', 'fn_00404000', 'fn_00405000']
     for fn in fns:
         (tmp_path / f'recovery/c/{fn}.c').write_text(f'/* {fn} */')
+    (tmp_path / 'run').mkdir()
+    (tmp_path / 'run/events.jsonl').write_text(''.join(
+        json.dumps({'event': 'open-defect', 'fn': fn, 'at': 1.0}) + '\n' for fn in fns))
     state = {'defects': {fn: [{'line': 1, 'detail': 'd'}] for fn in fns},
              'accepted': {fn: {'bytes': 100 + i} for i, fn in enumerate(fns)},
              'quarantined': {'fn_00402000': {}}}
-    run.mkdir()
     (run / 'state.json').write_text(json.dumps(state))
     (run / 'requests').mkdir()
     (run / 'requests/1-fn_00403000-adopt.json').write_text(json.dumps({'fn': 'fn_00403000'}))
@@ -302,20 +304,38 @@ def test_a_smoke_run_keeps_its_own_state_and_stops_after_one_recorded_result(tmp
     assert live.state['functions'] == {}
 
 
-def test_candidates_wait_for_the_farms_own_fix_to_finish(tmp_path):
+def fix_run(tmp_path, events):
     run = tmp_path / 'run'
-    (tmp_path / 'recovery/c').mkdir(parents=True)
+    (tmp_path / 'recovery/c').mkdir(parents=True, exist_ok=True)
     (tmp_path / 'recovery/c/fn_00401000.c').write_text('x')
-    run.mkdir()
+    run.mkdir(exist_ok=True)
     (run / 'state.json').write_text(json.dumps({'defects': {'fn_00401000': [{'d': 1}]},
                                                  'accepted': {'fn_00401000': {'bytes': 9}}}))
-    events = [{'event': 'open-defect', 'fn': 'fn_00401000'},
-              {'event': 'dispatch', 'kind': 'fix', 'fn': 'fn_00401000'}]
     (run / 'events.jsonl').write_text(''.join(json.dumps(e) + '\n' for e in events))
-    assert lane.FarmOps(run, root=tmp_path).candidates() == {}
-    with (run / 'events.jsonl').open('a') as out:
-        out.write(json.dumps({'event': 'open-defect', 'fn': 'fn_00401000'}) + '\n')
-    assert list(lane.FarmOps(run, root=tmp_path).candidates()) == ['fn_00401000']
+    return lane.FarmOps(run, root=tmp_path, clock=lambda: 100_000.0)
+
+
+def test_candidates_wait_for_the_farm_to_report_the_defect_open(tmp_path):
+    fn = 'fn_00401000'
+    # _defect records the defect and queues its fix in one step: no event yet means not ours.
+    assert fix_run(tmp_path, []).candidates() == {}
+    assert fix_run(tmp_path, [{'event': 'open-defect', 'fn': fn, 'at': 1.0},
+                              {'event': 'dispatch', 'kind': 'fix', 'fn': fn, 'at': 99_000.0}]).candidates() == {}
+    assert list(fix_run(tmp_path, [{'event': 'dispatch', 'kind': 'fix', 'fn': fn, 'at': 99_000.0},
+                                   {'event': 'open-defect', 'fn': fn, 'at': 99_500.0}]).candidates()) == [fn]
+    # A farm that died during its fix never reports it open: an old fix dispatch frees it.
+    old = 100_000.0 - lane.STALE_FIX_SECONDS - 1
+    assert list(fix_run(tmp_path, [{'event': 'dispatch', 'kind': 'fix', 'fn': fn, 'at': old}]).candidates()) == [fn]
+
+
+def test_a_relative_result_line_is_submitted(tmp_path):
+    def relative(job):
+        adopt_line(job)
+        rel = lambda path: Path(path).relative_to(tmp_path).as_posix()
+        return f"ADOPT {rel(job['hand'])} {rel(job['receipt'])} fixed"
+    l, ops, _ = make(tmp_path, {'fn_00401000': cand()}, relative)
+    drain(l)
+    assert len(ops.submitted) == 1
 
 
 def test_a_submit_timeout_is_recorded_not_fatal(tmp_path, monkeypatch):
