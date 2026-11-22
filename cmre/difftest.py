@@ -727,21 +727,28 @@ STACK_PROBE_CODE = ((0x00945610, 0x00945640),)
 STACK_LAYOUT_LIMIT = 0.02  # fraction of cases; above it the layout-dependent mismatches stay mismatches
 
 
-def _reads_dead_stack(result: emu.Result) -> bool:
-    """The original loaded stack bytes wholly below the live ESP, other than a stack probe.
+def _reads_dead_stack_before(rerun: emu.Result, difference: dict, profile: str) -> bool:
+    """The original loaded stack bytes wholly below the live ESP, other than a stack probe,
+    before the first difference.
 
     Those bytes are leftovers of earlier or deeper frames. Their values follow the frame
-    layout the compiler chose, which a faithful C function is free to change (ADR 0002)."""
-    return any(not any(lo <= eip < hi for lo, hi in STACK_PROBE_CODE)
-               for _index, _address, eip in result.dead_stack_reads)
+    layout the compiler chose, which a faithful C function is free to change (ADR 0002).
+    For an event difference the read must precede the original's differing import call;
+    a difference in the outcome, fault detail, registers or memory takes any such read."""
+    limit = (_raw_event_index(rerun.events, difference["index"], profile)
+             if difference.get("field") == "events" else None)
+    return any(not any(lo <= eip < hi for lo, hi in STACK_PROBE_CODE) and (limit is None or index < limit)
+               for index, _address, eip in rerun.dead_stack_reads)
 
 
 def _classify(na, nb, original: emu.Result, amap, region, data_spans, *, fault_mapping=None,
-              layout_hazard=False) -> tuple[str, dict]:
+              layout_hazard=None, profile="semantic") -> tuple[str, dict]:
     """equal | code-as-data | stack-layout | mismatch. Relocated code cannot reproduce its own
     instruction bytes when the original reads them as data: a hazard, not a mismatch. With
-    `layout_hazard` (C tier), a difference after the original read dead stack bytes is likewise
-    a hazard: the case depends on the compiler's frame layout, not on the function's behaviour."""
+    `layout_hazard` (C tier: a callable that re-runs the original with dead-stack tracking), a
+    difference after the original read dead stack bytes is likewise a hazard: the case depends
+    on the compiler's frame layout, not on the function's behaviour. A re-run that does not
+    reproduce the first run exactly is ignored."""
     if original.outcome == 'error' and original.detail and str(original.detail[0]).startswith('import transcript'):
         return 'mismatch', {'field': 'import-transcript', 'original': original.detail}
     if nb[0] == 'error' and nb[1] and str(nb[1][0]).startswith('import transcript'):
@@ -751,8 +758,12 @@ def _classify(na, nb, original: emu.Result, amap, region, data_spans, *, fault_m
         return "equal", {}
     if _reads_own_code(original, region, data_spans):
         return "code-as-data", difference
-    if layout_hazard and _reads_dead_stack(original):
-        return "stack-layout", difference
+    if layout_hazard is not None:
+        rerun = layout_hazard()
+        same = ((rerun.outcome, rerun.detail, rerun.regs, rerun.events)
+                == (original.outcome, original.detail, original.regs, original.events))
+        if same and _reads_dead_stack_before(rerun, difference, profile):
+            return "stack-layout", difference
     return "mismatch", difference
 
 
@@ -782,7 +793,6 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
     original = emu.Machine(img, watch=region, arena_size=opts.hints.get("arena_size", emu.ARENA_SIZE))
     recovered = emu.Machine(img, built.image, watch=region, escape=True,
                             arena_size=opts.hints.get("arena_size", emu.ARENA_SIZE))
-    original.track_dead_stack_reads = profile == "semantic"
     if profile == "semantic" and indirect is not None:
         _stop_indirect(original, recovered, region, built, indirect)
     text = built.image.text
@@ -816,7 +826,6 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
         sem_b = semantic_fp(recovered.uc, returns) if profile == "semantic" else ()
         if index < opts.discovery:
             global_inputs |= _global_reads(a, img, own)
-        covered |= a.covered
         import_calls += sum(1 for e in a.events if e[0] == "c")
         na = _normalize(a, None, profile, returns, sem_a)
         nb = _normalize(b, amap, profile, returns, sem_b, stop_shape(a))
@@ -829,6 +838,7 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
         if compare_fp:
             digest.update(repr(fp_a).encode())
         if profile in ("abi", "semantic") and "budget" in (a.outcome, b.outcome):
+            covered |= a.covered
             inconclusive += 1
             if a.outcome != b.outcome and len(mismatches) < 5:
                 mismatches.append({"case": index, "kind": "budget-asymmetry",
@@ -837,15 +847,26 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
                                       if extended else {}),
                                    "note": "Unresolved execution budget; investigate or raise the budget for both runs."})
             continue
-        verdict, difference = _classify(na, nb, a, amap, region, data_spans,
-                                        fault_mapping=b.fault_mapping, layout_hazard=profile == "semantic")
+        def tracked_rerun(case=case):
+            # Deterministic: the same case on the same machine. Only differing cases pay for tracking.
+            original.track_dead_stack_reads = True
+            try:
+                return original.run(va, case, opts.budget)
+            finally:
+                original.track_dead_stack_reads = False
+
+        verdict, difference = _classify(na, nb, a, amap, region, data_spans, fault_mapping=b.fault_mapping,
+                                        layout_hazard=tracked_rerun if profile == "semantic" else None,
+                                        profile=profile)
         if compare_fp and (fp_difference := x87_transport.difference(fp_a, fp_b)):
             verdict, difference = 'mismatch', fp_difference
+        if verdict == "stack-layout":
+            # Waived: instructions reached only here are not evidence of coverage.
+            stack_layout.append((index, difference))
+            continue
+        covered |= a.covered
         if verdict == "code-as-data":
             code_as_data.append(index)
-            continue
-        if verdict == "stack-layout":
-            stack_layout.append((index, difference))
             continue
         if verdict == "mismatch":
             if len(mismatches) < 5:

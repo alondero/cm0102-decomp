@@ -642,7 +642,8 @@ def _tier_record(report: dict, source: Path) -> dict:
         out["source_dependencies"] = report["source_dependencies"]
         out["preprocessed_sha256"] = report["preprocessed_sha256"]
         out["validation"] = {opt: {k: b["difftest"][k] for k in ("profile", "returns", "inputs", "cases", "seed", "outcomes",
-                                                                  "coverage", "inconclusive", "result_digest")
+                                                                  "coverage", "inconclusive", "stack_layout_cases",
+                                                                  "stack_layout_examples", "result_digest")
                                    if k in b["difftest"]}
                              for opt, b in report["builds"].items()}
         if any(b.get('return_transport') for b in report['builds'].values()):
