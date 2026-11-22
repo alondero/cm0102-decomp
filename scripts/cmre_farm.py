@@ -2073,6 +2073,12 @@ class Farm:
             stalled = (code is None and not timed_out and activity is not None
                        and now - max(activity, started) > self.config.stall_minutes * 60)
             if code is None and not timed_out and not stalled:
+                waiting = getattr(handle, 'pending_limit', lambda: None)()
+                if waiting:
+                    # 22 Nov: workers sat out a ~9 h free-tier 429 until their 30-minute limit.
+                    handle.kill()
+                    self._limited(job, *waiting)
+                    continue
                 still.append((job, handle, started))
                 continue
             if timed_out or stalled:
@@ -3764,6 +3770,47 @@ INFRA_ERROR = re.compile(r'API key|statusCode"?\s*:\s*(?:401|402|403)|quota|insu
 
 
 LIMIT_ERROR = re.compile(r'usage limit|rate limit|too many requests|go-limit', re.I)
+# OpenCode 2.x waits out a provider error with `retry` rows. A rate limit it would wait on for longer
+# than this is a limit to pause the model for; a brief one is waited out as before.
+LIMIT_WAIT_SECONDS = 120
+_PENDING = ('retry', 'step_start', 'error')   # rows that are not progress after a retry
+
+
+def _retry_limit(row):
+    """(message, seconds) when a `retry` row waits out a provider rate limit longer than
+    LIMIT_WAIT_SECONDS, else None."""
+    data = row.get('error') if isinstance(row, dict) else None
+    if not isinstance(data, dict):
+        return None
+    message = str(data.get('message') or '')
+    if not (data.get('status') == 429 or LIMIT_ERROR.search(f"{data.get('type', '')} {message}")):
+        return None
+    seconds = 0
+    if data.get('retryAfterMs'):
+        seconds = int(data['retryAfterMs']) // 1000
+    elif row.get('nextRetryAt') and row.get('timestamp'):
+        seconds = int(row['nextRetryAt'] - row['timestamp']) // 1000
+    if seconds <= LIMIT_WAIT_SECONDS:
+        return None
+    return message[:300], seconds
+
+
+def _scan_retry(state, line):
+    """Fold one log line into a pending retry limit: set by a long rate-limit retry, cleared by
+    any later progress (the provider answered)."""
+    if '"type"' not in line:
+        return state
+    try:
+        row = json.loads(line)
+    except ValueError:
+        return state
+    if not isinstance(row, dict):
+        return state
+    if row.get('type') == 'retry':
+        return _retry_limit(row) or state
+    if row.get('type') not in _PENDING:
+        return None
+    return state
 
 
 class OpencodeHandle:
@@ -3818,7 +3865,27 @@ class OpencodeHandle:
                 reset = re.search(r'resets in (?:(\d+)h)?\s*(?:(\d+)m)?', f'{message} {body}')
                 seconds = (int(reset.group(1) or 0) * 3600 + int(reset.group(2) or 0) * 60) if reset else 0
                 return message[:300], seconds or DEFAULT_LIMIT_SECONDS
-        return None
+        pending = None
+        for line in text.splitlines():
+            pending = _scan_retry(pending, line)
+        return pending
+
+    def pending_limit(self):
+        """A provider limit the running worker is waiting out, or None. Reads only lines added
+        since the last call, so the farm can ask on every tick."""
+        try:
+            with self.log.open('rb') as handle:
+                handle.seek(getattr(self, '_retry_offset', 0))
+                data = handle.read()
+        except OSError:
+            return getattr(self, '_retry_pending', None)
+        end = data.rfind(b'\n') + 1          # a line still being written is read next time
+        pending = getattr(self, '_retry_pending', None)
+        for line in data[:end].decode('utf-8', errors='replace').splitlines():
+            pending = _scan_retry(pending, line)
+        self._retry_offset = getattr(self, '_retry_offset', 0) + end
+        self._retry_pending = pending
+        return pending
 
     def infra_error(self):
         """A provider/auth error event in the worker's JSON stream, if any."""
