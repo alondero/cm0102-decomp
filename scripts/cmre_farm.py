@@ -2174,6 +2174,7 @@ class Farm:
         if (not job.get('_seed_from_attempt') and seed is not None and _read(job['source']) == seed):
             reason, message = 'unchanged', continue_message(self.root, job)
         elif ((report.get('result') or '').startswith('FARM-RESULT: fail')
+              and 'BLOCKER' not in report['result']   # a named blocker is the worker's result
               and report.get('gate_runs', GATE_RUN_BUDGET) < GATE_RUN_BUDGET
               and left >= EARLY_FAIL_MIN_SECONDS):
             reason = 'early-fail'
@@ -3950,7 +3951,9 @@ class OpencodeHandle:
                 row = json.loads(line)
             except ValueError:
                 continue
-            part = row.get('part') or {} if isinstance(row, dict) else {}
+            if not isinstance(row, dict):
+                continue
+            part = row.get('part') or {}
             if row.get('type') == 'tool_use' and part.get('tool') == 'shell':
                 command = str(((part.get('state') or {}).get('input') or {}).get('command') or '')
                 runs += ' -m cmre test ' in f' {command} '

@@ -2973,6 +2973,15 @@ def test_a_reported_pass_or_evidence_request_is_not_continued(root):
         assert launcher.resumed == [], result
 
 
+def test_an_early_fail_that_names_a_blocker_is_not_continued(root):
+    now = [0.0]
+    f, cmre, launcher = early_fail_farm(
+        root, ReportingHandle('FARM-RESULT: fail BLOCKER: callee 0x5e8290 receiver is unproven', 1),
+        write_source(GOOD), now)
+    drain(f, 6)
+    assert launcher.resumed == []
+
+
 def test_an_early_fail_is_continued_only_once(root):
     now = [0.0]
     f, cmre, launcher = early_fail_farm(root, ReportingHandle('FARM-RESULT: fail case 1', 1),
@@ -2991,7 +3000,7 @@ def test_the_handle_reports_gate_runs_and_the_last_farm_result(root, tmp_path):
             tool('shell', command='py -3.13 -m cmre test fn_1 --c --source a.c --opt=-O2'),
             {'type': 'text', 'part': {'text': 'Done.\nFARM-RESULT: fail case 3 event 22'}}]
     log = tmp_path / 'w.jsonl'
-    log.write_text('\n'.join(json.dumps(r) for r in rows) + '\nnot json\n', encoding='utf-8')
+    log.write_text('\n'.join(json.dumps(r) for r in rows) + '\nnot json\n42\n["row"]\n', encoding='utf-8')
     report = farm.OpencodeHandle(None, log).worker_report()
     assert report == {'result': 'FARM-RESULT: fail case 3 event 22', 'gate_runs': 2}
     assert farm.OpencodeHandle(None, tmp_path / 'missing.jsonl').worker_report() is None
