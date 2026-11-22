@@ -262,3 +262,36 @@ def test_tail_jump_arguments_start_above_the_return_address():
 def test_without_indirect_stops_the_interior_target_executes():
     m = slot_machine(call_eax(INTERIOR))
     assert m.run(SCRATCH, case(), 100).outcome != "interior"
+
+
+def _find_next_entry(machine, offset):
+    import struct
+
+    # push buffer; push 1; call [FindNextFileA]; ret
+    return _code(machine, offset, bytes.fromhex("68") + struct.pack("<I", emu.ARENA + 0x100) + bytes.fromhex("6a01ff15")
+                 + struct.pack("<I", _slot("KERNEL32.dll!FindNextFileA")) + b"\xc3")
+
+
+def test_successful_find_next_writes_the_same_find_data_for_the_same_seed(machine):
+    from cmre import imports
+
+    entry = _find_next_entry(machine, 0x5000)
+    seeds = [s for s in range(64) if imports.result(s, 0, emu.ARENA, emu.ARENA_SIZE) != 0]
+    assert seeds
+    for seed in seeds[:4]:
+        arena = bytes([0xEE]) * emu.ARENA_SIZE  # garbage the stub must overwrite, not preserve
+        r = machine.run(entry, emu.Case({"eflags": 0x202}, [0] * 4, arena, import_seed=seed), 100)
+        page = r.memory[(emu.ARENA + 0x100) & ~0xFFF]
+        offset = (emu.ARENA + 0x100) & 0xFFF
+        assert page[offset:offset + 320] == imports.find_data(seed, 0)
+
+
+def test_failed_find_next_leaves_the_buffer_alone(machine):
+    from cmre import imports
+
+    entry = _find_next_entry(machine, 0x6000)
+    seed = next(s for s in range(256) if imports.result(s, 0, emu.ARENA, emu.ARENA_SIZE) == 0)
+    arena = bytes([0xEE]) * emu.ARENA_SIZE
+    r = machine.run(entry, emu.Case({"eflags": 0x202}, [0] * 4, arena, import_seed=seed), 100)
+    assert r.regs[0] == 0
+    assert (emu.ARENA + 0x100) & ~0xFFF not in r.memory  # nothing written, so no dirty page

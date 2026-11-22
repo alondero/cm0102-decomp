@@ -3,7 +3,9 @@
 A stub only has to be identical on the original and recovered sides; it is not a
 model of Windows. It records the call (name + stdcall arguments) as an ordered
 event, returns a value derived from the case seed, and pops the documented
-stdcall argument count. Terminal imports end the case instead.
+stdcall argument count. A successful FindFirstFileA/FindNextFileA/FileTimeTo*
+call also writes its documented output structure (see `outputs`), so neither side
+reads stack garbage from the buffer. Terminal imports end the case instead.
 Never use these values as evidence of game behaviour.
 """
 from __future__ import annotations
@@ -88,6 +90,86 @@ def result(seed: int, index: int, arena: int, arena_size: int) -> int:
     if kind == 2:
         return arena + ((h >> 4) % (arena_size - 0x400)) & ~3
     return h
+
+
+# Documented output structures written by the file-search and file-time stubs.
+FIND_DATA_SIZE = 320  # WIN32_FIND_DATAA
+_FILETIME_MAX = (1 << 63) - 1  # FileTimeToSystemTime fails only for values with the top bit set
+_TICKS_PER_DAY = 864000000000
+
+
+def _mix(seed: int, index: int, salt: int) -> int:
+    h = (seed * 0x9E3779B1 + (index + 1) * 0x85EBCA6B + salt * 0xC2B2AE35) & 0xFFFFFFFF
+    h ^= h >> 15
+    h = (h * 0x2C1B3C6D) & 0xFFFFFFFF
+    h ^= h >> 12
+    h = (h * 0x297A2D39) & 0xFFFFFFFF
+    return h ^ (h >> 15)
+
+
+def find_data(seed: int, index: int) -> bytes:
+    """A valid WIN32_FIND_DATAA chosen only by (seed, call index): documented layout.
+
+    Times are valid FILETIMEs, the name is NUL-terminated and fits 8.3, so
+    cAlternateFileName stays empty. Test scaffolding, not a file system."""
+    kind = _mix(seed, index, 1) % 8
+    if kind < 2:
+        name, attrs = (b".", b"..")[kind], 0x10
+    else:
+        name = b"F%07X.DAT" % (_mix(seed, index, 2) & 0xFFFFFFF)
+        attrs = (0x10, 0x20, 0x01, 0x80)[_mix(seed, index, 3) % 4]
+        if attrs == 0x10:
+            name = name[:8]
+    times = b"".join(
+        (0x01C00000_00000000 + (_mix(seed, index, 4 + i) << 20) + _mix(seed, index, 8 + i)).to_bytes(8, "little")
+        for i in range(3))
+    size = 0 if attrs == 0x10 else _mix(seed, index, 12)
+    out = (attrs.to_bytes(4, "little") + times + (0).to_bytes(4, "little") + size.to_bytes(4, "little")
+           + bytes(8) + name + b"\0")
+    return out + bytes(FIND_DATA_SIZE - len(out))
+
+
+def systemtime(filetime: int) -> bytes | None:
+    """SYSTEMTIME for a FILETIME, or None where FileTimeToSystemTime documents failure."""
+    if not 0 <= filetime <= _FILETIME_MAX:
+        return None
+    days, rest = divmod(filetime, _TICKS_PER_DAY)
+    seconds, ticks = divmod(rest, 10000000)
+    # Proleptic Gregorian date from days since 1601-01-01 (a 400-year cycle is 146097 days).
+    era, doe = divmod(days + 584694, 146097)
+    yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    mp = (5 * doy + 2) // 153
+    day = doy - (153 * mp + 2) // 5 + 1
+    month = mp + 3 if mp < 10 else mp - 9
+    year = yoe + era * 400 + (month <= 2)
+    weekday = (days + 1) % 7  # 1601-01-01 was a Monday; SYSTEMTIME counts Sunday as 0
+    hour, seconds = divmod(seconds, 3600)
+    minute, second = divmod(seconds, 60)
+    fields = (year, month, weekday, day,
+              hour, minute, second, ticks // 10000)
+    return b"".join(f.to_bytes(2, "little") for f in fields)
+
+
+def outputs(name: str, args: tuple, value: int, seed: int, index: int, read) -> list[tuple[int, bytes]]:
+    """Documented out-parameter writes for a successful call: [(address, bytes)].
+
+    `read(address, size)` returns bytes, or None when unmapped. A failed call
+    writes nothing (the API leaves its output unspecified). Only the file-search
+    and file-time imports are covered; every other stub writes nothing."""
+    if name == "KERNEL32.dll!FindFirstFileA":
+        return [(args[1], find_data(seed, index))] if value != 0xFFFFFFFF else []
+    if name == "KERNEL32.dll!FindNextFileA":
+        return [(args[1], find_data(seed, index))] if value else []
+    if not value or name not in ("KERNEL32.dll!FileTimeToLocalFileTime", "KERNEL32.dll!FileTimeToSystemTime"):
+        return []
+    raw = read(args[0], 8)
+    if raw is None:
+        return []
+    if name == "KERNEL32.dll!FileTimeToLocalFileTime":
+        return [(args[1], raw)]  # time-zone bias of zero: local time equals UTC, copied unchanged
+    st = systemtime(int.from_bytes(raw, "little"))
+    return [(args[1], st)] if st is not None else []
 
 
 class Transcript:
