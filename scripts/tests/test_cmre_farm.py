@@ -3498,6 +3498,111 @@ def test_handle_reads_a_usage_limit_and_its_reset_time(tmp_path):
     assert farm.OpencodeHandle(None, log).limit_error() is None
 
 
+
+def retry_row(after_ms=32932000, status=429, kind='provider.rate-limit', at=1795359067904,
+              message='Rate limit exceeded. Please try again later.'):
+    """OpenCode 2.x waits out a provider error with a `retry` row (22 Nov: free Hy4, ~9 h)."""
+    return json.dumps({'type': 'retry', 'timestamp': at, 'sessionID': 'ses_x', 'attempt': 2,
+                       'nextRetryAt': at + 900000, 'error': {
+                           'type': kind, 'message': message, 'status': status, 'retryAfterMs': after_ms}})
+
+
+TRANSPORT = ('Connection lost while reading the response: ECONNRESET: The socket connection was '
+             'closed unexpectedly.')
+
+
+STEP = json.dumps({'type': 'step_start', 'timestamp': 1795359067902, 'part': {'type': 'step-start'}})
+TEXT = json.dumps({'type': 'text', 'timestamp': 1795359069000, 'part': {'type': 'text', 'text': 'reading'}})
+
+
+def test_a_worker_waiting_out_a_long_rate_limit_reports_it(tmp_path):
+    """22 Nov: 56 of 111 translate results were 30-minute timeouts spent waiting on a 429."""
+    log = tmp_path / 'w.jsonl'
+    log.write_text(STEP + '\n' + retry_row() + '\n')
+    handle = farm.OpencodeHandle(None, log)
+    message, seconds = handle.limit_error()
+    assert 'Rate limit' in message and seconds == 32932
+    assert handle.pending_limit() == (message, seconds)
+
+
+def test_short_retries_transport_retries_and_resumed_workers_are_not_limits(tmp_path):
+    log = tmp_path / 'w.jsonl'
+    for lines in ([STEP, retry_row(after_ms=5000)],                         # a brief 429 is waited out
+                  [STEP, retry_row(status=200, kind='provider.transport', message=TRANSPORT)],  # network
+                  [STEP, retry_row(), TEXT]):                               # the worker went on working
+        log.write_text('\n'.join(lines) + '\n')
+        handle = farm.OpencodeHandle(None, log)
+        assert handle.limit_error() is None and handle.pending_limit() is None
+
+
+def test_pending_limit_reads_only_new_complete_lines(tmp_path):
+    log = tmp_path / 'w.jsonl'
+    log.write_text(STEP + '\n')
+    handle = farm.OpencodeHandle(None, log)
+    assert handle.pending_limit() is None
+    row = retry_row()
+    with log.open('a', encoding='utf-8') as out:
+        out.write(row[:40])                      # the writer is mid-line
+    assert handle.pending_limit() is None
+    with log.open('a', encoding='utf-8') as out:
+        out.write(row[40:] + '\n')
+    assert handle.pending_limit()[1] == 32932
+    with log.open('a', encoding='utf-8') as out:
+        out.write(TEXT + '\n')
+    assert handle.pending_limit() is None
+
+
+class WaitingHandle(ScriptedHandle):
+    """A running worker that is waiting out a provider limit."""
+
+    def pending_limit(self):
+        return ('Rate limit exceeded. Please try again later.', 32932)
+
+    def limit_error(self):
+        return self.pending_limit()
+
+
+def test_the_farm_stops_a_worker_waiting_out_a_limit_at_once(root, monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(farm.time, 'time', lambda: now[0])
+    f, cmre, launcher = scripted_farm(root, lambda job: WaitingHandle(code=None), lambda: 0.0,
+                                      ladder=['go/a'])
+    f.tick()
+    f.tick()
+    assert launcher.handles[0].killed                     # not left to time out after 30 minutes
+    assert 'fn_00401000' not in f.state['attempts'] and not f.state['parked']
+    limited = [e for e in events(f.run_dir) if e['event'] == 'model-limited']
+    assert limited and limited[0]['until'] == pytest.approx(1000.0 + 32932)
+
+
+def test_a_limited_translation_keeps_its_written_draft_for_the_retry(root, monkeypatch):
+    """Review 2026-11-22: a worker can write its source and then meet the 429 on its last turn."""
+    now = [1000.0]
+    monkeypatch.setattr(farm.time, 'time', lambda: now[0])
+    draft = b'/* draft: half the loop recovered */\n'
+
+    def plan(job):
+        Path(job['source']).parent.mkdir(parents=True, exist_ok=True)
+        Path(job['source']).write_bytes(draft)
+        return WaitingHandle(code=None)
+
+    f, cmre, launcher = scripted_farm(root, plan, lambda: 0.0, ladder=['go/a'])
+    f.tick()
+    f.tick()
+    again = [j for j in f.pending if j['fn'] == 'fn_00401000']
+    assert again and again[0]['_seed'] == draft           # as escalation carries a prior source
+    assert 'fn_00401000' not in f.state['attempts']
+    assert any(e['event'] == 'draft-kept' for e in events(f.run_dir))
+
+
+def test_a_malformed_or_huge_retry_after_is_bounded(tmp_path):
+    log = tmp_path / 'w.jsonl'
+    log.write_text(STEP + '\n' + retry_row(after_ms='soon') + '\n')
+    assert farm.OpencodeHandle(None, log).pending_limit()[1] == 900          # falls back to nextRetryAt
+    log.write_text(STEP + '\n' + retry_row(after_ms=10 ** 12) + '\n')
+    assert farm.OpencodeHandle(None, log).limit_error()[1] == farm.MAX_RETRY_PAUSE_SECONDS
+
+
 def test_usage_limit_pauses_the_provider_and_requeues_without_an_attempt(root, monkeypatch):
     # Four backlog fix attempts were spent on the limit and reported as unchanged sources.
     now = [1000.0]

@@ -373,6 +373,10 @@ class Lane:
                     self._release(job, 'interrupted')
                     self.event('interrupted', fn=job['fn'], n=job['n'], reason='stop')
                     continue
+                if hasattr(handle, 'pending_limit') and handle.pending_limit():
+                    handle.kill()   # waiting out a provider limit: pause the model now, no attempt
+                    self._finish(job, handle, None)
+                    continue
                 activity = handle.last_activity() if hasattr(handle, 'last_activity') else None
                 stalled = activity is not None and time.monotonic() - activity > self.stall_seconds
                 if self.clock() - started > self.attempt_seconds or stalled:

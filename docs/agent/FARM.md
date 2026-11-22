@@ -240,6 +240,12 @@ Coordinator procedure:
      ("Model unavailable") pauses only that model for one hour (`LIMITED provider/model`);
      the input lane still gates a spec the worker changed before the error. The farm
      requeues without spending attempts and falls through to an available provider.
+     OpenCode 2.x reports a rate limit as a `retry` row and waits it out. When the
+     provider asks for more than 2 minutes (22 Nov: free Hy4 asked for about 9 hours),
+     the farm, the input lane and the defect lane stop that worker as soon as the row
+     appears and pause the model for the time the provider gave, instead of letting
+     it sit until its time limit. A brief retry, a network retry, or a retry that the
+     worker gets past is waited out as before.
      A failed attempt whose remaining rungs are all paused waits for them instead of
      parking, and a failure while the farm stops is left for the next run's scan.
      Audits and confirmations also use an available ladder model; they wait only

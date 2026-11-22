@@ -657,3 +657,31 @@ def test_worker_shell_cannot_redirect_or_chain_commands(tmp_path):
     for pattern in ('*>*', '*<*', '*|*', '*;*', '*&*', '*`*', '*$(*', r'*\n*', r'*\r*'):
         denies = [i for i, line in enumerate(rules) if f'resource: "{pattern}"' in line and 'effect: deny' in line]
         assert denies and min(denies) > last_allow, pattern   # later rules win: denies come last
+
+
+class WaitingHandle(Handle):
+    """22 Nov: input-lane workers sat out a ~9 h free-tier 429 until their time limit."""
+
+    def __init__(self, log):
+        super().__init__(log, code=None, limit=('Rate limit exceeded', 32932))
+
+    def pending_limit(self):
+        return self.limit
+
+
+def test_a_worker_waiting_out_a_limit_is_stopped_without_an_attempt(tmp_path):
+    l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1)
+    handles = []
+
+    def start(job, prompt, agent):
+        launcher.started.append((job, prompt, agent))
+        log = tmp_path / f"{job['fn']}-{job['n']}.jsonl"
+        log.write_text('')
+        handles.append(WaitingHandle(log))
+        return handles[-1]
+    launcher.start = start
+    l.tick()
+    l.tick()
+    assert handles[0].killed and ops.gates == []
+    assert l.state['functions']['fn_00401000'].get('attempts', []) == []
+    assert l.state['limited']['p'] == pytest.approx(1000.0 + 32932)

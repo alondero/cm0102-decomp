@@ -485,3 +485,30 @@ def test_a_verdict_recorded_while_submit_runs_still_counts(tmp_path):
     l.refreshed = None
     drain(l, ticks=1)
     assert l.state['functions']['fn_00401000']['attempts'][0]['farm']['outcome'] == 'refused'
+
+
+
+class WaitingHandle(Handle):
+    def __init__(self, log):
+        super().__init__(log, code=None, limit=('Rate limit exceeded', 32932))
+
+    def pending_limit(self):
+        return self.limit
+
+
+def test_a_defect_worker_waiting_out_a_limit_is_stopped_without_an_attempt(tmp_path):
+    l, ops, launcher = make(tmp_path, {'fn_00401000': cand()}, lambda job: 'working')
+    l.workers = 1
+    handles = []
+
+    def start(job, prompt, agent):
+        launcher.started.append((job, prompt, agent))
+        log = tmp_path / 'logs' / f"{job['fn']}-{job['n']}.jsonl"
+        text_log(log, 'working')
+        handles.append(WaitingHandle(log))
+        return handles[-1]
+    launcher.start = start
+    drain(l, ticks=2)
+    assert handles[0].killed and ops.submitted == []
+    assert l.state['functions']['fn_00401000'].get('attempts') == []
+    assert l.state['limited']['openai'] > time.time() + 30000
