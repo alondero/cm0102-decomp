@@ -117,6 +117,7 @@ MAX_FIX_ROUNDS = 1
 MAX_AUDIT_ROUNDS = 2
 DEFAULT_STALL_MINUTES = 15   # opencode 2.x is silent while a step thinks; 8 min killed real work
 FRONTIER_LIMIT = 5000   # cmre returns smallest-first; ask for the whole queue
+CONTINUE_MIN_SECONDS = 120   # a translator is continued only with this much of its attempt left
 PY = 'py -3.13'
 
 WORKER_COMMANDS = ('brief', 'test', 'explain', 'show', 'disasm', 'family', 'work show', 'trace-check')
@@ -506,6 +507,18 @@ def translate_prompt(root, job):
     elif job.get('seeded'):
         lines += ['', f'{src} already holds an earlier unaccepted source; start from it.']
     return '\n'.join(lines) + _hold_text(job.get('hold')) + '\n'
+
+
+def continue_message(root, job):
+    fn, src = job['fn'], _rel(root, job['source'])
+    seed = ('It holds the machine draft, which is translation input and usually does not build yet: '
+            'fix its build errors from the listing first.' if job.get('draft_seeded') else
+            'It holds an earlier unaccepted source, which is your starting point: check it against the '
+            'listing and repair what differs.')
+    return (f'You finished without editing {src}. The farm rejects an unchanged starting source, so this '
+            f'attempt has not been tested. {seed} Then run {PY} -m cmre test {fn} --c --source {src} '
+            'and fix mismatches one at a time, as your instructions say. Finish with exactly one '
+            'FARM-RESULT line.')
 
 
 def fix_prompt(root, job):
@@ -2115,6 +2128,8 @@ class Farm:
             if infra:
                 self._infra(job, infra)
                 continue
+            if code == 0 and self._continue(job, handle, started, still):
+                continue
             if stalled:
                 job['_stalled'] = True
             job['_finish'] = getattr(handle, 'finish_reason', lambda: None)()
@@ -2123,6 +2138,38 @@ class Farm:
             else:
                 self._verify(job, timed_out)
         self.running = still
+
+    def _continue(self, job, handle, started, still):
+        """Continue a translator's session once when it exits without editing its starting source.
+
+        22 Nov: 18 of 75 Terra translations ended inside 3 minutes with the machine draft untouched,
+        each spending a ladder rung. The continued worker keeps the attempt's original deadline."""
+        if job['kind'] != 'translate' or job.get('_nudged') or job.get('_seed_from_attempt'):
+            return False
+        left = self.config.attempt_minutes * 60 - (self.clock() - started)
+        if left < CONTINUE_MIN_SECONDS or self.stopping():
+            return False
+        seed = job.get('_seed_bytes')
+        if seed is None or _read(job['source']) != seed:
+            return False
+        if job.get('_hint_dispatched') and _read(job['hint_source']) != job['_snap']['hint']:
+            return False   # a private input proposal is the worker's result
+        resume = getattr(self.launcher, 'resume', None)
+        if resume is None:
+            return False
+        job['_nudged'] = True
+        try:
+            again = resume(job, handle, continue_message(self.root, job))
+        except Exception as exc:   # a failed continuation falls back to the unchanged-source failure
+            self._event('nudge-failed', fn=job['fn'], n=job['n'], error=str(exc)[:300])
+            return False
+        if again is None:
+            self._event('nudge-failed', fn=job['fn'], n=job['n'], error='no session to continue')
+            return False
+        self._event('nudged', fn=job['fn'], n=job['n'], model=job['model'],
+                    minutes=round((self.clock() - started) / 60, 1))
+        still.append((job, again, started))
+        return True
 
     def _x87_evidence_path(self, job, digest):
         """Deterministic, hash-bound receipt location for one job's operand mutants."""
@@ -4012,6 +4059,34 @@ class OpencodeV2Launcher:
                                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, creationflags=flags)
         out.close()
         return OpencodeV2Handle(process, logs / f'{stem}.jsonl', agent, self.executable)
+
+    def resume(self, job, handle, message):
+        """Send one more message to the worker's session; output appends to the same log.
+        None when the handle has no session to continue."""
+        sid = getattr(handle, 'session_id', lambda: None)()
+        if not sid:
+            return None
+        logs = self.run_dir / 'logs'
+        stem = f"{job['fn']}-{job['kind']}-{job['n']}"
+        (logs / f'{stem}.continue.txt').write_text(message, encoding='utf-8')
+        name = re.sub(r'[^A-Za-z0-9-]', '-', f"farm-{self.run_dir.name}-{stem}")
+        agent = self.root / '.opencode/agents' / f'{name}.md'
+        agent.parent.mkdir(parents=True, exist_ok=True)
+        agent.write_text(v2_agent(self.root, job), encoding='utf-8')   # removed when the first run exited
+        command = [self.executable, 'run', '--session', sid, '--agent', name, '-m', job['model'],
+                   '--format', 'json', message]
+        flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == 'nt' else 0
+        log = logs / f'{stem}.jsonl'
+        try:
+            self._wait_for_agent(name)
+            with log.open('ab') as out:
+                process = subprocess.Popen(command, cwd=self.root, env=dict(os.environ), stdout=out,
+                                           stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                           creationflags=flags)
+        except BaseException:
+            agent.unlink(missing_ok=True)
+            raise
+        return OpencodeV2Handle(process, log, agent, self.executable)
 
     def _wait_for_agent(self, name, attempts=30):
         """The shared service picks up a new agent file after a short delay; launching
