@@ -901,6 +901,8 @@ class Farm:
         else:
             extra = {k: job[k] for k in ('bytes', 'module', 'hold', 'prior') if k in job}
             again = self._new_job(job['kind'], job['fn'], job['model'], job['rung'], **extra)
+            # The retry restarts from the same seed, so a draft-seeded job stays in repair mode.
+            again['_from_draft'] = bool(job.get('draft_seeded'))
         again['_seed'] = job.get('_seed_bytes')
         self.pending.insert(0, again)
 

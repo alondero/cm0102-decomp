@@ -4223,6 +4223,30 @@ def test_the_next_rung_keeps_repairing_the_draft_lineage(root):
     assert cmre.accepted == ['fn_00401000']
 
 
+def test_a_limit_retry_keeps_repairing_the_draft_lineage(root, monkeypatch):
+    # Trial 2 2026-11-21: a draft-seeded MiniMax job hit its plan limit; the retry on Terra got the
+    # classic prompt with the draft repeated in its bundle and wrote a 1,460-byte stub from scratch.
+    monkeypatch.setattr(farm, 'DRAFT_SEED_MIN_BYTES', 0)
+    (root / DRAFT_REL).parent.mkdir(parents=True, exist_ok=True)
+    (root / DRAFT_REL).write_text(DRAFT)
+
+    def plan(job):
+        if job['model'].startswith('mm/'):
+            return limited_handle()
+        Path(job['source']).parent.mkdir(parents=True, exist_ok=True)
+        Path(job['source']).write_text(GOOD)
+        return ScriptedHandle(code=0)
+
+    f, cmre, launcher = scripted_farm(root, plan, lambda: 0.0, ladder=['mm/a', 'oa/b'])
+    cmre.brief = lambda fn: f'listing\ndraft: {DRAFT_REL}  NEEDS-REVIEW: extraout_var\n'
+    drain(f, 5)
+    (first, _, _), (second, prompt, _) = launcher.started[0], launcher.started[1]
+    assert first['draft_seeded'] and second['model'] == 'oa/b'
+    assert second['draft_seeded'] is True and not second.get('draft_reseeded')
+    assert 'do not rewrite' in prompt.lower()
+    assert 'already in your source file' in (root / second['bundle']).read_text()
+
+
 def test_a_draft_seeded_prompt_allows_a_long_gate(root):
     f, _, launcher = draft_farm(root, 6000, writes(GOOD))
     drain(f)
