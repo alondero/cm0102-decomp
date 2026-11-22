@@ -94,7 +94,7 @@ def result(seed: int, index: int, arena: int, arena_size: int) -> int:
 
 # Documented output structures written by the file-search and file-time stubs.
 FIND_DATA_SIZE = 320  # WIN32_FIND_DATAA
-_FILETIME_MAX = 0x7FFF35F4F06C58F0  # last FILETIME that fits SYSTEMTIME (30827-12-31)
+_FILETIME_MAX = (1 << 63) - 1  # FileTimeToSystemTime fails only for values with the top bit set
 _TICKS_PER_DAY = 864000000000
 
 
@@ -167,8 +167,7 @@ def outputs(name: str, args: tuple, value: int, seed: int, index: int, read) -> 
     if raw is None:
         return []
     if name == "KERNEL32.dll!FileTimeToLocalFileTime":
-        # Time-zone bias of zero: local time equals UTC; a FILETIME beyond the signed range is invalid.
-        return [(args[1], raw)] if int.from_bytes(raw, "little") < 1 << 63 else []
+        return [(args[1], raw)]  # time-zone bias of zero: local time equals UTC, copied unchanged
     st = systemtime(int.from_bytes(raw, "little"))
     return [(args[1], st)] if st is not None else []
 

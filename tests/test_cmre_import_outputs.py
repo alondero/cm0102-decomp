@@ -43,7 +43,7 @@ def test_local_file_time_copies_a_valid_input():
 
 def test_local_file_time_near_misses_write_nothing():
     raw = struct.pack("<Q", 1 << 63)
-    assert imports.outputs(K + "FileTimeToLocalFileTime", (0x10, 0x20), 1, 0, 0, lambda a, n: raw) == []
+    assert imports.outputs(K + "FileTimeToLocalFileTime", (0x10, 0x20), 1, 0, 0, lambda a, n: raw) == [(0x20, raw)]
     assert imports.outputs(K + "FileTimeToLocalFileTime", (0x10, 0x20), 0, 0, 0, lambda a, n: bytes(8)) == []
     assert imports.outputs(K + "FileTimeToLocalFileTime", (0x10, 0x20), 1, 0, 0, NOTHING) == []
 
@@ -59,15 +59,17 @@ def test_system_time_converts_exactly():
 
 def test_system_time_rejects_out_of_range_filetimes():
     assert imports.systemtime(0x7FFF35F4F06C58F0) is not None
-    assert imports.systemtime(0x7FFF35F4F06C58F1) is None
+    assert struct.unpack("<8H", imports.systemtime(0x7FFF35F4F06C58F0 + 864000000000))[:2] == (30828, 1)
+    assert struct.unpack("<8H", imports.systemtime((1 << 63) - 1)) == (30828, 9, 4, 14, 2, 48, 5, 477)
     assert imports.systemtime(1 << 63) is None
+    assert imports.systemtime(-1) is None
 
 
 def test_file_time_to_system_time_uses_the_input_and_writes_sixteen_bytes():
     raw = struct.pack("<Q", 125911584000000000)
     out = imports.outputs(K + "FileTimeToSystemTime", (0x10, 0x20), 1, 0, 0, lambda a, n: raw)
     assert out == [(0x20, imports.systemtime(125911584000000000))] and len(out[0][1]) == 16
-    bad = struct.pack("<Q", 0x7FFF35F4F06C58F1)
+    bad = struct.pack("<Q", 1 << 63)
     assert imports.outputs(K + "FileTimeToSystemTime", (0x10, 0x20), 1, 0, 0, lambda a, n: bad) == []
 
 
