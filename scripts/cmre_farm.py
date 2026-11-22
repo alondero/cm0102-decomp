@@ -2532,28 +2532,28 @@ class Farm:
         if self.last_dashboard_check is not None and self.clock() - self.last_dashboard_check < DASHBOARD_CHECK_SECONDS:
             return
         self.last_dashboard_check = self.clock()
-        if self.dashboard_proc is not None and self.dashboard_proc.poll() is None:
-            return
-        if (self.port_open or _port_open)(port):
-            return
-        command = [sys.executable, str(Path(__file__).resolve().parent / 'cmre_farm_dashboard.py'),
-                   'serve', '--port', str(port)]
-        default_runs = self.root / 'CM0102/Analysis/cmre/farm'
-        if self.run_dir.resolve().parent != default_runs.resolve():
-            command += ['--run', str(self.run_dir)]
         try:
+            if self.dashboard_proc is not None and self.dashboard_proc.poll() is None:
+                return
+            if (self.port_open or _port_open)(port):
+                return
+            command = [sys.executable, str(Path(__file__).resolve().parent / 'cmre_farm_dashboard.py'),
+                       'serve', '--port', str(port)]
+            default_runs = self.root / 'CM0102/Analysis/cmre/farm'
+            if self.run_dir.resolve().parent != default_runs.resolve():
+                command += ['--run', str(self.run_dir)]
             self.dashboard_proc = (self.dashboard_launch or self._popen_dashboard)(command)
-        except OSError as exc:   # the page is telemetry: it must never stop recovery
-            self._event('dashboard-failed', port=port, error=str(exc)[:300])
+        except Exception as exc:   # the page is telemetry: it must never stop recovery
+            self._event('dashboard-failed', port=port, error=f'{type(exc).__name__}: {exc}'[:300])
             return
         self._event('dashboard-start', port=port)
 
     def _popen_dashboard(self, command):
         logs = self.root / 'CM0102/Analysis/cmre/farm/dashboard'
         logs.mkdir(parents=True, exist_ok=True)
-        return subprocess.Popen(command, cwd=self.root, stdin=subprocess.DEVNULL,
-                                stdout=(logs / 'serve.out').open('ab'), stderr=(logs / 'serve.err').open('ab'),
-                                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        with (logs / 'serve.out').open('ab') as out, (logs / 'serve.err').open('ab') as err:
+            return subprocess.Popen(command, cwd=self.root, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 
     def _stop_input_lane(self):
         stop = self.run_dir / 'input-lane' / 'STOP'

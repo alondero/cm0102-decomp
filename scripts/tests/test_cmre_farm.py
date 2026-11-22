@@ -4188,6 +4188,33 @@ def test_an_existing_dashboard_is_left_alone_and_port_zero_disables_it(root):
     assert procs0 == []
 
 
+def test_a_dashboard_failure_never_stops_the_farm(root):
+    f, clock, procs, state = dashboard_farm(root)
+
+    def broken(command):
+        raise ValueError('bad command')
+    f.dashboard_launch = broken
+    f.tick()
+    failed = [e for e in events(f.run_dir) if e['event'] == 'dashboard-failed']
+    assert failed and 'bad command' in failed[0]['error']
+    f.port_open = lambda port: 1 / 0
+    clock['now'] = 70
+    f.tick()                                    # a broken check is telemetry too
+    assert len([e for e in events(f.run_dir) if e['event'] == 'dashboard-failed']) == 2
+
+
+def test_the_dashboard_is_told_about_a_run_outside_the_default_folder(root):
+    f, clock, procs, _ = dashboard_farm(root)
+    f.tick()
+    command = procs[0].command
+    assert command[command.index('--run') + 1] == str(f.run_dir)
+    default = root / 'CM0102/Analysis/cmre/farm/R1'
+    default.mkdir(parents=True)
+    f.run_dir, f.last_dashboard_check, f.dashboard_proc = default, None, None
+    f._dashboard()
+    assert '--run' not in procs[1].command
+
+
 def test_the_run_command_serves_the_dashboard_by_default(root):
     parser_defaults = farm.run_parser_defaults()
     assert parser_defaults['dashboard_port'] == farm.DASHBOARD_PORT == 8042
