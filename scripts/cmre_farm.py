@@ -66,7 +66,7 @@ NOTABLE_EVENTS = ('farm-exit', 'open-defect', 'model-unavailable', 'model-limite
 # Settings `set` may change on a running farm (RUN/control.json), applied on the next tick.
 CONTROL_KEYS = ('workers', 'audit_workers', 'min_bytes', 'max_bytes', 'ladder', 'audit_model',
                 'confirm_model', 'include_held', 'skip_ranges', 'attempt_minutes', 'stall_minutes',
-                'lift_lane_minutes', 'input_lane_workers')
+                'lift_lane_minutes', 'input_lane_workers', 'defect_lane_workers', 'defect_lane_model')
 SUPPLY_KEYS = ('min_bytes', 'max_bytes', 'include_held', 'skip_ranges')   # changes that reselect the frontier
 RESTART_SECONDS = 30         # supervisor pause before relaunching a farm that died
 MAX_RESTARTS_PER_HOUR = 5    # more than this is a crash loop: stop and wake the coordinator
@@ -167,6 +167,8 @@ class FarmConfig:
     rescan_seconds: float = 120    # how often an empty frontier is fetched again
     lift_lane_minutes: float = 0   # captures -> accepted lifts pass (scripts/cmre_lift_lane.py); 0 disables
     input_lane_workers: int = 0    # authored-input workers (scripts/cmre_input_lane.py, ADR 0013); 0 disables
+    defect_lane_workers: int = 0   # open-defect workers (scripts/cmre_defect_lane.py); 0 disables
+    defect_lane_model: str | None = None   # None: the lane's default model
     only: tuple = ()               # restrict the frontier to these functions (trial runs); () takes all
 
 
@@ -764,6 +766,8 @@ class Farm:
         self.input_launch = None    # callable(command) -> process; None: subprocess.Popen
         self.input_proc, self.last_input_launch = None, None
         self.input_drain = False    # an exit-when-empty farm stopped its lane to finish
+        self.defect_launch = None   # callable(command) -> process; None: subprocess.Popen
+        self.defect_proc, self.last_defect_launch = None, None
         self.recheck_ready = set()  # parked work stays durable until its verification finishes
         self.retried = {}          # fn -> parked record of a function returned to the queue
         self.state['deadline_at'] = None if config.hours is None else time.time() + config.hours * 3600
@@ -1132,7 +1136,8 @@ class Farm:
 
     def finished(self):
         return (self.stopping() and not self.running and not self.accept_queue
-                and not self.verifying and self.lift_proc is None and self.input_proc is None)
+                and not self.verifying and self.lift_proc is None and self.input_proc is None
+                and self.defect_proc is None)
 
     def drained(self):
         """The run is over. A continuous farm ends only on STOP or its deadline: with no supply
@@ -1148,6 +1153,10 @@ class Farm:
         if done and self.input_proc is not None:
             self.input_drain = True   # the lane would supply forever: stop it, then exit
             self._stop_input_lane()
+            return False
+        if done and self.defect_proc is not None:
+            self.input_drain = True   # also keeps the defect lane from relaunching
+            self._stop_side_lane('defect-lane')
             return False
         return done
 
@@ -1218,6 +1227,7 @@ class Farm:
                 'unavailable_models': dict(self.state['unavailable_models']),
                 'limited': _limit_labels(self.state.get('limited_providers', {}), time.time()),
                 'input_lane': input_lane_summary(self.run_dir),
+                'defect_lane': defect_lane_summary(self.run_dir),
                 'stopping': self.stopping()}
 
     # -- supply
@@ -1833,15 +1843,22 @@ class Farm:
             # (or absence). Do not replace the dispatch snapshot with the edits.
             return f'worker hints rejected: {exc}'
         declared = candidate_disclaimer_problems(text)
-        if declared and (_CANDIDATE_BLOCKER.search(text) or _CANDIDATE_MUST_NOT_ACCEPT.search(text)):
-            # A gate pass is exactly what "must not be accepted" says is not enough: triage it.
+        if declared and _CANDIDATE_BLOCKER.search(text):
             job['_safeguard_blocker'] = True
             return 'BLOCKER: ' + '; '.join(declared)
-        if declared:
+        must_not = bool(declared) and bool(_CANDIDATE_MUST_NOT_ACCEPT.search(text))
+        if declared and not must_not:
             # An unfinished-work statement without a BLOCKER: is a failed attempt, not an
             # evidence gap: the next rung continues from this candidate.
             return 'worker self-declared unfinished: ' + '; '.join(declared)
         report = self.cmre.test(fn, str(source))
+        if must_not:
+            # A gate pass is exactly what "must not be accepted" says is not enough: triage it.
+            # A gate fail is an unfinished attempt (96 of 162 safeguard parks on 22 Nov).
+            if report.get('status') == 'pass':
+                job['_safeguard_blocker'] = True
+                return 'BLOCKER: ' + '; '.join(declared) + '; the gate passes'
+            return 'worker self-declared unfinished: ' + '; '.join(declared) + ' | ' + report_detail(report)
         if report.get('status') != 'pass':
             coverage = input_bound(report)
             if coverage is not None and job['kind'] == 'translate':
@@ -2349,6 +2366,7 @@ class Farm:
         self._input_arrivals()
         self._lift_lane()
         self._input_lane()
+        self._defect_lane()
         self._dispatch()
         self.save()
         self.observe()
@@ -2431,6 +2449,59 @@ class Farm:
         self.last_input_launch = self.clock()
         self._event('input-lane-start', workers=workers)
 
+    def _defect_lane(self):
+        """Keep one defect-lane process running beside the farm while defect_lane_workers > 0.
+
+        Before 22 Nov open defects waited for a coordinator to send cm-defect subagents one at a
+        time (11 in 6 hours against 126 open). The lane's adopt/dismiss lines become the same
+        checked requests, applied on a later tick. It reads RUN/STOP and RUN/control.json itself."""
+        if self.defect_proc is not None:
+            if self.defect_proc.poll() is None:
+                if self.stopping():
+                    self._stop_side_lane('defect-lane')
+                return
+            self._event('defect-lane-exit', code=self.defect_proc.poll())
+            self.defect_proc = None
+        workers = self.config.defect_lane_workers or 0
+        if workers <= 0 or self.stopping() or self.launcher is None or self.input_drain:
+            return
+        stop = self.run_dir / 'defect-lane' / 'STOP'
+        try:
+            mine = stop.read_text(encoding='utf-8') == FARM_LANE_STOP
+        except OSError:
+            mine = None
+        if mine is False:
+            return   # someone paused the defect lane by hand
+        if mine:
+            stop.unlink(missing_ok=True)
+        if self.last_defect_launch is not None and self.clock() - self.last_defect_launch < 300:
+            return
+        command = [sys.executable, str(Path(__file__).resolve().parent / 'cmre_defect_lane.py'), 'run',
+                   str(self.run_dir), '--workers', str(workers)]
+        if self.config.defect_lane_model:
+            command += ['--model', self.config.defect_lane_model]
+        logs = self.run_dir / 'defect-lane'
+        logs.mkdir(parents=True, exist_ok=True)
+        self.defect_proc = (self.defect_launch or self._popen_side('defect-lane'))(command)
+        self.last_defect_launch = self.clock()
+        self._event('defect-lane-start', workers=workers)
+
+    def _stop_side_lane(self, name):
+        stop = self.run_dir / name / 'STOP'
+        if not stop.exists():
+            stop.parent.mkdir(parents=True, exist_ok=True)
+            stop.write_text(FARM_LANE_STOP, encoding='utf-8')
+            self._event(f'{name}-stop')
+
+    def _popen_side(self, name):
+        logs = self.run_dir / name
+
+        def popen(command):
+            return subprocess.Popen(command, cwd=self.root, stdin=subprocess.DEVNULL,
+                                    stdout=(logs / 'lane.out').open('ab'), stderr=(logs / 'lane.err').open('ab'),
+                                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        return popen
+
     def _stop_input_lane(self):
         stop = self.run_dir / 'input-lane' / 'STOP'
         if not stop.exists():
@@ -2493,7 +2564,8 @@ LANES = {
                         'establish the named ABI/layout/consumer evidence, then cmre work retry fn_X --changed'),
     'worker-failure': ('coordinator', 'retry RUN fn_X --reason "transient worker failure"'),
     'other': ('coordinator', 'read the parked detail in RUN/state.json'),
-    'open-defect': ('defect lane (FARM.md "Defect subagent")', 'fix or dismiss with evidence'),
+    'open-defect': ('defect lane (scripts/cmre_defect_lane.py; FARM.md "Defect lane")',
+                    'set RUN --defect-lane-workers N, or fix or dismiss by hand with evidence'),
     'acceptance-quarantined': ('coordinator (manual ledger review)',
                                'py -3.13 -m cmre work show fn_X; reconcile the retained acceptance before retry'),
     'boundary': ('none: explicit unknown (unproven callee consumption)',
@@ -2929,16 +3001,7 @@ their binding: preserve the concern and let fresh review reestablish evidence.
                        'primary', COORDINATOR_MODEL, rules, body)
 
 
-def defect_agent():
-    rules = [('*', '*', 'deny'), ('read', '*', 'allow'), ('grep', '*', 'allow'), ('glob', '*', 'allow'),
-             ('edit', 'CM0102/Analysis/cmre/farm/*/hand/*.c', 'allow'),
-             ('write', 'CM0102/Analysis/cmre/farm/*/hand/*.c', 'allow')]
-    shell = [f'{PY} scripts/cmre_farm.py test *', f'{PY} scripts/cmre_farm.py review *',
-             f'{PY} scripts/cmre_farm.py prepare-hand *']
-    shell += [f'{PY} -m cmre {command} *' for command in WORKER_COMMANDS if command not in ('test', 'explain')]
-    shell += list(READ_ONLY_SHELL)
-    rules += [('shell', command, 'allow') for command in shell]
-    body = """
+DEFECT_AGENT_BODY = """
 You resolve one open CM0102 audit defect. The coordinator gives you RUN (a farm run
 directory) and fn_X. Follow docs/agent/FARM.md section "Defect subagent" exactly and
 finish with its one result line.
@@ -2964,6 +3027,18 @@ Return ADOPT <source> <review_receipt> <note> or
 DISMISS <review_receipt> <reason>; never replace the receipt with a new current
 claim to make an old fix admissible. Never guess stable audit/bundle paths.
 """
+
+
+def defect_agent():
+    rules = [('*', '*', 'deny'), ('read', '*', 'allow'), ('grep', '*', 'allow'), ('glob', '*', 'allow'),
+             ('edit', 'CM0102/Analysis/cmre/farm/*/hand/*.c', 'allow'),
+             ('write', 'CM0102/Analysis/cmre/farm/*/hand/*.c', 'allow')]
+    shell = [f'{PY} scripts/cmre_farm.py test *', f'{PY} scripts/cmre_farm.py review *',
+             f'{PY} scripts/cmre_farm.py prepare-hand *']
+    shell += [f'{PY} -m cmre {command} *' for command in WORKER_COMMANDS if command not in ('test', 'explain')]
+    shell += list(READ_ONLY_SHELL)
+    rules += [('shell', command, 'allow') for command in shell]
+    body = DEFECT_AGENT_BODY
     body += '\n' + '\n'.join(AUDIT_AUTHORITY)
     return _agent_file('CM0102 defect fixer: checks one open audit defect against the listing, then fixes or dismisses it',
                        'subagent', DEFAULT_CONFIRM_MODEL, rules, body, steps=40)
@@ -3466,6 +3541,12 @@ def _request(run_dir, fn, kind, **data):
     return path
 
 
+def defect_lane_summary(run_dir):
+    """Defect-lane counts from RUN/defect-lane/events.jsonl, or None when the lane never ran."""
+    from cmre_defect_lane import lane_summary
+    return lane_summary(run_dir)
+
+
 def input_lane_summary(run_dir):
     """Input-lane counts from RUN/input-lane/events.jsonl, or None when the lane never ran."""
     path = Path(run_dir) / 'input-lane' / 'events.jsonl'
@@ -3507,6 +3588,9 @@ def status_line(s):
              + (f" | QUARANTINED {','.join(sorted(s['quarantined']))}" if s.get('quarantined') else '')
             + (f" | inputs: running {s['input_lane']['running']}, accepted {s['input_lane']['accepted']} fn / "
                f"{s['input_lane']['accepted_bytes']} B" if s.get('input_lane') else '')
+            + (f" | defects lane: running {s['defect_lane']['running']}, adopt {s['defect_lane']['adopt']}, "
+               f"dismiss {s['defect_lane']['dismiss']}, unresolved {s['defect_lane']['unresolved']}"
+               if s.get('defect_lane') else '')
             + (f" | SUPPLY EMPTY {round((time.time() - s['supply_empty_since']) / 60)} min: work the supply lane"
                if s.get('supply_empty_since') and not s['stopping'] else '')
             + (' | STOPPING' if s['stopping'] else ''))
@@ -3911,6 +3995,9 @@ def main(argv=None):
     r.add_argument('--input-lane-workers', type=int, default=4,
                    help='model workers authoring entry inputs for unlifted functions '
                         '(scripts/cmre_input_lane.py, ADR 0013); 0 disables')
+    r.add_argument('--defect-lane-workers', type=int, default=0,
+                   help='model workers resolving open audit defects (scripts/cmre_defect_lane.py); 0 disables')
+    r.add_argument('--defect-lane-model', help='defect-lane model (default: the lane default)')
     r.add_argument('--only', help='comma-separated fn_XXXXXXXX: translate only these (trial runs)')
     st = sub.add_parser('start', help='run the farm detached under a restart supervisor; args as for run')
     st.add_argument('run_dir')
@@ -3933,6 +4020,8 @@ def main(argv=None):
     se.add_argument('--stall-minutes', type=float)
     se.add_argument('--lift-lane-minutes', type=float, help='lift-lane pass interval; 0 disables')
     se.add_argument('--input-lane-workers', type=int, help='input-lane model workers; 0 dispatches no new input jobs')
+    se.add_argument('--defect-lane-workers', type=int, help='defect-lane model workers; 0 dispatches no new defect jobs')
+    se.add_argument('--defect-lane-model', help='defect-lane model for new jobs')
     se.add_argument('--add-hours', type=float, help='extend the deadline')
     ln = sub.add_parser('lanes', help='every state the farm cannot leave by itself: owner, bytes, next action')
     ln.add_argument('run_dir')
@@ -4217,6 +4306,7 @@ def main(argv=None):
                         confirm_model=a.confirm_model or None, skip_ranges=tuple(parse_ranges(a.skip_ranges)),
                         continuous=not a.exit_when_empty, rescan_seconds=a.rescan_minutes * 60,
                         lift_lane_minutes=a.lift_lane_minutes, input_lane_workers=a.input_lane_workers,
+                        defect_lane_workers=a.defect_lane_workers, defect_lane_model=a.defect_lane_model,
                         only=tuple(fn.strip() for fn in (a.only or '').split(',') if fn.strip()))
     from concurrent.futures import ThreadPoolExecutor
     with RunLock(run_dir), ThreadPoolExecutor(max_workers=max(1, a.verify_threads)) as verifier:
