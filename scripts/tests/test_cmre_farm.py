@@ -2813,12 +2813,71 @@ def test_a_continued_worker_that_still_leaves_its_seed_unchanged_fails_as_before
 
 def test_a_continued_worker_keeps_the_original_attempt_deadline(root):
     now = [0.0]
-    f, cmre, launcher = seeded_farm(root, lambda job: ScriptedHandle(code=None), now)
+    launcher = ResumingLauncher(lambda job: ScriptedHandle(code=0), lambda job: ScriptedHandle(code=None))
+    f, cmre, _ = scripted_farm(root, None, lambda: now[0], ladder=['m/cheap'], stall_minutes=60)
+    f.launcher = launcher
+    job = f._new_job('translate', 'fn_00401000', 'm/cheap', 0, bytes=200)
+    job['_seed'] = SEED.encode()
+    f.pending.append(job)
+    f.tick()
+    now[0] = 20 * 60                      # the first run exits after 20 minutes
     drain(f, 2)
-    assert len(launcher.resumed) == 1
-    now[0] = 31 * 60
+    assert len(launcher.resumed) == 1 and not launcher.handles[-1].killed
+    now[0] = 31 * 60                      # 11 minutes into the continuation, 31 into the attempt
     drain(f, 4)
     assert launcher.handles[-1].killed and 'timeout after 30 min' in json.dumps(f.state['parked'])
+
+
+def test_a_worker_near_its_deadline_is_not_continued(root):
+    now = [0.0]
+    f, cmre, launcher = seeded_farm(root, write_source(GOOD), now)
+    f.tick()
+    now[0] = 29 * 60
+    drain(f, 4)
+    assert launcher.resumed == [] and 'unchanged' in json.dumps(f.state['parked'])
+
+
+def test_a_worker_that_exited_with_an_error_is_not_continued(root):
+    now = [0.0]
+    launcher = ResumingLauncher(lambda job: ScriptedHandle(code=1), write_source(GOOD))
+    f, cmre, _ = scripted_farm(root, None, lambda: now[0], ladder=['m/cheap'])
+    f.launcher = launcher
+    job = f._new_job('translate', 'fn_00401000', 'm/cheap', 0, bytes=200)
+    job['_seed'] = SEED.encode()
+    f.pending.append(job)
+    drain(f, 6)
+    assert launcher.resumed == []
+
+
+def test_a_worker_that_left_an_input_proposal_is_not_continued(root):
+    hint = root / 'recovery/hints/fn_00401000.json'
+    hint.parent.mkdir(parents=True, exist_ok=True)
+    hint.write_text(json.dumps({'cases': 800, 'fixtures': [hint_fixture(7)]}))
+
+    def proposes(job):
+        changed = json.loads(hint.read_text())
+        changed['c_hints'] = {'fixtures': [hint_fixture(9)]}
+        Path(job['hint_source']).write_text(json.dumps(changed))
+        return ScriptedHandle(code=0)
+
+    now = [0.0]
+    launcher = ResumingLauncher(proposes, write_source(GOOD))
+    f, cmre, _ = scripted_farm(root, None, lambda: now[0], ladder=['m/cheap'])
+    f.launcher = launcher
+    job = f._new_job('translate', 'fn_00401000', 'm/cheap', 0, bytes=200)
+    job['_seed'] = SEED.encode()
+    f.pending.append(job)
+    drain(f, 6)
+    assert launcher.started and launcher.started[0][0].get('_hint_dispatched')
+    assert launcher.resumed == [] and cmre.accepted == []
+
+
+def test_the_continue_message_names_the_kind_of_seed(root):
+    job = {'fn': 'fn_00401000', 'source': str(root / 'run/src/fn_00401000.c'), 'draft_seeded': True}
+    assert 'machine draft' in farm.continue_message(root, job)
+    job['draft_seeded'] = False
+    text = farm.continue_message(root, job)
+    assert 'machine draft' not in text and 'earlier unaccepted source' in text
 
 
 def test_an_unchanged_earlier_attempt_is_gated_not_continued(root):
@@ -3226,6 +3285,34 @@ def test_v2_launcher_resumes_the_same_session_into_the_same_log(root, monkeypatc
     assert cmd[cmd.index('--session') + 1] == 'ses_abc123' and cmd[-1] == 'NUDGE'
     assert cmd[cmd.index('-m') + 1] == job['model'] and (root / '.opencode/agents' / f'{name}.md').exists()
     assert again.log == first.log and 'ses_abc123' in again.log.read_text(encoding='utf-8')
+
+
+def test_v2_launcher_removes_the_agent_file_when_a_resume_fails_to_launch(root, monkeypatch):
+    class Proc:
+        pid, code = 1, 0
+
+        def poll(self):
+            return self.code
+
+    launches = []
+
+    def popen(command, **kw):
+        launches.append(command)
+        if '--session' in command:
+            raise OSError('spawn failed')
+        return Proc()
+
+    monkeypatch.setattr(farm.subprocess, 'Popen', popen)
+    monkeypatch.setattr(farm.subprocess, 'run',
+                        lambda command, **kw: farm.subprocess.CompletedProcess(command, 0))
+    launcher = farm.OpencodeV2Launcher(root, root / 'run', executable='oc2')
+    job = _job(root)
+    first = launcher.start(job, 'PROMPT', {})
+    first.log.write_text('{"type":"step_start","sessionID":"ses_abc123"}\n', encoding='utf-8')
+    first.poll()
+    with pytest.raises(OSError):
+        launcher.resume(job, first, 'NUDGE')
+    assert not list((root / '.opencode/agents').glob('*.md'))
 
 
 def test_v2_launcher_does_not_resume_without_a_session_id(root, monkeypatch):

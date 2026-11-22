@@ -117,6 +117,7 @@ MAX_FIX_ROUNDS = 1
 MAX_AUDIT_ROUNDS = 2
 DEFAULT_STALL_MINUTES = 15   # opencode 2.x is silent while a step thinks; 8 min killed real work
 FRONTIER_LIMIT = 5000   # cmre returns smallest-first; ask for the whole queue
+CONTINUE_MIN_SECONDS = 120   # a translator is continued only with this much of its attempt left
 PY = 'py -3.13'
 
 WORKER_COMMANDS = ('brief', 'test', 'explain', 'show', 'disasm', 'family', 'work show', 'trace-check')
@@ -510,11 +511,14 @@ def translate_prompt(root, job):
 
 def continue_message(root, job):
     fn, src = job['fn'], _rel(root, job['source'])
+    seed = ('It holds the machine draft, which is translation input and usually does not build yet: '
+            'fix its build errors from the listing first.' if job.get('draft_seeded') else
+            'It holds an earlier unaccepted source, which is your starting point: check it against the '
+            'listing and repair what differs.')
     return (f'You finished without editing {src}. The farm rejects an unchanged starting source, so this '
-            'attempt has not been tested. The source is your starting point, not a result: a seeded draft '
-            'that does not build is expected. Fix its build errors from the listing, then run '
-            f'{PY} -m cmre test {fn} --c --source {src} and fix mismatches one at a time, as your '
-            'instructions say. Finish with exactly one FARM-RESULT line.')
+            f'attempt has not been tested. {seed} Then run {PY} -m cmre test {fn} --c --source {src} '
+            'and fix mismatches one at a time, as your instructions say. Finish with exactly one '
+            'FARM-RESULT line.')
 
 
 def fix_prompt(root, job):
@@ -2124,7 +2128,7 @@ class Farm:
             if infra:
                 self._infra(job, infra)
                 continue
-            if not timed_out and not stalled and self._continue(job, handle, started, still):
+            if code == 0 and self._continue(job, handle, started, still):
                 continue
             if stalled:
                 job['_stalled'] = True
@@ -2141,6 +2145,9 @@ class Farm:
         22 Nov: 18 of 75 Terra translations ended inside 3 minutes with the machine draft untouched,
         each spending a ladder rung. The continued worker keeps the attempt's original deadline."""
         if job['kind'] != 'translate' or job.get('_nudged') or job.get('_seed_from_attempt'):
+            return False
+        left = self.config.attempt_minutes * 60 - (self.clock() - started)
+        if left < CONTINUE_MIN_SECONDS or self.stopping():
             return False
         seed = job.get('_seed_bytes')
         if seed is None or _read(job['source']) != seed:
@@ -4066,15 +4073,19 @@ class OpencodeV2Launcher:
         agent = self.root / '.opencode/agents' / f'{name}.md'
         agent.parent.mkdir(parents=True, exist_ok=True)
         agent.write_text(v2_agent(self.root, job), encoding='utf-8')   # removed when the first run exited
-        self._wait_for_agent(name)
         command = [self.executable, 'run', '--session', sid, '--agent', name, '-m', job['model'],
                    '--format', 'json', message]
         flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == 'nt' else 0
         log = logs / f'{stem}.jsonl'
-        out = log.open('ab')
-        process = subprocess.Popen(command, cwd=self.root, env=dict(os.environ), stdout=out,
-                                   stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, creationflags=flags)
-        out.close()
+        try:
+            self._wait_for_agent(name)
+            with log.open('ab') as out:
+                process = subprocess.Popen(command, cwd=self.root, env=dict(os.environ), stdout=out,
+                                           stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                           creationflags=flags)
+        except BaseException:
+            agent.unlink(missing_ok=True)
+            raise
         return OpencodeV2Handle(process, log, agent, self.executable)
 
     def _wait_for_agent(self, name, attempts=30):
