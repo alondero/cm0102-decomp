@@ -607,26 +607,32 @@ before writing. Then:
   validation/application; a worker test is not evidence for that proposal.
 - Start from the draft path `cmre brief` prints, or from the source already
   in your scratch file. Check every statement against the listing.
-- A translation of 2,000 bytes or more with no earlier candidate starts with
-  the `cmre draft` output already in its scratch source. Repair that file in
-  place; a build failure of the seeded draft is the first thing to fix, not a
-  result. The next rung, and a retry after a usage limit, keep repairing the
-  same lineage. A retried candidate that only declares itself unfinished and
-  is under a quarter of the draft's size is replaced by the draft. The draft
-  is translation input, never evidence: the gate and audit decide as before.
+- A translation of 2,000 bytes or more with no accepted `recovery/c` source,
+  no earlier candidate and no resume candidate starts with the `cmre draft`
+  output already in its scratch source. Repair that file in place and still
+  check every statement against the listing; the first test run of a seeded
+  draft is a build check, and its build failures are the first thing to fix,
+  not a result. The next rung, and a retry after a usage limit, keep repairing
+  the same lineage; when that lineage's source has shrunk below a quarter of
+  the draft, the farm reseeds the draft. Outside the lineage, a retried
+  candidate is replaced by the draft only when it is that small and declares
+  itself unfinished. The draft is translation input, never evidence: the gate
+  and audit decide as before.
 - Never shape code generation to pass: no `register`, no optimize attributes,
   no volatile locals added only to change register allocation, no inline
   assembly. A frame layout or a pass at one optimization level is not evidence.
 - Unknown meaning stays unnamed. Never invent logic, defaults or initialization.
-- Five failed tests (build failures count) end the attempt. Report the first
+- Five failed tests (build failures count, except those of a seeded draft)
+  end the attempt. Report the first
   remaining mismatch on the final line; the farm escalates to a stronger model.
 - A candidate that still needs work must keep its truthful
   `UNVALIDATED CANDIDATE`, `must not be accepted` or `BLOCKER:` statement.
   The farm refuses such a source; never delete a disclaimer merely to get it
   accepted. Resolve the boundary, or leave the candidate blocked for the parent
-  input lane. A `BLOCKER:` statement parks the function as `safeguard-blocker`;
-  any other unfinished-work statement is a failed attempt that escalates to the
-  next rung and, at the top, parks as `worker-failure`.
+  input lane. A `BLOCKER:` or `must not be accepted` statement parks the
+  function as `safeguard-blocker`; an `UNVALIDATED CANDIDATE` statement alone is
+  a failed attempt that escalates to the next rung and, at the top, parks as
+  `worker-failure`.
 
 ## Audit checklist
 

@@ -4223,6 +4223,83 @@ def test_the_next_rung_keeps_repairing_the_draft_lineage(root):
     assert cmre.accepted == ['fn_00401000']
 
 
+def test_the_next_rung_is_reseeded_when_the_draft_was_replaced_by_a_stub(root):
+    # Review 2026-11-22: rung 0 overwrote the seeded draft with a small undeclared stub; rung 1 was
+    # told the file held the draft and its bundle left the draft out.
+    STUB = 'int fn_00401000(void) { return 0; }\n'
+    seen = []
+
+    def behaviour(job, root):
+        seen.append(Path(job['source']).read_text())
+        writes(STUB if job['model'] == 'm/cheap' else GOOD)(job, root)
+
+    f, cmre, launcher = draft_farm(root, 6000, behaviour)
+    drain(f)
+    second = launcher.started[1]
+    assert seen == [DRAFT, DRAFT]
+    assert second[0]['draft_seeded'] and second[0]['draft_reseeded']
+    assert 'replaced it with the machine draft' in second[1] and 'self-declared' not in second[1]
+    assert 'already in your source file' in (root / second[0]['bundle']).read_text()
+    assert cmre.accepted == ['fn_00401000']
+
+
+def test_a_draft_lineage_job_without_a_seed_starts_from_the_draft(root):
+    f, cmre, _ = draft_farm(root, 6000, writes(GOOD))
+    job = f._new_job('translate', 'fn_00401000', 'm/strong', bytes=6000)
+    job['_from_draft'] = True
+    job['_snap'] = {'c': None, 'hint': None}
+    assert f._draft_seed(job, cmre.brief('fn_00401000')) == DRAFT_REL
+
+
+def test_a_draft_path_outside_the_repository_is_not_seeded(root):
+    seen = []
+    f, cmre, launcher = draft_farm(root, 6000, seen_at_start(seen))
+    (root.parent / 'outside.c').write_text(DRAFT)
+    cmre.brief = lambda fn: 'listing\ndraft: ../outside.c  NEEDS-REVIEW: extraout_var\n'
+    drain(f)
+    assert seen[0] is None and not launcher.started[0][0].get('draft_seeded')
+
+
+def test_acceptance_refuses_a_self_disclaimed_canonical_source(root):
+    # Second line of defence: a disclaimed source reaching recovery/c is still never accepted.
+    f, _, _ = make(root, [], writes(GOOD))
+    canonical = root / 'recovery/c/fn_00401000.c'
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_text('/* UNVALIDATED CANDIDATE: loop exit not checked */\n' + GOOD)
+    job = f._new_job('translate', 'fn_00401000', 'm/cheap', bytes=200)
+    blocker = f._pre_accept_blocker(job, {'identity': {}})
+    assert blocker.startswith('BLOCKER: ') and 'UNVALIDATED CANDIDATE' in blocker
+    canonical.write_text(GOOD)
+    assert f._pre_accept_blocker(job, {'identity': {}}) is None
+
+
+def test_an_existing_canonical_source_is_kept_over_the_draft(root):
+    seen = []
+    f, cmre, launcher = draft_farm(root, 6000, seen_at_start(seen))
+    canonical = root / 'recovery/c/fn_00401000.c'
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_text(GOOD)
+    drain(f)
+    job = launcher.started[0][0]
+    assert seen[0] == GOOD and not job.get('draft_seeded')
+
+
+def test_an_interrupted_candidate_is_resumed_instead_of_the_draft(root):
+    seen = []
+    f, cmre, launcher = draft_farm(root, 6000, seen_at_start(seen))
+    saved = f.run_dir / 'retained.c'
+    saved.parent.mkdir(parents=True, exist_ok=True)
+    saved.write_bytes(GOOD.encode())
+    (f.run_dir / 'resume-candidates.json').write_text(json.dumps({
+        'schema': 'cmre-farm-resume-candidates/1',
+        'sources': {'fn_00401000': {'path': saved.name,
+                                    'sha256': hashlib.sha256(saved.read_bytes()).hexdigest()}}}))
+    drain(f)
+    job = launcher.started[0][0]
+    assert seen[0] == GOOD and job['seeded'] is True and not job.get('draft_seeded')
+    assert 'already in your source file' not in (root / job['bundle']).read_text()
+
+
 def test_a_limit_retry_keeps_repairing_the_draft_lineage(root, monkeypatch):
     # Trial 2 2026-11-21: a draft-seeded MiniMax job hit its plan limit; the retry on Terra got the
     # classic prompt with the draft repeated in its bundle and wrote a 1,460-byte stub from scratch.
@@ -4251,7 +4328,10 @@ def test_a_draft_seeded_prompt_allows_a_long_gate(root):
     f, _, launcher = draft_farm(root, 6000, writes(GOOD))
     drain(f)
     prompt = launcher.started[0][1]
-    assert 'timeout of 900000' in prompt
+    # Below the 15-minute stall window, which reads the worker log's modified time.
+    assert 'timeout of 600000' in prompt and farm.DEFAULT_STALL_MINUTES * 60 * 1000 > 600000
+    # Review 2026-11-22: repair in place still checks every statement, edited or not.
+    assert 'check every statement against the listing' in prompt
     # Trial 2026-11-21: Terra quit after the first expected build failure; MiniMax read the
     # 9,600-line capture hints file and then stalled silently.
     assert 'a build failure of the seeded draft is not a result' in prompt.lower()
@@ -4340,10 +4420,12 @@ def test_candidate_self_disclaimer_is_refused_before_the_gate(root, marker):
     assert cmre.tests == []
     assert not (root / 'recovery/c/fn_00401000.c').exists()
     detail = f.state['parked']['fn_00401000']['detail']
-    assert detail.startswith('BLOCKER:' if 'BLOCKER' in marker else 'worker self-declared unfinished:')
+    # A gate pass is exactly what "must not be accepted" says is not enough: it parks for triage.
+    parks = 'BLOCKER' in marker or 'accepted' in marker.lower()
+    assert detail.startswith('BLOCKER:' if parks else 'worker self-declared unfinished:')
     assert 'candidate self-declares' in detail
     assert farm.parked_lane('fn_00401000', detail, f.state) == (
-        'safeguard-blocker' if 'BLOCKER' in marker else 'worker-failure')
+        'safeguard-blocker' if parks else 'worker-failure')
 
 
 def x87_gate(root, cmre, outcome, *, drift=None):

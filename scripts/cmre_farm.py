@@ -440,10 +440,10 @@ def _hint_steps(root, job):
 DRAFT_SEEDED_LINES = [
     'Your source file already holds the machine draft: Ghidra pseudocode converted by cmre draft. '
     'It is translation input, not evidence, and usually does not build yet. Do not rewrite the file. '
-    'Test it first, fix the build errors, then fix mismatches one at a time, checking each edited '
-    'statement against the listing.',
+    'Test it first, fix the build errors, then fix mismatches one at a time. Repairing in place does '
+    'not narrow the review: check every statement against the listing, edited or not.',
     'The gate can take several minutes on a function this large: run each cmre test or explain with '
-    'a shell timeout of 900000 ms and wait for its result.',
+    'a shell timeout of 600000 ms and wait for its result.',
     'A build failure of the seeded draft is not a result: fix each reported error from the listing '
     '(argument counts, receivers, types) and test again.',
     'Do not read the hints file unless you are proposing inputs: for large functions it holds '
@@ -473,8 +473,9 @@ def translate_prompt(root, job):
            'iterate from test output.']),
         '',
         *_bundle_steps(job, 'the draft, the C.md rules, the worker rules'),
-        (f'2. Repair {src} in place with small edits; do not rewrite the file. Resolve every '
-         'NEEDS-REVIEW construct the brief lists from the listing.' if job.get('draft_seeded') else
+        (f'2. Repair {src} in place with small edits; do not rewrite the file. Check every statement '
+         'against the listing and resolve every NEEDS-REVIEW construct the brief lists.'
+         if job.get('draft_seeded') else
          f'2. Write {src} from the draft or the starting source below; check every statement against the listing.'),
         f'3. {PY} -m cmre test {fn} --c --source {src}',
         f'4. On a mismatch: {PY} -m cmre explain {fn} --c --source {src} --case N   then fix the first difference.',
@@ -488,8 +489,8 @@ def translate_prompt(root, job):
         p = job['prior']
         lines += ['', f'Previous attempt ({p["model"]}) failed: {p["detail"][:1500]}']
         if job.get('draft_reseeded'):
-            lines.append('It left only a self-declared partial stub, so the farm replaced it with the machine '
-                         'draft; start from the draft.')
+            lines.append('It left only a partial stub, so the farm replaced it with the machine draft; '
+                         'start from the draft.')
         elif job.get('_seed_bytes'):
             lines.append(f'Its source is already in {src}; start from it.')
         else:
@@ -1493,9 +1494,14 @@ class Farm:
             return None
         seed = job.get('_seed')
         if seed is not None:
-            stub = (candidate_disclaimer_problems(seed.decode('utf-8', errors='replace'))
-                    and len(seed) * DRAFT_STUB_FRACTION < len(draft))
+            # A seed far smaller than the draft is a stub. In the draft lineage any stub is reseeded,
+            # since the next rung is told its file holds the draft; elsewhere only a self-declared one.
+            small = len(seed) * DRAFT_STUB_FRACTION < len(draft)
+            stub = small and (job.get('_from_draft')
+                              or candidate_disclaimer_problems(seed.decode('utf-8', errors='replace')))
             return match.group(1) if stub else None
+        if job.get('_from_draft'):
+            return match.group(1)
         return None if self._has_resume_candidate(job['fn']) else match.group(1)
 
     def _has_resume_candidate(self, fn):
@@ -1825,7 +1831,8 @@ class Farm:
             # (or absence). Do not replace the dispatch snapshot with the edits.
             return f'worker hints rejected: {exc}'
         declared = candidate_disclaimer_problems(text)
-        if declared and _CANDIDATE_BLOCKER.search(text):
+        if declared and (_CANDIDATE_BLOCKER.search(text) or _CANDIDATE_MUST_NOT_ACCEPT.search(text)):
+            # A gate pass is exactly what "must not be accepted" says is not enough: triage it.
             job['_safeguard_blocker'] = True
             return 'BLOCKER: ' + '; '.join(declared)
         if declared:
