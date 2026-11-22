@@ -22,6 +22,14 @@ from . import csource, emu, env, image
 RETURN_KINDS = ("void", "int8", "int16", "int", "int64", "float")
 RETURN_MASK = {"int8": 0xFF, "int16": 0xFFFF}
 STACK_MARK = 0x5354_4B00  # canonical stand-in for any test-stack address
+STACK_GUARD_MARK = 0x5354_4700  # canonical stand-in for a stack-probe fault below the test stack
+# The pinned original stack probe (return_transport.STACK_PROBE, 47 bytes). It
+# reads one dword per page below the incoming ESP, then pushes its return word.
+STACK_PROBE = 0x00945610
+STACK_PROBE_RET = 0x0094563E
+# Its first unmapped access lies in the page just below the stack (a dword lower
+# for the return-word push); the offset inside that page is the caller's frame depth.
+GUARD_START = emu.STACK - 0x1004
 _EDX = {X.X86_REG_EDX, X.X86_REG_DX, X.X86_REG_DL, X.X86_REG_DH}
 _SCAN_LIMIT = 24
 _BITS = {

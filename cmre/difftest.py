@@ -490,7 +490,10 @@ def _normalize_semantic(result: emu.Result, amap: emu.AddressMap | None, returns
     canon = semantic.canonical
     detail, regs = result.detail, ()
     if result.outcome == "fault":
-        (access, address, size), _eip = detail
+        (access, address, size), eip = detail
+        if (access in DATA_FAULTS and semantic.STACK_PROBE <= eip <= semantic.STACK_PROBE_RET
+                and semantic.GUARD_START <= address < emu.STACK):
+            address = semantic.STACK_GUARD_MARK  # probe fault below the stack: offset is frame depth
         detail = (access, canon(address if access in DATA_FAULTS else loc(address)), size)
     elif result.outcome in semantic.INDIRECT_STOPS:
         target, _site, ecx, words, own = detail
