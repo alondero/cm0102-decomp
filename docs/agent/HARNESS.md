@@ -340,7 +340,7 @@ hide a collision. Readable/executable page collisions are not solved by this rul
 The semantic profile treats a stack-probe fault below the test stack as one
 location: a data fault whose instruction lies in the pinned original probe
 (`0x00945610..0x0094563E`) and whose address lies in the page below the stack
-(`semantic.GUARD_START`, one dword lower for the return push). The offset in that
+(`semantic.GUARD_START`; the return push faults in its last dword). The offset in that
 page is the caller's frame depth. Access class, width and every other address
 still compare raw.
 

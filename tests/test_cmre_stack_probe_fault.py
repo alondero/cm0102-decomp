@@ -6,10 +6,13 @@ read lands in the page just below it, at an offset that depends on how deep the
 caller's frame was (compiler layout). Both sides fault in the same original
 instructions with the same access class and width; only that offset differs.
 """
-from cmre import difftest, emu, semantic
+from cmre import difftest, emu, return_transport, semantic
 
-PROBE_READ = semantic.STACK_PROBE + 0x17
-PROBE_RET = semantic.STACK_PROBE_RET
+PROBE_START = 0x945610
+PROBE_READ = 0x945627
+PROBE_LAST_READ = 0x945634
+PROBE_PUSH = 0x94563D
+PROBE_RET = 0x94563E
 PAGE = 0x1000
 BELOW = emu.STACK - 0x100  # inside the page below the stack
 
@@ -31,13 +34,36 @@ def test_probe_read_below_stack_with_other_frame_depth_is_equal():
 
 
 def test_probe_return_push_write_below_stack_is_equal():
-    a = fault(20, emu.STACK - 8, 4, PROBE_RET)
-    b = fault(20, emu.STACK - 0x40, 4, PROBE_RET)
+    a = fault(20, emu.STACK - 4, 4, PROBE_PUSH)
+    b = fault(20, emu.STACK - 1, 4, PROBE_PUSH)
     assert diff(a, b) == {}
 
 
+def test_probe_range_is_pinned_to_the_original_helper():
+    assert (return_transport.STACK_PROBE, return_transport.STACK_PROBE_RET) == (PROBE_START, PROBE_RET)
+    for eip in (PROBE_START, PROBE_LAST_READ, PROBE_RET):
+        assert diff(fault(19, BELOW - 8, 4, eip), fault(19, BELOW - 0x40, 4, eip)) == {}
+
+
+def test_near_miss_instruction_just_outside_the_probe_still_differs():
+    for eip in (PROBE_START - 1, PROBE_RET + 1):
+        assert diff(fault(19, BELOW - 8, 4, eip), fault(19, BELOW - 0x40, 4, eip))["field"] == "detail"
+
+
+def test_near_miss_fetch_fault_in_the_probe_range_is_not_normalised():
+    a = fault(21, BELOW - 8, 4, PROBE_READ)
+    b = fault(21, BELOW - 0x40, 4, PROBE_READ)
+    assert diff(a, b)["field"] == "detail"
+
+
+def test_near_miss_address_just_below_the_guard_page_still_differs():
+    a = fault(19, emu.STACK - 0x1001, 4, PROBE_READ)
+    b = fault(19, emu.STACK - 4, 4, PROBE_READ)
+    assert diff(a, b)["field"] == "detail"
+
+
 def test_page_boundary_just_inside_the_guard_page_is_equal():
-    a = fault(19, emu.STACK - PAGE - 4, 4, PROBE_READ)
+    a = fault(19, emu.STACK - PAGE, 4, PROBE_READ)
     b = fault(19, emu.STACK - 4, 4, PROBE_READ)
     assert diff(a, b) == {}
 
