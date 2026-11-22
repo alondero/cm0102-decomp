@@ -703,6 +703,19 @@ raced. Only closing text that no tool call follows counts as a result; a worker
 killed at its time limit submits nothing. Provider limits pause the model
 without spending an attempt.
 
+The lane reads the farm's verdict on each request it submitted (`accepted`,
+`dismissed` or `request-failed` in the run's events). An applied request is
+final for that defect key. A refusal frees the defect at once, so it does not
+wait out the 2-hour grace period, and the next worker's prompt quotes the
+refusal. A gate pass alone is not enough, because the farm's x87 operand
+safeguard also has to prove each `cm_x87_CIpow` call is tested (22 Nov: a call
+inside a `#define`). A refusal that names a surviving operand mutant means the
+gate inputs never expose that operand. No rewrite fixes that, so the defect is
+marked `needs-inputs` in `cmre_defect_lane.py status RUN` and left for a person
+to add inputs that exercise the operand. An applied dismiss is final while the
+inputs and findings are unchanged. `status` shows these verdicts as "farm
+applied N, refused M".
+
 - `py -3.13 scripts/cmre_defect_lane.py plan RUN` lists what it would work;
   `status RUN` gives counts. While `--defect-lane-workers` is above 0, `status`
   on the farm shows `defects lane: running N, adopt A, dismiss D, unresolved U`
