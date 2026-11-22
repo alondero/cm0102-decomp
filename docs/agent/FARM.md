@@ -20,8 +20,12 @@ Confirmation remains a separate worker run, including when both auditors use Ter
 
 ## Live pipeline dashboard
 
-From the authoritative checkout, run `py -3.13 scripts/cmre_farm_dashboard.py serve`
-and open [127.0.0.1:8042](http://127.0.0.1:8042/). The read-only browser page
+A running farm serves it at [127.0.0.1:8042](http://127.0.0.1:8042/): once a minute
+it checks the port and starts `scripts/cmre_farm_dashboard.py serve` when nothing
+answers (`run --dashboard-port N` moves it, 0 disables; logs under
+`CM0102/Analysis/cmre/farm/dashboard/`). A server already on the port is left alone,
+and the farm never stops the page. By hand, from the authoritative checkout, run
+`py -3.13 scripts/cmre_farm_dashboard.py serve`. The read-only browser page
 discovers local farm runs, defaults to a live run when available, and refreshes
 every five seconds. Use `serve --run RUN` to include a run directory outside
 the default farm folder. `--port` changes the local port.

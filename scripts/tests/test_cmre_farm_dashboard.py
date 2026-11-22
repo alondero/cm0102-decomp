@@ -104,3 +104,16 @@ def test_legacy_history_reads_state_and_removes_unfinished_jobs(tmp_path):
         {'accepted': {fn: {'bytes': 80}}, 'parked': {}, 'defects': {}, 'input_needed': {}}))
     run = dashboard.Dashboard(tmp_path / 'farm', tmp_path / 'reports').overview()['run']
     assert (run['status'], run['jobs'], run['counts']['accepted_bytes']) == ('stopped', [], 80)
+
+
+def test_a_second_server_cannot_share_a_port_already_served():
+    """Review 2026-11-22: with SO_REUSEADDR, Windows lets two servers bind one listening port."""
+    import socket
+    with dashboard.ExclusiveServer(('127.0.0.1', 0), dashboard.BaseHTTPRequestHandler) as first:
+        port = first.server_port
+        try:
+            second = dashboard.ExclusiveServer(('127.0.0.1', port), dashboard.BaseHTTPRequestHandler)
+        except OSError:
+            return
+        second.server_close()
+        raise AssertionError(f'a second server bound port {port}')

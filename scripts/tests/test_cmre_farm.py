@@ -4142,6 +4142,84 @@ def test_supervisor_does_not_restart_after_the_deadline(root):
     assert len(launched) == 1
 
 
+# --- live dashboard (FARM.md "Live pipeline dashboard") --------------------------
+
+def dashboard_farm(root, port=8042, listening=False):
+    clock = {'now': 0.0}
+    f, _, _ = make(root, [], writes(GOOD), dashboard_port=port, continuous=True, hours=None)
+    f.clock = lambda: clock['now']
+    procs, state = [], {'listening': listening}
+    f.dashboard_launch = lambda command: procs.append(FakeLiftProc(command)) or procs[-1]
+    f.port_open = lambda p: state['listening']
+    return f, clock, procs, state
+
+
+def test_a_running_farm_starts_the_dashboard_when_nothing_serves_its_port(root):
+    """22 Nov: the farm ran for hours with 127.0.0.1:8042 down; nothing started the page."""
+    f, clock, procs, _ = dashboard_farm(root)
+    f.tick()
+    assert len(procs) == 1
+    command = procs[0].command
+    assert command[1].endswith('cmre_farm_dashboard.py') and command[2:5] == ['serve', '--port', '8042']
+    assert 'dashboard-start' in [e['event'] for e in events(f.run_dir)]
+    clock['now'] = 30
+    f.tick()
+    assert len(procs) == 1                       # still running: no second server
+
+
+def test_a_dashboard_that_died_is_started_again_but_not_every_tick(root):
+    f, clock, procs, _ = dashboard_farm(root)
+    f.tick()
+    procs[0].code = 1
+    clock['now'] = 10
+    f.tick()
+    assert len(procs) == 1
+    clock['now'] = 70
+    f.tick()
+    assert len(procs) == 2
+
+
+def test_an_existing_dashboard_is_left_alone_and_port_zero_disables_it(root):
+    f, clock, procs, state = dashboard_farm(root, listening=True)
+    f.tick()
+    assert procs == []
+    g, _, procs0, _ = dashboard_farm(root / 'off', port=0)
+    g.tick()
+    assert procs0 == []
+
+
+def test_a_dashboard_failure_never_stops_the_farm(root):
+    f, clock, procs, state = dashboard_farm(root)
+
+    def broken(command):
+        raise ValueError('bad command')
+    f.dashboard_launch = broken
+    f.tick()
+    failed = [e for e in events(f.run_dir) if e['event'] == 'dashboard-failed']
+    assert failed and 'bad command' in failed[0]['error']
+    f.port_open = lambda port: 1 / 0
+    clock['now'] = 70
+    f.tick()                                    # a broken check is telemetry too
+    assert len([e for e in events(f.run_dir) if e['event'] == 'dashboard-failed']) == 2
+
+
+def test_the_dashboard_is_told_about_a_run_outside_the_default_folder(root):
+    f, clock, procs, _ = dashboard_farm(root)
+    f.tick()
+    command = procs[0].command
+    assert command[command.index('--run') + 1] == str(f.run_dir)
+    default = root / 'CM0102/Analysis/cmre/farm/R1'
+    default.mkdir(parents=True)
+    f.run_dir, f.last_dashboard_check, f.dashboard_proc = default, None, None
+    f._dashboard()
+    assert '--run' not in procs[1].command
+
+
+def test_the_run_command_serves_the_dashboard_by_default(root):
+    parser_defaults = farm.run_parser_defaults()
+    assert parser_defaults['dashboard_port'] == farm.DASHBOARD_PORT == 8042
+
+
 # --- pre-accept safeguards: self-declared candidates and ADR 0010 condition 3 ---
 
 BRIDGED = ('#include "cmre.h"\n'

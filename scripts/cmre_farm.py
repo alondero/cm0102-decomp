@@ -68,6 +68,8 @@ CONTROL_KEYS = ('workers', 'audit_workers', 'min_bytes', 'max_bytes', 'ladder', 
                 'confirm_model', 'include_held', 'skip_ranges', 'attempt_minutes', 'stall_minutes',
                 'lift_lane_minutes', 'input_lane_workers', 'defect_lane_workers', 'defect_lane_model')
 SUPPLY_KEYS = ('min_bytes', 'max_bytes', 'include_held', 'skip_ranges')   # changes that reselect the frontier
+DASHBOARD_PORT = 8042           # FARM.md "Live pipeline dashboard"; `run --dashboard-port 0` disables
+DASHBOARD_CHECK_SECONDS = 60    # how often a running farm checks that the page is served
 RESTART_SECONDS = 30         # supervisor pause before relaunching a farm that died
 MAX_RESTARTS_PER_HOUR = 5    # more than this is a crash loop: stop and wake the coordinator
 # OpenCode Go has a 5-hour usage limit per account (HTTP 429, hit 2026-11-13 evening); it pauses
@@ -170,6 +172,7 @@ class FarmConfig:
     defect_lane_workers: int = 0   # open-defect workers (scripts/cmre_defect_lane.py); 0 disables
     defect_lane_model: str | None = None   # None: the lane's default model
     only: tuple = ()               # restrict the frontier to these functions (trial runs); () takes all
+    dashboard_port: int = 0        # serve the live dashboard here while the farm runs; 0: never
 
 
 def parse_ranges(text):
@@ -766,6 +769,9 @@ class Farm:
         self.input_launch = None    # callable(command) -> process; None: subprocess.Popen
         self.input_proc, self.last_input_launch = None, None
         self.input_drain = False    # an exit-when-empty farm stopped its lane to finish
+        self.dashboard_launch = None   # callable(command) -> process; None: subprocess.Popen
+        self.port_open = None          # callable(port) -> bool; None: a loopback connect
+        self.dashboard_proc, self.last_dashboard_check = None, None
         self.defect_launch = None   # callable(command) -> process; None: subprocess.Popen
         self.defect_proc, self.last_defect_launch = None, None
         self.recheck_ready = set()  # parked work stays durable until its verification finishes
@@ -2380,6 +2386,7 @@ class Farm:
         self._dispatch()
         self.save()
         self.observe()
+        self._dashboard()
 
     def _lift_lane(self):
         """Run one lift-lane pass at a time: stored captures -> expand -> apply -> cmre accept.
@@ -2512,6 +2519,41 @@ class Farm:
                                     stdout=(logs / 'lane.out').open('ab'), stderr=(logs / 'lane.err').open('ab'),
                                     creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         return popen
+
+    def _dashboard(self):
+        """Keep the live dashboard served while the farm runs.
+
+        On 22 Nov the farm ran for hours with 127.0.0.1:8042 down because only a person ever
+        started the page. A server already on the port (another farm's, or one started by hand)
+        is left alone; the farm never stops the page, so it outlives a farm restart."""
+        port = self.config.dashboard_port or 0
+        if port <= 0 or self.launcher is None:
+            return
+        if self.last_dashboard_check is not None and self.clock() - self.last_dashboard_check < DASHBOARD_CHECK_SECONDS:
+            return
+        self.last_dashboard_check = self.clock()
+        try:
+            if self.dashboard_proc is not None and self.dashboard_proc.poll() is None:
+                return
+            if (self.port_open or _port_open)(port):
+                return
+            command = [sys.executable, str(Path(__file__).resolve().parent / 'cmre_farm_dashboard.py'),
+                       'serve', '--port', str(port)]
+            default_runs = self.root / 'CM0102/Analysis/cmre/farm'
+            if self.run_dir.resolve().parent != default_runs.resolve():
+                command += ['--run', str(self.run_dir)]
+            self.dashboard_proc = (self.dashboard_launch or self._popen_dashboard)(command)
+        except Exception as exc:   # the page is telemetry: it must never stop recovery
+            self._event('dashboard-failed', port=port, error=f'{type(exc).__name__}: {exc}'[:300])
+            return
+        self._event('dashboard-start', port=port)
+
+    def _popen_dashboard(self, command):
+        logs = self.root / 'CM0102/Analysis/cmre/farm/dashboard'
+        logs.mkdir(parents=True, exist_ok=True)
+        with (logs / 'serve.out').open('ab') as out, (logs / 'serve.err').open('ab') as err:
+            return subprocess.Popen(command, cwd=self.root, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 
     def _stop_input_lane(self):
         stop = self.run_dir / 'input-lane' / 'STOP'
@@ -3978,7 +4020,7 @@ class RunLock:
         self.handle.close()
 
 
-def main(argv=None):
+def build_parser():
     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     sub = p.add_subparsers(dest='action', required=True)
     r = sub.add_parser('run', help='dispatch, gate and accept until the deadline or STOP')
@@ -4014,6 +4056,8 @@ def main(argv=None):
                    help='model workers resolving open audit defects (scripts/cmre_defect_lane.py); 0 disables')
     r.add_argument('--defect-lane-model', help='defect-lane model (default: the lane default)')
     r.add_argument('--only', help='comma-separated fn_XXXXXXXX: translate only these (trial runs)')
+    r.add_argument('--dashboard-port', type=int, default=DASHBOARD_PORT,
+                   help='serve the live dashboard on this loopback port while the farm runs; 0 disables')
     st = sub.add_parser('start', help='run the farm detached under a restart supervisor; args as for run')
     st.add_argument('run_dir')
     st.add_argument('run_args', nargs=argparse.REMAINDER)
@@ -4093,7 +4137,16 @@ def main(argv=None):
         s.add_argument('run_dir')
         if name == 'status':
             s.add_argument('--json', action='store_true')
-    a = p.parse_args(argv)
+    return p
+
+
+def run_parser_defaults():
+    """The `run` command's defaults (tests and documentation checks)."""
+    return vars(build_parser().parse_args(['run', 'RUN']))
+
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
     if a.action == 'probe':
         models = list(dict.fromkeys(m.strip() for m in a.ladder.split(',') if m.strip()))
         results = probe(models, a.opencode)
@@ -4322,7 +4375,8 @@ def main(argv=None):
                         continuous=not a.exit_when_empty, rescan_seconds=a.rescan_minutes * 60,
                         lift_lane_minutes=a.lift_lane_minutes, input_lane_workers=a.input_lane_workers,
                         defect_lane_workers=a.defect_lane_workers, defect_lane_model=a.defect_lane_model,
-                        only=tuple(fn.strip() for fn in (a.only or '').split(',') if fn.strip()))
+                        only=tuple(fn.strip() for fn in (a.only or '').split(',') if fn.strip()),
+                        dashboard_port=a.dashboard_port)
     from concurrent.futures import ThreadPoolExecutor
     with RunLock(run_dir), ThreadPoolExecutor(max_workers=max(1, a.verify_threads)) as verifier:
         (run_dir / 'STOP').unlink(missing_ok=True)
@@ -4380,6 +4434,16 @@ def _launch_farm(run_dir):
         with (run_dir / 'farm.out').open('ab') as out, (run_dir / 'farm.err').open('ab') as err:
             return subprocess.call(command, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
     return launch
+
+
+def _port_open(port, host='127.0.0.1', timeout=1.0):
+    """True when something accepts connections on the loopback port."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def supervise(run_dir, run_args, launch=None, sleep=time.sleep, clock=time.monotonic,

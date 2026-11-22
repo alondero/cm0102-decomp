@@ -310,6 +310,18 @@ def handler_for(dashboard):
     return Handler
 
 
+class ExclusiveServer(ThreadingHTTPServer):
+    """One dashboard per port. ThreadingHTTPServer sets SO_REUSEADDR, which on Windows lets a
+    second server bind a port that is already listening (review 2026-11-22)."""
+    allow_reuse_address = False
+
+    def server_bind(self):
+        import socket
+        if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='action', required=True)
@@ -327,7 +339,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     reports = LOCAL / 'farm-activity'
     if args.action == 'serve':
-        with ThreadingHTTPServer(('127.0.0.1', args.port), handler_for(Dashboard(extra_runs=args.run))) as server:
+        with ExclusiveServer(('127.0.0.1', args.port), handler_for(Dashboard(extra_runs=args.run))) as server:
             print(f'CM 01/02 pipeline dashboard: http://127.0.0.1:{server.server_port}/', flush=True)
             try:
                 server.serve_forever()
