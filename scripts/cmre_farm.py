@@ -1583,6 +1583,7 @@ class Farm:
                     job['prior'] = {'model': (previous.get('models') or ['unknown'])[-1],
                                     'detail': previous.get('detail', '')}
                     job['_seed'] = candidate
+                    job['_seed_from_attempt'] = True   # the parked attempt's candidate, unverified
                 seed = self._resume_seed(item.fn, collect=True)
                 if seed is not None:
                     # The operator must quiesce old sessions and retain hash-bound
@@ -1818,8 +1819,9 @@ class Farm:
         Runs on a verifier thread: it reads the job and calls the gate; only the canonical copy
         into recovery/c/ is written here, and the main loop restores it on failure."""
         detail = self._check_candidate(job, timed_out)
-        if detail and job.get('_late'):
-            return f"{detail} (gated after {job['_late']})"
+        if job.get('_late'):
+            # An event, not a detail suffix: parked_lane classifies details by their text.
+            self._event('late-gated', fn=job['fn'], n=job['n'], late=job['_late'], passed=detail is None)
         return detail
 
     def _check_candidate(self, job, timed_out):

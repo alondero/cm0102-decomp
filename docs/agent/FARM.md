@@ -648,8 +648,9 @@ before writing. Then:
   parks as `worker-failure`. Before 22 Nov a failing `must not be accepted`
   candidate parked without a gate: 96 of 162 safeguard parks.
 - A translation that times out or stalls after changing its source is gated
-  like any other, and a failure names the timeout ("gated after timeout ...").
-  A rung seeded with an earlier attempt's candidate may confirm it unchanged:
+  like any other; a `late-gated` event records the timeout and whether it passed.
+  A rung seeded with an earlier attempt's candidate (escalation, a `retry`, or a
+  draft kept after a limit) may confirm it unchanged:
   that candidate is gated too, and only an unchanged machine draft or existing
   source fails as "worker left the starting source unchanged". On 22 Nov
   fn_007d8120 and fn_00414420 were lost to both rules with candidates that passed.
