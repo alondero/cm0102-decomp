@@ -150,9 +150,13 @@ def test_reader_just_outside_the_probe_routine_counts():
 
 
 def test_a_rerun_that_diverges_from_the_first_run_is_not_a_hazard():
-    first = _result(events=[('c', 'x', 1, (1,))])
-    rerun = _result(events=[('c', 'x', 1, (9,))], dead=[(0, emu.STACK_TOP - 8, READER)])
-    assert _verdict(first, _result(2), tracked=rerun) == 'mismatch'
+    """Review: the read must precede the call here, or the ordering rule hides the re-run guard."""
+    dead = [(0, emu.STACK_TOP - 8, READER)]
+    first = _result(events=_READ_THEN_CALL)
+    diverged = _result(events=[('r', emu.ARENA, 4, 0), ('c', 'x', 1, (9,))], dead=dead)
+    assert _verdict(first, _result(2), tracked=diverged) == 'mismatch'
+    same = _result(events=_READ_THEN_CALL, dead=dead)
+    assert _verdict(first, _result(2), tracked=same) == 'stack-layout'
 
 
 # whole run -------------------------------------------------------------------------------
