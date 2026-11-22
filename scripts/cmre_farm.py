@@ -706,6 +706,8 @@ class Farm:
             self.state = {'schema': 'cmre-farm/1', 'started_at': time.time(), 'owner': config.owner,
                           'attempts': {}, 'accepted': {}, 'parked': {}, 'skipped': {}, 'audits': {},
                           'defects': {}, 'fix_rounds': {}, 'unavailable_models': {}}
+        if launcher is not None:
+            self.state['owner'] = config.owner
         self.state.setdefault('unavailable_models', {})
         self.state.setdefault('limited_providers', {})
         self.deadline = None if config.hours is None else clock() + config.hours * 3600
