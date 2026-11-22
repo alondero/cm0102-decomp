@@ -2770,6 +2770,109 @@ def test_auth_error_marks_model_unavailable_without_spending_an_attempt(root):
     assert farm.status_line(f.summary()).count('UNAVAILABLE') == 1
 
 
+def test_a_timed_out_worker_that_wrote_a_passing_source_is_accepted(root):
+    """22 Nov: DeepSeek wrote gate-passing sources for fn_007d8120 and fn_00414420, then timed out."""
+    now = [0.0]
+
+    def plan(job):
+        Path(job['source']).parent.mkdir(parents=True, exist_ok=True)
+        Path(job['source']).write_text(GOOD)
+        return ScriptedHandle(code=None)
+
+    f, cmre, launcher = scripted_farm(root, plan, lambda: now[0], ladder=['m/cheap'])
+    f.tick()
+    now[0] = 31 * 60
+    drain(f, 3)
+    assert launcher.handles[0].killed and cmre.accepted == ['fn_00401000']
+
+
+def test_a_stalled_worker_that_wrote_a_passing_source_is_accepted(root):
+    def plan(job):
+        Path(job['source']).parent.mkdir(parents=True, exist_ok=True)
+        Path(job['source']).write_text(GOOD)
+        return ScriptedHandle(code=None, activity=0.0)
+
+    now = [0.0]
+    f, cmre, launcher = scripted_farm(root, plan, lambda: now[0], ladder=['m/cheap'])
+    f.tick()
+    now[0] = 6 * 60                      # past stall_minutes=5, inside attempt_minutes=30
+    drain(f, 3)
+    assert launcher.handles[0].killed and cmre.accepted == ['fn_00401000']
+    late = [e for e in events(f.run_dir) if e['event'] == 'late-gated']
+    assert late and late[0]['late'].startswith('stalled') and late[0]['passed']
+
+
+def test_a_late_gate_failure_keeps_the_plain_gate_detail(root):
+    """Review 2026-11-22: a suffix on the detail broke parked_lane's budget-bound match."""
+    now = [0.0]
+
+    def plan(job):
+        Path(job['source']).parent.mkdir(parents=True, exist_ok=True)
+        Path(job['source']).write_text('int cm_fn_00401000(void) { return 1; }\n')
+        return ScriptedHandle(code=None)
+
+    f, cmre, launcher = scripted_farm(root, plan, lambda: now[0], ladder=['m/cheap'])
+    f.tick()
+    now[0] = 31 * 60
+    drain(f, 3)
+    detail = f.state['parked']['fn_00401000']['detail']
+    assert 'mismatch' in detail and 'gated after' not in detail and not detail.startswith('timeout')
+    late = [e for e in events(f.run_dir) if e['event'] == 'late-gated']
+    assert late and late[0]['late'].startswith('timeout') and not late[0]['passed']
+
+
+def test_a_retried_function_restarts_from_its_last_candidate_as_an_attempt(root):
+    def plan(job):
+        Path(job['source']).parent.mkdir(parents=True, exist_ok=True)
+        if not job.get('prior'):
+            Path(job['source']).write_text('int cm_fn_00401000(void) { return 1; }\n')
+        return ScriptedHandle(code=0)
+
+    f, cmre, launcher = scripted_farm(root, plan, lambda: 0.0, ladder=['m/cheap'])
+    drain(f, 4)
+    assert 'fn_00401000' in f.state['parked']
+    farm._request(f.run_dir, 'fn_00401000', 'retry', reason='test')
+    drain(f, 4)
+    retried = [job for job, _, _ in launcher.started][-1]
+    assert retried.get('prior') and retried.get('_seed_from_attempt')
+
+
+def test_a_timed_out_worker_with_no_new_source_still_fails_as_a_timeout(root):
+    now = [0.0]
+    f, cmre, launcher = scripted_farm(root, lambda job: ScriptedHandle(code=None), lambda: now[0],
+                                      ladder=['m/cheap'])
+    f.tick()
+    now[0] = 31 * 60
+    drain(f, 3)
+    assert cmre.accepted == [] and 'timeout after 30 min' in json.dumps(f.state['parked'])
+
+
+def test_an_escalated_candidate_is_gated_even_when_the_next_rung_leaves_it_unchanged(root):
+    """22 Nov: Terra confirmed the previous rung's passing source and was failed as 'unchanged'."""
+    def plan(job):
+        Path(job['source']).parent.mkdir(parents=True, exist_ok=True)
+        if job['model'] == 'm/cheap':
+            Path(job['source']).write_text('int cm_fn_00401000(void) { return 0; } /* mismatch */\n')
+        return ScriptedHandle(code=0)    # the second rung writes nothing: its seed is kept
+
+    f, cmre, launcher = scripted_farm(root, plan, lambda: 0.0)
+    drain(f, 8)
+    jobs = [job for job, _, _ in launcher.started]
+    assert [j['model'] for j in jobs] == ['m/cheap', 'm/strong'] and jobs[1].get('_seed_from_attempt')
+    # The second rung's unchanged seed is gated: it fails on its merits, not as "unchanged".
+    parked = json.dumps(f.state['parked'])
+    assert 'fn_00401000' in f.state['parked'] and 'unchanged' not in parked and 'mismatch' in parked
+
+
+def test_an_unchanged_seed_from_an_earlier_attempt_that_passes_is_accepted(root):
+    f, cmre, launcher = scripted_farm(root, lambda job: ScriptedHandle(code=0), lambda: 0.0, ladder=['m/cheap'])
+    job = f._new_job('translate', 'fn_00401000', 'm/cheap', 0, bytes=200)
+    job['_seed'], job['_seed_from_attempt'] = GOOD.encode(), True
+    f.pending.append(job)
+    drain(f, 3)
+    assert cmre.accepted == ['fn_00401000']
+
+
 def test_stalled_worker_is_killed_before_the_attempt_timeout(root):
     now = [0.0]
     f, cmre, launcher = scripted_farm(root, lambda job: ScriptedHandle(code=None, activity=0.0),
@@ -3591,6 +3694,7 @@ def test_a_limited_translation_keeps_its_written_draft_for_the_retry(root, monke
     f.tick()
     again = [j for j in f.pending if j['fn'] == 'fn_00401000']
     assert again and again[0]['_seed'] == draft           # as escalation carries a prior source
+    assert again[0]['_seed_from_attempt']
     assert 'fn_00401000' not in f.state['attempts']
     assert any(e['event'] == 'draft-kept' for e in events(f.run_dir))
 
