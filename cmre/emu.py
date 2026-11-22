@@ -421,6 +421,7 @@ class Machine:
         self.events.append(("c", name, n, args))
         if self.transcript is None:
             value = imports.result(self.import_seed, self.import_count, ARENA, ARENA_SIZE)
+            self._stub_outputs(name, args, value)
         else:
             try:
                 value = self.transcript.call(name, args, self._transcript_write)
@@ -430,6 +431,19 @@ class Machine:
                 return
         uc.reg_write(R.UC_X86_REG_EAX, value)
         self.import_count += 1
+
+    def _stub_outputs(self, name, args, value):
+        """Write the documented out-parameters of a successful file-search/file-time stub."""
+        def read(address, size):
+            try:
+                return bytes(self.uc.mem_read(address, size))
+            except unicorn.UcError:
+                return None
+        for address, blob in imports.outputs(name, args, value, self.import_seed, self.import_count, read):
+            try:
+                self._transcript_write(address, blob)
+            except unicorn.UcError:
+                pass
 
     def _transcript_write(self, address, blob):
         # Host writes do not trigger Unicorn memory hooks. Retain final-memory
