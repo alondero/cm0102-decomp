@@ -866,3 +866,67 @@ def test_the_lane_reads_grouped_ladders_from_control_and_dispatches_concrete_mod
     assert l.ladder == ['p/a|q/b', 'r/strong']
     l.tick()
     assert sorted(job['model'] for job, _, _ in launcher.started) == ['p/a', 'q/b']
+
+
+# --- memory bound of a varied spec -------------------------------------------------
+
+class _FakeMachine:
+    def run(self, va, case, budget):
+        import types
+        return types.SimpleNamespace(covered={1, 2}, outcome='return', detail='')
+
+
+def _fake_context(size=0x10000):
+    import types
+    opts = types.SimpleNamespace(arg_count=0, budget=1)
+    return {1, 2, 3}, opts, _FakeMachine(), [bytes([0xAA]) * size, bytes(size)]
+
+
+def _wide_spec(count):
+    # Zeroing the arena makes every variant carry ~16K dword writes, like the farm's real specs.
+    return {'fixtures': [{'name': 's', 'zero': [['0x0', '0x10000']],
+                          'vary': [{'field': 'import_seed', 'range': [0, count]}]}]}
+
+
+def _peak(count):
+    import tracemalloc
+    tracemalloc.start()
+    try:
+        probe._run_rows(0x401000, _wide_spec(count), _fake_context())
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_running_a_varied_spec_does_not_retain_every_expanded_fixture():
+    small, large = _peak(10), _peak(80)
+    assert large < small * 3, (small, large)
+
+
+def test_rows_keep_names_and_reach_for_every_expansion():
+    *_, rows = probe._run_rows(0x401000, _wide_spec(5), _fake_context())
+    assert [(r[0], r[2], r[3]) for r in rows] == [(f's#{n}', {1, 2}, 'return') for n in range(5)]
+
+
+def test_picked_fixtures_are_regenerated_identically_to_expand():
+    spec = _wide_spec(6)
+    full = probe.expand(spec, 0, _fake_context()[3])
+    assert probe.picked_fixtures(spec, [1, 4], 0, _fake_context()[3]) == [full[1][1], full[4][1]]
+
+
+def test_expansion_limit_is_the_gate_case_budget():
+    from cmre import difftest
+    assert probe.MAX_EXPANDED == difftest.DEFAULTS['cases']
+
+
+def test_a_spec_at_the_expansion_limit_runs_and_one_over_is_refused_with_advice():
+    at = probe.MAX_EXPANDED
+    spec = lambda n: {'fixtures': [{'zero': [], 'vary': [{'field': 'import_seed', 'range': [0, n]}]}]}
+    out = probe.expand(spec(at), 0, _fake_context(0x100)[3])
+    assert len(out) == at
+    with pytest.raises(ValueError, match=f'more than {at} fixtures.*gate'):
+        probe.expand(spec(at + 1), 0, _fake_context(0x100)[3])
+    with pytest.raises(ValueError, match=f'more than {at} fixtures'):
+        probe.expand({'fixtures': [{'vary': [{'field': 'import_seed', 'range': [0, 25]},
+                                             {'field': 'stack.0', 'range': [0, 25]}]}]}, 1,
+                     _fake_context(0x100)[3])
