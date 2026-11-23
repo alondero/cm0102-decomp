@@ -264,20 +264,25 @@ def _transfer_count(seed: int, index: int, requested: int) -> int:
 def _file_io_outputs(name, args, value, seed, index, read):
     """ReadFile/WriteFile byte count (and ReadFile's buffer bytes), synchronous I/O only.
 
-    Both APIs zero the count before any work, so failure writes 0. A successful
-    transfer moves 0..nNumberOfBytes bytes, and ReadFile fills lpBuffer with
-    exactly the bytes it reports. An overlapped call or a NULL count pointer
-    has no synchronous count to define."""
+    Both APIs zero the count before any work or error checking, so failure
+    writes 0 even for an overlapped call. A successful synchronous WriteFile to
+    a blocking handle writes all nNumberOfBytesToWrite; a successful ReadFile
+    moves 0..nNumberOfBytesToRead bytes and fills lpBuffer with exactly the
+    bytes it reports. A successful overlapped call has no synchronous count."""
     buffer, requested, count_ptr, overlapped = args[1], args[2], args[3], args[4]
-    if count_ptr == 0 or overlapped != 0 or read(count_ptr, 4) is None:
+    if count_ptr == 0 or read(count_ptr, 4) is None:
         return []
     if not value:
-        return [(count_ptr, bytes(4))]
+        return [(count_ptr, bytes(4))]  # zeroed before any work, overlapped or not
+    if overlapped != 0:
+        return []
+    if name == "KERNEL32.dll!WriteFile":
+        return [(count_ptr, requested.to_bytes(4, "little"))]  # a blocking disk write returning TRUE wrote it all
     n = _transfer_count(seed, index, requested)
+    if n and read(buffer, n) is None:
+        n = 0  # the buffer is not mapped: report nothing transferred
     out = [(count_ptr, n.to_bytes(4, "little"))]
-    if name == "KERNEL32.dll!ReadFile" and n:
-        if read(buffer, n) is None:
-            return []  # the buffer is not mapped: nothing can be defined
+    if n:
         data = bytearray()
         for word in range((n + 3) // 4):
             data += _mix(seed, index, 8000 + word).to_bytes(4, "little")

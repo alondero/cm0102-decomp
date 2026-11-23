@@ -73,11 +73,10 @@ def test_read_failure_writes_zero_count_only():
     assert out == [(COUNT, b"\0\0\0\0")]
 
 
-def test_read_writes_nothing_for_null_count_or_overlapped():
+def test_read_writes_nothing_for_null_count_or_overlapped_success():
     assert _call(K + "ReadFile", _read_args(512, count=0), 1, 9) == []
     assert _call(K + "ReadFile", _read_args(512, count=0), 0, 9) == []
     assert _call(K + "ReadFile", _read_args(512, overlapped=0x5000), 1, 9) == []
-    assert _call(K + "ReadFile", _read_args(512, overlapped=0x5000), 0, 9) == []
 
 
 def test_read_writes_nothing_when_the_count_pointer_is_unreadable():
@@ -90,16 +89,30 @@ def test_read_is_deterministic_and_varies_with_index():
     assert len({_count(_call(K + "ReadFile", _read_args(512), 1, 4, i)) for i in range(60)}) > 1
 
 
-def test_write_success_count_is_at_most_requested_and_failure_zero():
+def test_write_success_writes_everything_and_failure_zero():
+    for requested in (0, 1, 300, 1 << 30):
+        args = (HANDLE, BUF, requested, COUNT, 0)
+        for s in range(50):
+            assert _call(K + "WriteFile", args, 1, s) == [(COUNT, requested.to_bytes(4, "little"))]
     args = (HANDLE, BUF, 300, COUNT, 0)
-    counts = {_count(_call(K + "WriteFile", args, 1, s)) for s in range(400)}
-    assert {0, 1, 300} <= counts and max(counts) == 300
-    for s in range(50):
-        out = _call(K + "WriteFile", args, 1, s)
-        assert [a for a, _ in out] == [COUNT]
     assert _call(K + "WriteFile", args, 0, 3) == [(COUNT, b"\0\0\0\0")]
     assert _call(K + "WriteFile", (HANDLE, BUF, 300, 0, 0), 1, 3) == []
     assert _call(K + "WriteFile", (HANDLE, BUF, 300, COUNT, 0x5000), 1, 3) == []
+
+
+def test_failure_zeroes_the_count_even_with_overlapped():
+    for name in ("ReadFile", "WriteFile"):
+        out = _call(K + name, (HANDLE, BUF, 300, COUNT, 0x5000), 0, 3)
+        assert out == [(COUNT, b"\0\0\0\0")]
+        assert _call(K + name, (HANDLE, BUF, 300, 0, 0x5000), 0, 3) == []
+
+
+def test_read_with_unmapped_buffer_still_writes_a_zero_count():
+    def read(address, size):
+        return bytes(size) if COUNT <= address < COUNT + 4 else None
+    for seed in range(100):
+        out = _call(K + "ReadFile", _read_args(512), 1, seed, read=read)
+        assert out == [(COUNT, b"\0\0\0\0")]
 
 
 class _FakeUc:
