@@ -286,6 +286,13 @@ _CANDIDATE_DISCLAIMER = re.compile(r'\bUNVALIDATED\s+CANDIDATE\b', re.I)
 _CANDIDATE_BLOCKER = re.compile(r'(?<![A-Za-z0-9_])BLOCKER\s*:')
 _CANDIDATE_MUST_NOT_ACCEPT = re.compile(r'\bmust\s+not\s+be\s+accepted\b', re.I)
 _X87_BRIDGE = 'cm_x87_CIpow'
+# Workers paste the original disassembly into comments; publication withholds such sources, so
+# the farm sends the candidate back before it is gated or accepted.
+LISTING_REFUSAL = 'pasted original instruction listing in comments'
+LISTING_NUDGE = ('Your source carries a pasted address-keyed instruction listing in its comments (lines such as '
+                 '"0056f230  push esi"). Remove those listing lines from the comments without changing any code, '
+                 'keeping prose that explains the translation. Then run the gate again and finish with exactly '
+                 'one FARM-RESULT line.')
 
 
 def candidate_disclaimer_problems(text):
@@ -490,6 +497,8 @@ def translate_prompt(root, job):
     if not job.get('bundle'):
         lines += ['Read docs/agent/FARM.md section "Worker rules" once before writing.']
     lines += [
+        'Do not paste the original instruction listing, or any address-keyed instruction lines such as '
+        '"0056f230  push esi", into comments; explain the translation in prose.',
         'Everything you need is the brief, the draft it names, the C.md Rules, and the header '
         'recovery/include/cmre.h (types, CM_GLOBAL, CM_THISCALL, CM_FS). Do not search the repository, '
         'list directories or read cmre/ Python sources.',
@@ -520,6 +529,9 @@ def translate_prompt(root, job):
             lines.append(f'Its source is already in {src}; start from it.')
         else:
             lines.append('No C source was carried forward; start from the draft and write the C source.')
+        if p['detail'].startswith(LISTING_REFUSAL):
+            lines += ['Remove the address-keyed instruction listing from the comments without changing any '
+                      'code, then run the gate.']
         if p['detail'].startswith('worker self-declared unfinished'):
             lines += ['Finish the work it names. Remove its unfinished-work statement only once that work '
                       'is done and the gate passes.']
@@ -1934,9 +1946,12 @@ class Farm:
             return 'worker left the starting source unchanged'
         text = text_bytes.decode('utf-8', errors='replace')
         from cmre import publication
-        for finding in publication.candidate_listing_findings(self.root, int(fn[3:], 16), text_bytes):
+        listing = publication.candidate_listing_findings(self.root, int(fn[3:], 16), text_bytes)
+        for finding in listing:
             self._event('publication-review-needed', fn=fn, sha256=hashlib.sha256(text_bytes).hexdigest(),
                         finding=finding.kind, detail=finding.detail)
+        if listing:
+            return f'{LISTING_REFUSAL}: {listing[0].detail}'
         problems = mechanical_problems(fn, text)
         if problems:
             return 'mechanical: ' + '; '.join(problems)
@@ -2197,7 +2212,7 @@ class Farm:
         each spending a ladder rung. Also when the worker reports fail with gate runs and time to
         spare: after 19:27 that day 75 of ~100 Terra failures stopped after 1-2 of 5 gate runs.
         The continued worker keeps the attempt's original deadline."""
-        if job['kind'] != 'translate' or job.get('_nudged'):
+        if job['kind'] not in ('translate', 'fix') or job.get('_nudged'):
             return False
         left = self.config.attempt_minutes * 60 - (self.clock() - started)
         if left < CONTINUE_MIN_SECONDS or self.stopping():
@@ -2209,9 +2224,14 @@ class Farm:
             return False
         seed = job.get('_seed_bytes')
         report = getattr(handle, 'worker_report', lambda: None)() or {}
-        if (not job.get('_seed_from_attempt') and seed is not None and _read(job['source']) == seed):
+        written = _read(job['source'])
+        if (job['kind'] == 'translate' and not job.get('_seed_from_attempt') and seed is not None
+                and written == seed):
             reason, message = 'unchanged', continue_message(self.root, job)
-        elif ((report.get('result') or '').startswith('FARM-RESULT: fail')
+        elif ((report.get('result') or '').startswith('FARM-RESULT: pass') and written is not None
+              and written != seed and self._pasted_listing(job, written)):
+            reason, message = 'listing', LISTING_NUDGE
+        elif (job['kind'] == 'translate' and (report.get('result') or '').startswith('FARM-RESULT: fail')
               and 'BLOCKER' not in report['result']   # a named blocker is the worker's result
               and report.get('gate_runs', GATE_RUN_BUDGET) < GATE_RUN_BUDGET
               and left >= EARLY_FAIL_MIN_SECONDS):
@@ -2232,6 +2252,10 @@ class Farm:
                     gate_runs=report.get('gate_runs'), minutes=round((self.clock() - started) / 60, 1))
         still.append((job, again, started))
         return True
+
+    def _pasted_listing(self, job, raw):
+        from cmre import publication
+        return bool(publication.candidate_listing_findings(self.root, int(job['fn'][3:], 16), raw))
 
     def _x87_evidence_path(self, job, digest):
         """Deterministic, hash-bound receipt location for one job's operand mutants."""
