@@ -540,18 +540,25 @@ class ToolchainEnvironmentError(RuntimeError):
 
 # A toolchain that fails for a real reason prints a diagnostic. Exiting non-zero
 # with no text, or reporting resource exhaustion, means the host failed.
+# Only lines the toolchain itself prints count: diagnostics echo source lines, so
+# resource words elsewhere in stderr say nothing about the host.
 _ENVIRONMENT_STDERR = re.compile(
-    r'out of memory|virtual memory exhausted|cannot allocate memory|no space left|not enough (?:memory|space)'
-    r"|insufficient (?:system )?resources|(?:cannot|can't|unable to) (?:create|open|write) temporary|cannot fork"
-    r'|resource temporarily unavailable|disk full|no memory', re.I)
+    r'^(?:\S*[\\/])?(?:cc1(?:plus)?|gcc|g\+\+|ld|as|nm|collect2)(?:\.exe)?: .*'
+    r"(?:out of memory|virtual memory exhausted|cannot allocate memory|no space left|not enough (?:memory|space)"
+    r"|insufficient (?:system )?resources|(?:cannot|can't|unable to) (?:create|open|write) temporary"
+    r"|cannot fork|resource temporarily unavailable)", re.I | re.M)
 
 
 def _environmental(stderr: str) -> bool:
-    return not stderr.strip() or bool(_ENVIRONMENT_STDERR.search(stderr))
+    return not stderr.strip() or bool(_ENVIRONMENT_STDERR.search(stderr.lstrip()))
 
 
 def toolchain_failure(report: dict) -> str | None:
-    """Describe an environmental toolchain failure in a test report, else None."""
+    """Describe an environmental toolchain failure in a test report, else None.
+
+    One environmental build among several makes the whole report environmental,
+    even if another optimisation level shows a mismatch: the item is retried.
+    """
     for problem in report.get('problems') or []:
         if isinstance(problem, str) and problem.startswith('assembler:') and _environmental(problem[len('assembler:'):]):
             return problem
@@ -567,6 +574,9 @@ def execute_item(va: int, tier: str, refresh: bool) -> tuple[bool, str]:
     record = read(ledger.record_path(va))
     if refresh and (tier == 'c' or not record.get('c')):
         ok, report = recover.accept(va, tier, refresh=True)
+        failure = None if ok else toolchain_failure(report)
+        if failure:  # accept returns before writing a ledger record on a failed test
+            raise ToolchainEnvironmentError(failure)
         return ok, report.get('status', 'unknown')
     report = recover.test_c(va, fresh=True) if tier == 'c' else recover.test_lifted(va, fresh=True)
     if report['status'] != 'pass':

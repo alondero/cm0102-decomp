@@ -642,7 +642,7 @@ def _c_report(stderr, detail='compile failed: fn_00000001.c'):
             'builds': {'-O0': {'status': 'build-failed', 'detail': detail, 'stderr': stderr}}}
 
 
-@pytest.mark.parametrize('problem', ['assembler: ', 'assembler: fatal error: can\'t create temporary file: No space left on device',
+@pytest.mark.parametrize('problem', ['assembler: ', 'assembler: gcc.exe: fatal error: can\'t create temporary file: No space left on device',
                                      'assembler: cc1.exe: out of memory allocating 65536 bytes'])
 def test_environmental_assembler_failure_is_inconclusive_error(monkeypatch, problem):
     out = _wire_execute(monkeypatch, 'lifted', {'status': 'lift-blocked', 'problems': [problem]})
@@ -678,3 +678,45 @@ def test_spawn_failures_are_inconclusive_exceptions(monkeypatch):
         raise OSError(12, 'Cannot allocate memory')
     out = _wire_execute(monkeypatch, 'lifted', boom)
     assert out['detail'].startswith('OSError') and out['inconclusive'] is True
+
+
+def test_refresh_path_classifies_environmental_failure(monkeypatch):
+    report = _c_report('')
+    monkeypatch.setattr(recover, 'accept', lambda va, tier, refresh=False: (False, report))
+    monkeypatch.setattr(v, 'worker_identity', lambda: {})
+    monkeypatch.setattr(v, 'snapshot', lambda va, t, deps: {'x': 1})
+    monkeypatch.setattr(v, 'read', lambda path: {'c': {'source_sha256': 'h'}})
+    out = v.execute(_item('c'), v.digest({}), True)
+    assert out['inconclusive'] is True and out['detail'].startswith('ToolchainEnvironmentError')
+
+
+def test_refresh_path_keeps_genuine_failure(monkeypatch):
+    monkeypatch.setattr(recover, 'accept', lambda va, tier, refresh=False: (False, _c_report("fn.c:1:1: error: boom")))
+    monkeypatch.setattr(v, 'worker_identity', lambda: {})
+    monkeypatch.setattr(v, 'snapshot', lambda va, t, deps: {'x': 1})
+    monkeypatch.setattr(v, 'read', lambda path: {'c': {'source_sha256': 'h'}})
+    out = v.execute(_item('c'), v.digest({}), True)
+    assert out['detail'] == 'fail' and not out['inconclusive']
+
+
+ECHO = "fn.c:7:9: error: expected ';'\n    7 |   puts(\"out of memory\")\n      |         ^\n"
+
+
+def test_echoed_source_line_with_resource_text_is_not_environmental(monkeypatch):
+    out = _wire_execute(monkeypatch, 'c', _c_report(ECHO))
+    assert out['detail'] == 'fail' and not out['inconclusive']
+    out = _wire_execute(monkeypatch, 'lifted', {'status': 'lift-blocked', 'problems': ['assembler: ' + ECHO]})
+    assert out['detail'] == 'lift-blocked' and not out['inconclusive']
+
+
+def test_link_failure_with_real_diagnostic_stays_fail(monkeypatch):
+    out = _wire_execute(monkeypatch, 'c', _c_report('ld.exe: x.o: undefined reference to `foo\'', 'link failed: fn.c'))
+    assert out['detail'] == 'fail' and not out['inconclusive']
+
+
+def test_mixed_environmental_and_mismatch_is_environmental_and_retried(monkeypatch):
+    report = {'status': 'fail', 'source_sha256': 'h', 'problems': [], 'builds': {
+        '-O0': {'status': 'build-failed', 'detail': 'compile failed: fn.c', 'stderr': ''},
+        '-O2': {'status': 'fail', 'difftest': {}}}}
+    out = _wire_execute(monkeypatch, 'c', report)
+    assert out['inconclusive'] is True and out['detail'].startswith('ToolchainEnvironmentError')
