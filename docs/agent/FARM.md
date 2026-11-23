@@ -40,7 +40,8 @@ the default farm folder. `--port` changes the local port.
   plus idle translation slots indicates a supply constraint. Compare that with
   the gate, writer, and audit queues before changing concurrency. Use the farm's
   `set RUN` command to tune a running farm. Settings apply at the start of the
-  next scheduler tick, which can be delayed by serial acceptance.
+  next scheduler tick, which can be delayed by serial acceptance. Each tick starts no new acceptance after `ACCEPT_TICK_SECONDS` (60 s) of farm-clock time,
+  but always finishes at least one, and leaves the rest of the queue in order for the next tick.
 - **Supply inventory** shows workspace-wide authored, lifted, and unlifted body
   bytes and the largest evidence and harness blocker families. It refreshes
   independently every minute. The selected run's frontier also reflects its
@@ -382,7 +383,12 @@ Coordinator procedure:
    (default MiniMax M3.1 Flash → DeepSeek v4.1 Flash `#low` via Go → `#low` via
    Command Code → default effort via Go → default effort via Command Code →
    GPT-6.1 Terra via OpenAI;
-   MiniMax M3 passed 3 of 13 on 2026-11-13 and is off the ladder). DeepSeek runs
+   MiniMax M3 passed 3 of 13 on 2026-11-13 and is off the ladder).
+   A rung may mix providers with `|`, e.g. `--ladder a/x|b/y,c/strong`: each job
+   takes the available member with the fewest running jobs (ties by order), a
+   limited or retired member's share goes to the others, and the rung counts as
+   paused by a usage limit only when every live member is limited. The input lane
+   gets the same groups. Job records keep the concrete model. DeepSeek runs
    use v4.1 Flash. `--audit-model` defaults to `openai/gpt-6.1-terra`; when the
    preferred auditor is limited or retired, the last available ladder rung audits.
    `--stall-minutes` (default 15) kills a worker whose transcript stops growing.
@@ -776,6 +782,12 @@ New lifts reach the C translators on the next frontier rescan.
   function is gated once first, and if that gate passes it is accepted with no
   model call. Each function gets three attempts per canonical-hint state, one
   ladder rung each. Each later attempt starts from the best spec so far.
+  Only attempts made under the current harness digest (`cmre.recover.harness_digest()`,
+  recorded on every attempt) count toward the three and pick the ladder rung, so a
+  harness release re-opens exhausted functions, and a `fail`, `error` or
+  `lift-blocked` row set under an older harness is re-screened once. Accepted rows
+  stay done. An idle lane re-scans candidates at most once a minute (at once after a
+  gate result or accept); a busy lane every ten minutes.
 - Skipped: hard work holds, blocked records, lift `lift-blocked`, `fail` and
   `error`. A mismatch found with authored inputs is recorded in
   `RUN/input-lane/state.json` for triage and is never reshaped away.

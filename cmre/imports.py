@@ -3,8 +3,8 @@
 A stub only has to be identical on the original and recovered sides; it is not a
 model of Windows. It records the call (name + stdcall arguments) as an ordered
 event, returns a value derived from the case seed, and pops the documented
-stdcall argument count. A successful FindFirstFileA/FindNextFileA/FileTimeTo*
-call also writes its documented output structure (see `outputs`), so neither side
+stdcall argument count. A successful FindFirstFileA/FindNextFileA/FileTimeTo* call (and ReadFile/WriteFile byte counts)
+also writes its documented output structure (see `outputs`), so neither side
 reads stack garbage from the buffer. Terminal imports end the case instead.
 Never use these values as evidence of game behaviour.
 """
@@ -107,23 +107,98 @@ def _mix(seed: int, index: int, salt: int) -> int:
     return h ^ (h >> 15)
 
 
-def find_data(seed: int, index: int) -> bytes:
-    """A valid WIN32_FIND_DATAA chosen only by (seed, call index): documented layout.
+_NAME_CHARS = b"abcdefghijklmnopqrstuvwxyz0123456789"
 
-    Times are valid FILETIMEs, the name is NUL-terminated and fits 8.3, so
-    cAlternateFileName stays empty. Test scaffolding, not a file system."""
-    kind = _mix(seed, index, 1) % 8
+
+def _file_size(h: int) -> int:
+    """nFileSizeLow from the same 0 / 1 / small / full-dword mix as `result`."""
+    kind = h & 3
     if kind < 2:
+        return kind
+    return (h >> 4) % 0x10000 if kind == 2 else h
+MAX_PATH = 260
+
+
+def _plain_match(name: bytes, pattern: bytes) -> bool:
+    """`*` = any run, `?` = exactly one byte, other bytes literal (case-sensitive).
+
+    Trailing dots and spaces are dropped from the pattern first, as Windows does."""
+    import fnmatch
+    stripped = pattern.rstrip(b". ")
+    return bool(stripped) and fnmatch.fnmatchcase(name.decode("latin-1"),
+                                                  stripped.decode("latin-1").replace("[", "[[]"))
+
+
+MAX_NAME = 255  # longest file-name component (NAME_MAX)
+
+
+def _pattern_name(seed: int, index: int, pattern: bytes) -> bytes | None:
+    """A name that plainly matches `pattern`, or None when no legal name can.
+
+    `pattern` is already trimmed by `_usable_pattern`. The name is never empty, never
+    ends in a dot or space (Windows strips them), and is at most MAX_NAME bytes."""
+    out = bytearray()
+    for position, char in enumerate(pattern):
+        if char == 0x2A:      # '*': zero to eight seeded bytes
+            count = _mix(seed, index, 100 + 2 * position) % 9
+            if count == 0 and not out and not pattern[position + 1:].replace(b"*", b""):
+                count = 1     # nothing else can supply a character: keep the name non-empty
+            for k in range(count):
+                out.append(_NAME_CHARS[_mix(seed, index, 1000 + 16 * position + k) % len(_NAME_CHARS)])
+        elif char == 0x3F:    # '?': exactly one seeded byte
+            out.append(_NAME_CHARS[_mix(seed, index, 101 + 2 * position) % len(_NAME_CHARS)])
+        else:
+            out.append(char)
+    if out[-1:] in (b".", b" "):
+        if pattern[-1:] != b"*":
+            return None
+        # A trailing '*' that expanded to nothing after a literal dot: add one seeded byte.
+        out.append(_NAME_CHARS[_mix(seed, index, 1000 + 16 * len(pattern) + 8) % len(_NAME_CHARS)])
+    return bytes(out) if len(out) <= MAX_NAME else None
+
+
+# DOS wildcards and characters Windows rejects in a file name: such a pattern cannot constrain names.
+_ILLEGAL_PATTERN_BYTES = frozenset(b'<>"|:\\/') | frozenset(range(0x20))
+
+
+def _usable_pattern(pattern: bytes) -> bytes | None:
+    """The pattern once trailing dots/spaces are dropped; None when it cannot constrain names."""
+    if set(pattern) & _ILLEGAL_PATTERN_BYTES:
+        return None
+    return pattern.rstrip(b". ") or None
+
+
+def find_data(seed: int, index: int, pattern: bytes | None = None) -> bytes:
+    """A valid WIN32_FIND_DATAA chosen only by (seed, call index[, pattern]): documented layout.
+
+    With a search pattern (the final lpFileName component), the name matches it,
+    as FindFirstFileA/FindNextFileA document. Without one the name is unconstrained.
+    Times are valid FILETIMEs and cAlternateFileName stays empty (a volume may omit
+    8.3 names). Test scaffolding, not a file system."""
+    if pattern is not None:
+        pattern = _usable_pattern(pattern)
+    kind = _mix(seed, index, 1) % 8
+    # "." and ".." are listed only for a `*` or literal-dot pattern (not `?`), and are directories.
+    dot_listed = kind < 2 and (pattern is None
+                               or (pattern[:1] in (b"*", b".") and _plain_match((b".", b"..")[kind], pattern)))
+    if dot_listed:
         name, attrs = (b".", b"..")[kind], 0x10
-    else:
+    elif pattern is None:
         name = b"F%07X.DAT" % (_mix(seed, index, 2) & 0xFFFFFFF)
         attrs = (0x10, 0x20, 0x01, 0x80)[_mix(seed, index, 3) % 4]
         if attrs == 0x10:
             name = name[:8]
+    else:
+        name = _pattern_name(seed, index, pattern)
+        if name is None:  # no legal name can match: search without the constraint
+            return find_data(seed, index)
+        attrs = (0x10, 0x20, 0x01, 0x80)[_mix(seed, index, 3) % 4]
+    if name in (b".", b".."):
+        attrs = 0x10
     times = b"".join(
         (0x01C00000_00000000 + (_mix(seed, index, 4 + i) << 20) + _mix(seed, index, 8 + i)).to_bytes(8, "little")
         for i in range(3))
-    size = 0 if attrs == 0x10 else _mix(seed, index, 12)
+    size = 0 if attrs == 0x10 else _file_size(_mix(seed, index, 12))
     out = (attrs.to_bytes(4, "little") + times + (0).to_bytes(4, "little") + size.to_bytes(4, "little")
            + bytes(8) + name + b"\0")
     return out + bytes(FIND_DATA_SIZE - len(out))
@@ -151,16 +226,94 @@ def systemtime(filetime: int) -> bytes | None:
     return b"".join(f.to_bytes(2, "little") for f in fields)
 
 
-def outputs(name: str, args: tuple, value: int, seed: int, index: int, read) -> list[tuple[int, bytes]]:
+def search_pattern(read, address: int) -> bytes | None:
+    """The final path component of the NUL-terminated lpFileName, or None if unreadable."""
+    raw = bytearray()
+    while len(raw) < MAX_PATH:
+        byte = read(address + len(raw), 1)
+        if byte is None:
+            return None
+        if byte == b"\0":
+            break
+        raw += byte
+    else:
+        return None
+    component = bytes(raw).replace(b"/", b"\\").rsplit(b"\\", 1)[-1].rsplit(b":", 1)[-1]
+    if set(component) & _ILLEGAL_PATTERN_BYTES:
+        return None
+    return component or None
+
+
+IO_BUFFER_CAP = 64 * 1024  # largest ReadFile transfer the stub will define
+
+
+def _transfer_count(seed: int, index: int, requested: int) -> int:
+    """0 / 1 / small / full byte count, never above `requested` or IO_BUFFER_CAP."""
+    cap = min(requested, IO_BUFFER_CAP)
+    h = _mix(seed, index, 7001)
+    kind = h & 3
+    if kind == 0 or cap == 0:
+        return 0
+    if kind == 1:
+        return 1
+    if kind == 2:
+        return 1 + (h >> 4) % cap
+    return cap
+
+
+def _file_io_outputs(name, args, value, seed, index, read):
+    """ReadFile/WriteFile byte count (and ReadFile's buffer bytes), synchronous I/O only.
+
+    Both APIs zero the count before any work or error checking, so failure
+    writes 0 even for an overlapped call. A successful synchronous WriteFile to
+    a blocking handle writes all nNumberOfBytesToWrite; a successful ReadFile
+    moves 0..nNumberOfBytesToRead bytes and fills lpBuffer with exactly the
+    bytes it reports. A successful overlapped call has no synchronous count."""
+    buffer, requested, count_ptr, overlapped = args[1], args[2], args[3], args[4]
+    if count_ptr == 0 or read(count_ptr, 4) is None:
+        return []
+    if not value:
+        return [(count_ptr, bytes(4))]  # zeroed before any work, overlapped or not
+    if overlapped != 0:
+        return []
+    if name == "KERNEL32.dll!WriteFile":
+        return [(count_ptr, requested.to_bytes(4, "little"))]  # a blocking disk write returning TRUE wrote it all
+    n = _transfer_count(seed, index, requested)
+    if n and read(buffer, n) is None:
+        n = 0  # the buffer is not mapped: report nothing transferred
+    out = [(count_ptr, n.to_bytes(4, "little"))]
+    if n:
+        data = bytearray()
+        for word in range((n + 3) // 4):
+            data += _mix(seed, index, 8000 + word).to_bytes(4, "little")
+        out.append((buffer, bytes(data[:n])))
+    return out
+
+
+def outputs(name: str, args: tuple, value: int, seed: int, index: int, read,
+            patterns: dict | None = None) -> list[tuple[int, bytes]]:
     """Documented out-parameter writes for a successful call: [(address, bytes)].
 
-    `read(address, size)` returns bytes, or None when unmapped. A failed call
+    `read(address, size)` returns bytes, or None when unmapped. A failed file-search/file-time call
     writes nothing (the API leaves its output unspecified). Only the file-search
-    and file-time imports are covered; every other stub writes nothing."""
+    file-time and ReadFile/WriteFile imports are covered; every other stub writes nothing.
+    `patterns` maps a successful FindFirstFileA handle to its search pattern for
+    this case, so FindNextFileA continues the same search."""
+    if name in ("KERNEL32.dll!ReadFile", "KERNEL32.dll!WriteFile"):
+        return _file_io_outputs(name, args, value, seed, index, read)
     if name == "KERNEL32.dll!FindFirstFileA":
-        return [(args[1], find_data(seed, index))] if value != 0xFFFFFFFF else []
+        if value == 0xFFFFFFFF:
+            return []
+        pattern = search_pattern(read, args[0])
+        if patterns is not None:
+            if pattern is None:
+                patterns.pop(value, None)  # this search is unconstrained: drop any earlier pattern on the handle
+            else:
+                patterns[value] = pattern
+        return [(args[1], find_data(seed, index, pattern))]
     if name == "KERNEL32.dll!FindNextFileA":
-        return [(args[1], find_data(seed, index))] if value else []
+        pattern = patterns.get(args[0]) if patterns is not None else None
+        return [(args[1], find_data(seed, index, pattern))] if value else []
     if not value or name not in ("KERNEL32.dll!FileTimeToLocalFileTime", "KERNEL32.dll!FileTimeToSystemTime"):
         return []
     raw = read(args[0], 8)

@@ -41,6 +41,7 @@ ATTEMPT_MINUTES = 30
 STALL_MINUTES = 15
 INFRA_PAUSE_SECONDS = 3600   # auth/key failure: pause the provider, retry hourly in case it is renewed
 CANDIDATE_REFRESH_SECONDS = 600
+IDLE_REFRESH_SECONDS = 60     # an idle lane re-scans (about 7 s of CPU) at most this often
 SCREEN_JOBS = 2
 SKIP_STATUSES = ('lift-blocked', 'fail', 'error', 'not-unlifted')
 WORKER_COMMANDS = ('brief', 'test', 'explain', 'show', 'disasm', 'family', 'work show')
@@ -100,20 +101,34 @@ def _save(path, state):
     os.replace(tmp, path)
 
 
-def plan(candidates, rows, active=()):
+def current_attempts(row, harness):
+    """Attempts made under this harness digest. Attempts with no digest predate the field."""
+    if harness is None:
+        return list(row.get('attempts', []))
+    return [a for a in row.get('attempts', []) if a.get('harness') == harness]
+
+
+def plan(candidates, rows, active=(), harness=None):
     """Functions to work, best first: near the coverage threshold, then larger.
 
     candidates: {fn: {'bytes', 'coverage' (None if never gated), 'key', 'status'}}.
-    A function is skipped while active, after MAX_ATTEMPTS at its current hint key,
-    or when its lifted gate cannot be helped by inputs (blocked lift, mismatch, error)."""
+    A function is skipped while active, after MAX_ATTEMPTS at its current hint key and
+    harness digest, or when its lifted gate cannot be helped by inputs (blocked lift,
+    mismatch, error). A terminal status set under an older harness reopens (the screen
+    re-runs it once); `accepted` stays done. harness=None ignores digests."""
     todo = []
     for fn, info in candidates.items():
         row = rows.get(fn, {})
         if fn in active or info.get('status') in SKIP_STATUSES:
             continue
-        if row.get('key') == info['key'] and (len(row.get('attempts', [])) >= MAX_ATTEMPTS
-                                              or row.get('status') in SKIP_STATUSES + ('accepted', 'pass-unaccepted')):
-            continue
+        if row.get('key') == info['key']:
+            status = row.get('status')
+            if status in ('accepted', 'pass-unaccepted'):
+                continue
+            if status in SKIP_STATUSES and (harness is None or row.get('harness') == harness):
+                continue
+            if len(current_attempts(row, harness)) >= MAX_ATTEMPTS:
+                continue
         coverage = info.get('coverage')
         band = round(coverage, 1) if coverage is not None else -1.0
         todo.append((-band, -info['bytes'], fn))
@@ -244,6 +259,8 @@ class Lane:
         self.running = []          # (job, handle, started)
         self.gating = []           # (job, claimed, interrupted, future)
         self.candidates, self.refreshed = {}, None
+        self.harness = None        # harness digest, read once per refresh
+        self.wake = False          # work may have appeared (a gate result or accept): rescan an idle lane now
         self.queue = []
 
     # bookkeeping
@@ -289,27 +306,36 @@ class Lane:
         self.state['limited'][key] = self.clock() + seconds
 
     def _model(self, attempt):
-        for model in self.ladder[min(attempt, len(self.ladder) - 1):] if self.ladder else []:
-            if self._available(model):
-                return model
+        """The least busy available model of the first rung at or above the attempt that has one;
+        a rung is a group `a|b`, a plain model a group of one."""
+        for entry in self.ladder[min(attempt, len(self.ladder) - 1):] if self.ladder else []:
+            usable = [m for m in (g.strip() for g in entry.split('|')) if m and self._available(m)]
+            if usable:
+                return min(usable, key=lambda m: sum(1 for job, _, _ in self.running if job['model'] == m))
         return None
 
     def _busy(self):
         return {job['fn'] for job, _, _ in self.running} | {job['fn'] for job, _, _, _ in self.gating}
 
     # candidates
-    def refresh(self, force=False):
-        if not force and self.refreshed is not None and self.clock() - self.refreshed < CANDIDATE_REFRESH_SECONDS:
+    def refresh(self, force=False, idle=False):
+        period = IDLE_REFRESH_SECONDS if idle else CANDIDATE_REFRESH_SECONDS
+        if not force and self.refreshed is not None and self.clock() - self.refreshed < period:
             return
-        self.refreshed = self.clock()
+        self.refreshed, self.wake = self.clock(), False
+        self.harness = self.ops.harness_digest()
         self.candidates = self.ops.candidates()
         if self.only is not None:
             self.candidates = {fn: info for fn, info in self.candidates.items() if fn in self.only}
         for fn, info in self.candidates.items():
             row = self.state['functions'].get(fn, {})
-            if row.get('key') == info['key'] and info.get('coverage') is None and row.get('coverage') is not None:
+            if row.get('key') != info['key']:
+                continue
+            if row.get('status') in SKIP_STATUSES and row.get('harness') != self.harness:
+                info['coverage'] = None   # settled under an older harness: the screen runs it again
+            elif info.get('coverage') is None and row.get('coverage') is not None:
                 info['coverage'] = row['coverage']   # this lane's own screen of the same hints
-        self.queue = plan(self.candidates, self.state['functions'], self._busy())
+        self.queue = plan(self.candidates, self.state['functions'], self._busy(), self.harness)
 
     def _screen(self, fn):
         """A never-gated function is gated once on its canonical hints before any model time."""
@@ -319,11 +345,16 @@ class Lane:
         row = self.state['functions'].setdefault(fn, {})
         if row.get('key') != info['key']:
             row.clear()
-        row.update(key=info['key'], screened=report.get('status'), coverage=report.get('coverage'))
+        if row.get('status') in SKIP_STATUSES and row.get('harness') != self.harness:
+            for stale in ('status', 'mismatches', 'screen_errors'):
+                row.pop(stale, None)   # reopened by a harness release: judge it afresh
+        row.update(key=info['key'], harness=self.harness, screened=report.get('status'),
+                   coverage=report.get('coverage'))
         if report.get('status') == 'pass':
             outcome = self.ops.accept(fn)
             row['status'] = 'accepted' if outcome == 'accepted' else 'pass-unaccepted'
             row['accept'] = outcome
+            self.wake = True
             self.event('screen-accept', fn=fn, outcome=outcome, bytes=info['bytes'])
             return False
         if report.get('status') != 'low-coverage':
@@ -362,7 +393,7 @@ class Lane:
                 row.clear()
                 row['key'] = info['key']
             attempts = row.setdefault('attempts', [])
-            model = self._model(len(attempts))
+            model = self._model(len(current_attempts(row, self.harness)))
             if model is None:
                 return   # every remaining rung is limited: wait
             self.queue.pop(0)
@@ -377,7 +408,7 @@ class Lane:
             job = {'fn': fn, 'n': n, 'kind': 'inputs', 'model': model, 'bytes': info['bytes'],
                    'coverage': info.get('coverage'), 'threshold': info.get('threshold', 0.6),
                    'spec': str(spec), 'hints_sha256': info['hints_sha256'], 'key': info['key'],
-                   'seed_sha256': hashlib.sha256(seed).hexdigest()}
+                   'seed_sha256': hashlib.sha256(seed).hexdigest(), 'harness': self.harness}
             if best:
                 job['prior'] = {'model': best.get('model'), 'coverage': best.get('coverage'),
                                 'detail': best.get('detail', '')}
@@ -469,6 +500,7 @@ class Lane:
         self.state['limited'][model.split('/', 1)[0]] = self.clock() + seconds
 
     def _worker_done(self, job, handle, interrupted):
+        self.wake = True   # a worker ended: its function may return to the queue on the next refresh
         # Limits first, as in the farm: a quota limit can also match the infra pattern.
         if self._record_limit(job, handle):
             if not self._spec_changed(job):
@@ -521,8 +553,10 @@ class Lane:
             self.refreshed = None
             self.save()
             return
+        self.wake = True
         attempt = {'n': job['n'], 'model': job['model'], 'status': status, 'coverage': coverage,
-                   'claimed': claimed, 'interrupted': interrupted, 'at': self.clock()}
+                   'claimed': claimed, 'interrupted': interrupted, 'at': self.clock(),
+                   'harness': job.get('harness', self.harness)}
         row.setdefault('attempts', []).append(attempt)
         best = row.get('best')
         if coverage is not None and status in ('low-coverage', 'pass') and (
@@ -538,6 +572,7 @@ class Lane:
             self._apply(fn, row, pending)
         elif status == 'fail':
             row['status'] = 'fail'
+            row['harness'] = attempt['harness']
             row['mismatches'] = result.get('mismatches', [])[:3]
             self.event('lift-mismatch', fn=fn, mismatches=row['mismatches'])
         self.save()
@@ -546,6 +581,7 @@ class Lane:
         outcome = self.ops.apply(fn, pending['expected'], Path(pending['proposal']),
                                  proposal_sha256=pending.get('sha256'))
         row['accept'] = outcome
+        self.wake = True
         if outcome == 'accepted':
             row['status'] = 'accepted'
             row.pop('pending_apply', None)
@@ -570,7 +606,8 @@ class Lane:
         self.collect()
         self.process_gates()
         self.retry_applies()
-        self.refresh(force=not self.queue and not self.running and not self.gating)
+        idle = not self.queue and not self.running and not self.gating
+        self.refresh(force=idle and self.wake, idle=idle)
         self.dispatch()
         self.save()
 
@@ -632,6 +669,10 @@ class CmreOps:
             except (OSError, ValueError):
                 return {}
         return data.get('functions', {})
+
+    def harness_digest(self):
+        from cmre import recover
+        return recover.harness_digest()
 
     def candidates(self):
         """Unlifted inventory functions with no hard work hold, and their last known coverage."""

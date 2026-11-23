@@ -1,11 +1,15 @@
-/* WIP: semantic import-order mismatch in downstream original cleanup, case120.
-   See the shutdown-stale-stack-attributes work hold; do not tune the C frame. */
-#include "cmre.h"
 /* Preferred-image VA 0x005cc6d0, base 0x00400000, CM0102 3.9.68.
    SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
-   The second construction leaves SEH state one until the frame is unlinked. */
+   SEH record {prev, handler, state} at 0x005cc6d6-0x005cc6de; state is read
+   as a dword at [esp+0x10] and [esp+0x14] only, never decides control flow.
+   The second construction leaves SEH state 1 until the frame is unlinked
+   (0x005cc76b .. 0x005cc7b7), exactly as the original does; no store restores
+   it to -1. Boundary: the caller's exit cleanup (0x009468xx/0x009469xx) runs
+   after this routine returns and is reached through the caller's own frame, so
+   its import selection is not part of this routine's contract. */
+#include "cmre.h"
 extern u32 CM_FASTCALL cm_fn_005d72c0(u32);
-extern u32 CM_FASTCALL cm_fn_005ef0b0(u32);
+extern u32 CM_THISCALL cm_fn_005ef0b0(u32);
 extern unsigned long long CM_CDECL cm_fn_00944cf1(u32);
 extern u32 CM_CDECL cm_fn_009532a6(u32);
 extern u32 CM_CDECL cm_fn_00945a60(u32, u32);

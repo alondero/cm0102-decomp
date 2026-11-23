@@ -1,7 +1,7 @@
 #include "cmre.h"
 
 extern void cm_fn_005a8f60(void);
-extern void cm_fn_005cc7d0(void);
+extern unsigned long long CM_CDECL cm_fn_005cc7d0(void);
 extern void cm_fn_005e8290(const char *param_1, const char *param_2, int param_3);
 extern char *CM_CDECL cm_fn_0090d130(void);
 extern u32 CM_CDECL cm_fn_00932c30(u32 destination, u32 size, u32 count, u32 stream);
@@ -28,7 +28,7 @@ u32 cm_fn_0054fd60(u32 arg1, u32 arg2, u32 arg3, u32 arg4)
         cm_fn_005e8290((const char *)0x009870e0u,
                        (const char *)&CM_GLOBAL(u8, 0x00ae24d0), 0);
         CM_GLOBAL(volatile u32, 0x00b67a34) = 0u;
-        cm_fn_005cc7d0();
+        (void)cm_fn_005cc7d0();
         cm_fn_005a8f60();
         cm_fn_00945934(0xffffffffu);
     }

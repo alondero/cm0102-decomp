@@ -6184,3 +6184,196 @@ def test_an_abbreviated_start_setting_also_replaces_the_live_control(root, monke
     (run / 'control.json').write_text(json.dumps({'ladder': ['m/old'], 'workers': 3}))
     assert farm.main(['start', str(run), '--lad', 'm/new']) == 0   # argparse accepts unique prefixes
     assert json.loads((run / 'control.json').read_text()) == {'workers': 3}
+
+
+class SlowAcceptCmre(FakeCmre):
+    """Each accept spends `seconds` of the farm's clock, as a held or lease-waiting accept does."""
+
+    def __init__(self, *args, now, seconds, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.now, self.seconds = now, seconds
+
+    def accept(self, fn, *, request):
+        self.now[0] += self.seconds
+        return super().accept(fn, request=request)
+
+
+def queued_accepts(root, count, seconds, accept_codes=None, **cfg):
+    """A farm whose first `count` translations passed and wait in the accept queue."""
+    now = [0.0]
+    items = [item(f'fn_00401{i:03x}') for i in range(count)]
+    f, _, _ = make(root, items, writes(passing), workers=count, continuous=True, rescan_seconds=0, **cfg)
+    cmre = SlowAcceptCmre(items, accept_codes=accept_codes, now=now, seconds=seconds)
+    cmre.root = root
+    f.cmre, f.clock = cmre, lambda: now[0]
+    f._dispatch()
+    f._reap()
+    f._collect()
+    assert [j['fn'] for j in f.accept_queue] == [i.fn for i in items]
+    return f, cmre, now, [i.fn for i in items]
+
+
+def test_a_tick_accepts_only_a_budgeted_prefix_of_a_long_backlog(root):
+    f, cmre, now, fns = queued_accepts(root, 6, seconds=25)
+    f.tick()
+    assert cmre.accepted == fns[:3]
+    assert [j['fn'] for j in f.accept_queue] == fns[3:]
+    assert not f.finished() and not f.drained()
+
+
+def test_settings_and_dispatch_are_not_starved_by_the_accept_backlog(root):
+    f, cmre, now, fns = queued_accepts(root, 6, seconds=25)
+    f.tick()
+    assert len(cmre.accepted) < len(fns)
+    assert farm.main(['set', str(f.run_dir), '--workers', '4']) == 0
+    f.tick()
+    assert f.config.workers == 4
+    assert any(e['event'] == 'config-changed' for e in events(f.run_dir))
+    assert cmre.accepted == fns[:6]
+
+
+def test_every_queued_accept_completes_once_in_order(root):
+    f, cmre, now, fns = queued_accepts(root, 7, seconds=25)
+    for _ in range(10):
+        f.tick()
+    assert cmre.accepted == fns
+    assert f.accept_queue == []
+    assert sorted(f.state['accepted']) == fns
+
+
+def test_one_accept_longer_than_the_budget_still_completes(root):
+    f, cmre, now, fns = queued_accepts(root, 3, seconds=farm.ACCEPT_TICK_SECONDS * 10)
+    f.tick()
+    assert cmre.accepted == fns[:1]
+    assert [j['fn'] for j in f.accept_queue] == fns[1:]
+    f.tick()
+    assert cmre.accepted == fns[:2]
+
+
+def test_waiting_lease_items_stay_ahead_of_unreached_items(root):
+    f, cmre, now, fns = queued_accepts(root, 5, seconds=25, accept_codes=[2, 0, 2])
+    f.tick()
+    # fn0 waits for the lease, fn1 accepts, fn2 waits; the budget ends before fn3 and fn4.
+    assert cmre.accepted == [fns[1]]
+    assert [j['fn'] for j in f.accept_queue] == [fns[0], fns[2], fns[3], fns[4]]
+    assert f.lease_waits == {j['n'] for j in f.accept_queue[:2]}
+    assert not f.drained()
+    f.tick()
+    f.tick()
+    assert sorted(cmre.accepted) == sorted(fns)
+    assert cmre.accepted.count(fns[0]) == 1 and cmre.accepted.count(fns[2]) == 1
+
+
+def test_queued_accepts_keep_their_transactions_across_a_partial_pass(root):
+    f, cmre, now, fns = queued_accepts(root, 4, seconds=40)
+    f.tick()
+    assert cmre.accepted == fns[:2]
+    for job in f.accept_queue:
+        assert f._transaction(job)['phase'] != 'accepted'
+    f.tick()
+    assert cmre.accepted == fns
+
+
+# -- mixed model rungs: `a|b` shares one rung between models
+
+def _running(f, model, count=1):
+    for _ in range(count):
+        f.running.append(({'kind': 'translate', 'fn': 'fn_x', 'model': model}, None, 0.0))
+
+
+def _limit(f, provider, seconds=3600):
+    f.state['limited_providers'][provider] = {'until': time.time() + seconds, 'message': 'usage limit'}
+
+
+def test_a_mixed_rung_picks_the_least_busy_model_and_ties_go_by_order(root):
+    f, _, _ = make(root, [], writes(GOOD), ladder=['a/x|b/y', 'c/strong'])
+    assert f._rung_model(0) == ('a/x', 0)
+    _running(f, 'a/x')
+    assert f._rung_model(0) == ('b/y', 0)
+    _running(f, 'b/y', 2)
+    assert f._rung_model(0) == ('a/x', 0)
+
+
+def test_a_limited_member_hands_its_share_to_the_others(root):
+    f, _, _ = make(root, [], writes(GOOD), ladder=['a/x|b/y|c/z', 'd/strong'])
+    _limit(f, 'a')
+    _running(f, 'b/y', 3)
+    assert f._rung_model(0) == ('c/z', 0)
+    f.state['unavailable_models']['c/z'] = 'dead'
+    assert f._rung_model(0) == ('b/y', 0)
+
+
+def test_a_rung_with_every_member_down_falls_to_the_next_and_pauses_only_when_all_limited(root):
+    f, _, job = failed_cheap_attempt(root)
+    f.config.ladder = ['a/x|b/y', 'c/strong']
+    _limit(f, 'a')
+    f.state['unavailable_models']['b/y'] = 'dead'
+    assert f._rung_model(0) == ('c/strong', 1)
+    assert f._rung_paused(0)                   # the only live member is limited
+    f.state['unavailable_models']['a/x'] = 'dead'
+    assert not f._rung_paused(0)               # every member retired: parked, not paused
+    f.state['unavailable_models'].pop('a/x')
+    f.state['unavailable_models'].pop('b/y')
+    assert f._rung_model(0) == ('b/y', 0)
+    _limit(f, 'b')
+    _limit(f, 'c')
+    assert f._rung_model(0)[0] is None and f._paused_from(0)
+    f.state['limited_providers'].pop('b')
+    assert f._rung_model(0) == ('b/y', 0)
+
+
+def test_escalation_picks_a_concrete_model_from_the_next_group(root):
+    f, _, _ = make(root, [], writes(GOOD), workers=1, ladder=['a/cheap', 'b/x|c/y'])
+    job = f._new_job('translate', 'fn_00401000', 'a/cheap', 0, bytes=200)
+    _running(f, 'b/x')
+    f._fail(job, 'timeout after 30 min')
+    nxt = f.pending[0]
+    assert nxt['rung'] == 1 and nxt['model'] == 'c/y'
+    _limit(f, 'b')
+    _limit(f, 'c')
+    f.pending.clear()
+    f._fail(job, 'timeout after 30 min')
+    assert f.pending[0]['model'] in ('b/x', 'c/y') and '|' not in f.pending[0]['model']
+
+
+def test_fix_jobs_and_audits_use_concrete_models_from_groups(root):
+    f, _, _ = make(root, [], writes(GOOD), ladder=['a/cheap', 'b/x|c/y'], audit_model='z/gone')
+    f.state['unavailable_models']['z/gone'] = 'dead'
+    f.state['unavailable_models']['c/y'] = 'dead'
+    assert f._audit_model('z/gone') == 'b/x'
+    f.state['accepted']['fn_00401000'] = {'bytes': 200}
+    f._defect('fn_00401000', ['wrong'])
+    assert f.pending[0]['kind'] == 'fix' and f.pending[0]['model'] == 'b/x'
+    assert f.pending[0]['rung'] == 1
+
+
+def test_mixed_rung_jobs_record_the_concrete_model(root):
+    f, cmre, launcher = make(root, [item('fn_00401000'), item('fn_00401100')], writes(GOOD),
+                             workers=2, ladder=['a/x|b/y'])
+    drain(f, 2)
+    assert sorted(j['model'] for j, _, _ in launcher.started) == ['a/x', 'b/y']
+
+
+def test_plain_ladder_helpers_are_unchanged():
+    assert farm.parse_ladder('a, b ,,c') == ['a', 'b', 'c']
+    assert farm.ladder_group('a') == ['a']
+
+
+def test_set_ladder_with_groups_round_trips_through_control_and_the_lane_argument(root):
+    f, _, _ = make(root, [], writes(GOOD), workers=1, continuous=True)
+    spec = 'a/x| b/y ,c/strong,d/p|e/q'
+    assert farm.main(['set', str(f.run_dir), '--ladder', spec]) == 0
+    control = json.loads((f.run_dir / 'control.json').read_text(encoding='utf-8'))
+    assert control['ladder'] == ['a/x|b/y', 'c/strong', 'd/p|e/q']
+    f.tick()
+    assert f.config.ladder == control['ladder']
+    assert farm.parse_ladder(','.join(f.config.ladder)) == f.config.ladder
+    assert farm.ladder_models(f.config.ladder) == ['a/x', 'b/y', 'c/strong', 'd/p', 'e/q']
+
+
+def test_the_input_lane_receives_grouped_rungs_intact(root):
+    f, clock, procs = input_farm(root)
+    f.config.ladder = ['a/x|b/y', 'c/strong']
+    f.tick()
+    arg = procs[0].command[procs[0].command.index('--ladder') + 1]
+    assert arg == 'a/x|b/y,c/strong'

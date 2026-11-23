@@ -6,7 +6,7 @@
 #include "cmre.h"
 
 extern void cm_fn_005a8f60(void);
-extern void cm_fn_005cc7d0(void);
+extern unsigned long long CM_CDECL cm_fn_005cc7d0(void);
 extern void cm_fn_005e8290(const char *title, const char *text, int flags);
 extern char *cm_fn_0090d130(void);
 extern u32 cm_fn_00932c30(u32 destination, u32 size, u32 count, u32 stream);
@@ -15,7 +15,7 @@ extern u32 cm_fn_00944cff(u32 source, u32 a, u32 b, void *first, void *second);
 extern void cm_fn_00945934(u32 status);
 extern u32 cm_fn_00945bfe(u32 buffer, u32 a, u32 b, u32 stream);
 
-u32 cm_fn_00550380(u32 stream, u32 reading, u32 buffer, u32 record)
+u32 CM_CDECL cm_fn_00550380(u32 stream, u32 reading, u32 buffer, u32 record)
 {
     u8 scratch[0x200];
     u32 count = *(volatile u32 *)(record + 0x37u);

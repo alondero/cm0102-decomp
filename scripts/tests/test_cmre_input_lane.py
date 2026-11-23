@@ -86,8 +86,13 @@ class Ops:
         self.screen_result = screen or {}
         self.apply_result = apply
         self.gates, self.applies, self.accepts, self.screens = [], [], [], []
+        self.harness, self.candidate_calls = 'H1', 0
+
+    def harness_digest(self):
+        return self.harness
 
     def candidates(self):
+        self.candidate_calls += 1
         return json.loads(json.dumps(self._candidates))
 
     def screen(self, fn):
@@ -685,3 +690,179 @@ def test_a_worker_waiting_out_a_limit_is_stopped_without_an_attempt(tmp_path):
     assert handles[0].killed and ops.gates == []
     assert l.state['functions']['fn_00401000'].get('attempts', []) == []
     assert l.state['limited']['p'] == pytest.approx(1000.0 + 32932)
+
+
+# --- harness release re-opens exhausted functions ---------------------------------
+
+def attempts_under(digest, count, status='no-new-reach'):
+    return [{'n': i, 'model': 'p/cheap', 'status': status, 'coverage': 0.5, 'harness': digest} for i in range(count)]
+
+
+def test_attempts_from_an_older_harness_do_not_count_toward_the_cap():
+    candidates = {'fn_a': candidate(100, 0.55)}
+    rows = {'fn_a': {'key': 'k1', 'attempts': attempts_under('old', 3)}}
+    assert lane.plan(candidates, rows, harness='new') == ['fn_a']
+    assert lane.plan(candidates, rows, harness='old') == []
+
+
+def test_attempts_without_a_digest_are_an_older_harness():
+    rows = {'fn_a': {'key': 'k1', 'attempts': [{}, {}, {}]}}
+    assert lane.plan({'fn_a': candidate(100, 0.55)}, rows, harness='new') == ['fn_a']
+
+
+def test_current_harness_attempts_still_count_and_mixed_attempts_count_only_current():
+    candidates = {'fn_a': candidate(100, 0.55)}
+    rows = {'fn_a': {'key': 'k1', 'attempts': attempts_under('new', 3)}}
+    assert lane.plan(candidates, rows, harness='new') == []
+    rows['fn_a']['attempts'] = attempts_under('old', 5) + attempts_under('new', 2)
+    assert lane.plan(candidates, rows, harness='new') == ['fn_a']
+    rows['fn_a']['attempts'] = attempts_under('old', 5) + attempts_under('new', 3)
+    assert lane.plan(candidates, rows, harness='new') == []
+
+
+def test_terminal_rows_from_an_older_harness_reopen_but_accepted_rows_stay_done():
+    candidates = {name: candidate(100, 0.55) for name in ('fn_f', 'fn_e', 'fn_acc', 'fn_cur')}
+    rows = {'fn_f': {'key': 'k1', 'status': 'fail'},
+            'fn_e': {'key': 'k1', 'status': 'error', 'harness': 'old'},
+            'fn_acc': {'key': 'k1', 'status': 'accepted', 'harness': 'old'},
+            'fn_cur': {'key': 'k1', 'status': 'fail', 'harness': 'new'}}
+    assert sorted(lane.plan(candidates, rows, harness='new')) == ['fn_e', 'fn_f']
+
+
+def test_ladder_position_comes_from_current_harness_attempts_only(tmp_path):
+    l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1)
+    l.state['functions']['fn_00401000'] = {'key': 'k1', 'attempts': attempts_under('old', 3)}
+    l.tick()
+    assert launcher.started[0][0]['model'] == 'p/cheap'
+    l.tick()
+    l.tick()
+    assert [job['model'] for job, _, _ in launcher.started][:2] == ['p/cheap', 'q/strong']
+    row = l.state['functions']['fn_00401000']
+    assert [a.get('harness') for a in row['attempts']][3:] == ['H1', 'H1']
+
+
+def test_new_attempts_still_start_from_the_best_spec_after_a_harness_change(tmp_path):
+    l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1)
+    best = tmp_path / 'best.json'
+    best.write_text('{"fixtures": [{"name": "kept"}]}')
+    l.state['functions']['fn_00401000'] = {'key': 'k1', 'attempts': attempts_under('old', 3),
+                                           'best': {'spec': str(best), 'coverage': 0.55, 'model': 'p/cheap'}}
+    l.tick()
+    assert json.loads(Path(launcher.started[0][0]['spec']).read_text()) == {'fixtures': [{'name': 'kept'}]}
+
+
+def test_a_lane_stops_at_the_cap_per_harness_and_reopens_when_the_harness_changes(tmp_path):
+    l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1)
+    for _ in range(10):
+        l.tick()
+        clock['now'] += 1
+    assert len(launcher.started) == lane.MAX_ATTEMPTS
+    ops.harness = 'H2'
+    clock['now'] += lane.CANDIDATE_REFRESH_SECONDS + 1
+    for _ in range(10):
+        l.tick()
+        clock['now'] += 1
+    assert len(launcher.started) == 2 * lane.MAX_ATTEMPTS
+
+
+def test_an_old_harness_fail_is_rescreened_once_then_stays_done(tmp_path):
+    l, ops, launcher, clock = make_lane(
+        tmp_path, {'fn_00401000': candidate(700, 0.5)}, workers=1,
+        screen={'fn_00401000': {'status': 'fail'}})
+    l.state['functions']['fn_00401000'] = {'key': 'k1', 'status': 'fail', 'coverage': 0.5,
+                                           'mismatches': [{'case': 1}]}
+    for _ in range(4):
+        l.tick()
+        clock['now'] += lane.CANDIDATE_REFRESH_SECONDS + 1
+    row = l.state['functions']['fn_00401000']
+    assert ops.screens == ['fn_00401000'] and launcher.started == []
+    assert row['status'] == 'fail' and row['harness'] == 'H1' and 'mismatches' not in row
+
+
+def test_an_old_harness_fail_that_now_reaches_low_coverage_gets_attempts(tmp_path):
+    l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700, 0.5)}, workers=1)
+    l.state['functions']['fn_00401000'] = {'key': 'k1', 'status': 'fail', 'coverage': 0.5}
+    l.tick()
+    assert ops.screens == ['fn_00401000'] and len(launcher.started) == 1
+    assert 'status' not in l.state['functions']['fn_00401000']
+
+
+def test_an_accepted_row_is_not_rescreened_after_a_harness_change(tmp_path):
+    l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700, 0.5)}, workers=1)
+    l.state['functions']['fn_00401000'] = {'key': 'k1', 'status': 'accepted', 'harness': 'old'}
+    l.tick()
+    assert ops.screens == [] and launcher.started == []
+
+
+def test_harness_digest_is_read_once_per_refresh_not_per_function(tmp_path):
+    l, ops, launcher, clock = make_lane(tmp_path, {f'fn_0040{n}000': candidate(100) for n in range(1, 6)})
+    calls = []
+    ops.harness_digest = lambda: calls.append(1) or 'H1'
+    l.refresh(force=True)
+    assert len(calls) == 1
+
+
+# --- idle refresh rate --------------------------------------------------------------
+
+def test_an_idle_lane_rescans_at_most_once_per_idle_period(tmp_path):
+    l, ops, launcher, clock = make_lane(tmp_path, {}, workers=1)
+    for _ in range(30):                   # 30 polls, 10 s apart
+        l.tick()
+        clock['now'] += 10
+    assert ops.candidate_calls == 5       # t=0,60,120,180,240
+
+
+def test_an_idle_lane_rescans_immediately_after_a_gate_result(tmp_path):
+    l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1)
+    for _ in range(10):
+        l.tick()
+        clock['now'] += 1
+    before = ops.candidate_calls
+    l.finish({'fn': 'fn_00401000', 'n': 99, 'model': 'p/cheap', 'key': 'k1', 'hints_sha256': 'h' * 64,
+              'harness': 'H1'}, 'x', False, {'status': 'low-coverage', 'coverage': 0.4, 'prior_sha256': 'h' * 64})
+    l.tick()
+    assert ops.candidate_calls == before + 1
+
+
+def test_a_busy_lane_still_refreshes_on_the_long_period(tmp_path):
+    l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1)
+    launcher.start = lambda job, prompt, agent: Handle(tmp_path / 'log.jsonl', code=None)
+    l.tick()
+    assert l.running and ops.candidate_calls == 1
+    for _ in range(5):
+        clock['now'] += 100
+        l.tick()
+        assert l.running
+    assert ops.candidate_calls == 1       # 500 s: busy lane waits for the 600 s period
+    clock['now'] += 101
+    l.tick()
+    assert ops.candidate_calls == 2
+
+
+# -- mixed model rungs
+
+def test_a_mixed_rung_spreads_jobs_by_running_count_and_skips_limited_members(tmp_path):
+    l, _, _, clock = make_lane(tmp_path, {})
+    l.ladder = ['p/a|q/b', 'r/strong']
+    assert l._model(0) == 'p/a'
+    l.running.append(({'model': 'p/a'}, None, 0))
+    assert l._model(0) == 'q/b'
+    l.running.append(({'model': 'q/b'}, None, 0))
+    l.running.append(({'model': 'q/b'}, None, 0))
+    assert l._model(0) == 'p/a'
+    l.state['limited']['p'] = clock['now'] + 600
+    assert l._model(0) == 'q/b'
+    l.state['limited']['q'] = clock['now'] + 600
+    assert l._model(0) == 'r/strong'      # the whole rung is down: the next rung
+    assert l._model(1) == 'r/strong'
+    l.state['limited']['r'] = clock['now'] + 600
+    assert l._model(0) is None
+
+
+def test_the_lane_reads_grouped_ladders_from_control_and_dispatches_concrete_models(tmp_path):
+    l, _, launcher, _ = make_lane(tmp_path, {'fn_00401000': candidate(700), 'fn_00401100': candidate(600)})
+    (l.run_dir / 'control.json').write_text(json.dumps({'ladder': ['p/a|q/b', 'r/strong']}))
+    l._control()
+    assert l.ladder == ['p/a|q/b', 'r/strong']
+    l.tick()
+    assert sorted(job['model'] for job, _, _ in launcher.started) == ['p/a', 'q/b']
