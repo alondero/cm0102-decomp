@@ -777,6 +777,12 @@ New lifts reach the C translators on the next frontier rescan.
   function is gated once first, and if that gate passes it is accepted with no
   model call. Each function gets three attempts per canonical-hint state, one
   ladder rung each. Each later attempt starts from the best spec so far.
+  Only attempts made under the current harness digest (`cmre.recover.harness_digest()`,
+  recorded on every attempt) count toward the three and pick the ladder rung, so a
+  harness release re-opens exhausted functions, and a `fail`, `error` or
+  `lift-blocked` row set under an older harness is re-screened once. Accepted rows
+  stay done. An idle lane re-scans candidates at most once a minute (at once after a
+  gate result or accept); a busy lane every ten minutes.
 - Skipped: hard work holds, blocked records, lift `lift-blocked`, `fail` and
   `error`. A mismatch found with authored inputs is recorded in
   `RUN/input-lane/state.json` for triage and is never reshaped away.
