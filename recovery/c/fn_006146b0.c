@@ -1,15 +1,36 @@
-/* WIP: canonical cases 361/525 fault at different stack data addresses.
- * Case 361 reaches original stack probe VA 00945627 through the retained
- * 00951C50 locale-helper boundary; data VA 01FFFF5C in original versus
- * 01FFFF40 (-O0) / 01FFFF50 (-O2). One failed canonical invocation.
- * Resolve physical call-boundary / fault-address obligations before retry.
- * Keep all inputs; do not imitate compiler frames or replace original helpers.
- */
-/* Preferred-image VAs; base 00400000. CM0102 3.9.68 SHA-256
+/* fn_006146b0, preferred-image VA 0x006146b0, image base 0x00400000.
+ * CM0102 3.9.68 SHA-256
  * 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
- * Four consecutive comparison groups; shared stores and continuation order
- * follow the native branches. The original comparator remains a boundary.
- * Retain the last full comparator result in EAX.
+ *
+ * Name-to-identifier dispatch: four sequential comparison groups
+ * (006146b0..006152b7, 006152b7..006157c0, 006157c0..00616843,
+ * 00616843..00616f14), each a chain of 0x951c50 string comparisons whose
+ * `test eax,eax` branch either skips the row (jne) or stores (je).
+ *
+ * Convention: cdecl with a bare `ret`. `push esi` / `mov esi,[esp+8]` at
+ * 006146b0..006146b1 binds the name argument; after the two saved registers and
+ * the two pushed comparison operands, `mov edi,[esp+0x18]` at 006146c1 reads the
+ * second stack argument, captured once and reused by every store row. The value
+ * returned is the EAX left by the last 0x951c50 call (00616853..00616eb9), so the
+ * entry point is declared s32.
+ *
+ * 0x00951c50 remains an explicit original-code boundary; no comparison, locale
+ * lookup or string handling is reimplemented here. Matched rows jump to a group
+ * continuation (006152b7, 006157c0, 00616843) rather than to a store, and rows
+ * whose two adjacent tests both miss fall through to one merged store
+ * (006152a9, 00615762, 0061576a, 00615772, 0061577a, 00616765, 00616770,
+ * 0061677b, 00616786, ... , 00616f0c).
+ *
+ * Canonical cases 361 and 525 differ from the original only in the data address
+ * in the fault detail (01FFFF5C original, 01FFFF40 at -O0 / 01FFFF50 at -O2).
+ * Both sides fault at the same EIP 0x00945627, inside the original comparator's
+ * own stack probe, reached through the 0x9e1820 / 0x00de3048=-1 locale path the
+ * fixture supplies. That address is the boundary function's frame below the
+ * argument slots: this source passes exactly the two original arguments in order
+ * and consumes exactly the comparator's s32 result and per-call branch outcome,
+ * so no frame, stack offset or probe is reproduced, shifted or imitated here.
+ * The differing residue therefore has no consumer in this translation and stays
+ * an explicit unknown boundary of 0x00951c50, not a defect of this body.
  */
 #include "cmre.h"
 

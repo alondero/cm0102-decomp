@@ -6,7 +6,7 @@
 #include "cmre.h"
 
 extern void cm_fn_005a8f60(void);
-extern void cm_fn_005cc7d0(void);
+extern unsigned long long CM_CDECL cm_fn_005cc7d0(void);
 extern void cm_fn_005e8290(const char *title, const char *text, int flags);
 extern char *cm_fn_0090d130(void);
 extern u32 cm_fn_00932c30(u32 destination, u32 size, u32 count, u32 stream);

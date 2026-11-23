@@ -15,7 +15,7 @@ extern void cm_fn_00945934(u32 code);
 
 u32 CM_THISCALL cm_fn_0077b630(u32 self, u32 input)
 {
-    volatile u8 scratch[0x200];
+    u8 scratch[0x200];
     u32 allocation;
 
     *(volatile u32 *)(self + 0x04u) = 0;

@@ -564,7 +564,7 @@ L46127a:
                 format=second?0x009900a4:0x00990070;
             }
             cm_fn_0066f4e0(0x00de1f64,format,capacity,seats);
-        }else{
+        }else if(capacity!=0){
             first=BYTE(stadium+0x4c);
             if(first!=0){
                 second=BYTE(stadium+0x4d);
@@ -574,7 +574,7 @@ L46127a:
                 format=second?0x0098ffdc:0x0098ffc8;
             }
             cm_fn_0066f4e0(0x00de1f64,format,capacity);
-        }
+        }else goto L461468;
     }
     goto L461491;
 L461468:

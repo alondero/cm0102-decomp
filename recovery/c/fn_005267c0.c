@@ -325,7 +325,8 @@ u32 CM_CDECL cm_fn_005267c0(u8 mode)
                 id = D(pointer + q * 4u);
                 D(destination + q * 4u) = id;
             }
-            B(destination + 580u) = B(pointer + 580u);
+            q = B(pointer + 580u);
+            B(destination + 580u) = (u8)q;
             base = G(0x00ae23fc);
             D(base + kept * 4u) = i;
             destination = D(cursor);

@@ -1,6 +1,3 @@
-/* WIP: budget-asymmetry, case 9 (original copy fault, recovered budget).
-   Keep the 2000-case input policy and forward copy; the current shared
-   instruction budget does not establish equivalence. */
 #include "cmre.h"
 
 /* Preferred-image VA 0x0062e9e0, base 0x00400000, CM0102 3.9.68.
@@ -24,9 +21,9 @@ u32 CM_THISCALL cm_fn_0062e9e0(u32 self)
     u32 attempts, source, dest, bytes, words, tail, result;
     u16 today_year, row_year, cutoff_year, cutoff_day;
     u8 flag, byte;
-    previous = CM_FS(u32, 0);
     frame.state = 0xffffffffu;
     frame.handler = 0x0095b188;
+    previous = CM_FS(u32, 0);
     frame.prev = previous;
     CM_FS(u32, 0) = (u32)&frame;
     D(local + 8) = 0;

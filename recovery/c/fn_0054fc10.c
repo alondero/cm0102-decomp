@@ -1,7 +1,7 @@
 #include "cmre.h"
 
 extern void cm_fn_005a8f60(void);
-extern void cm_fn_005cc7d0(void);
+extern unsigned long long CM_CDECL cm_fn_005cc7d0(void);
 extern void cm_fn_005e8290(const char *param_1, const char *param_2, int param_3);
 extern char *CM_CDECL cm_fn_0090d130(void);
 extern u32 CM_CDECL cm_fn_00932c30(u32 destination, u32 size, u32 count, u32 stream);
@@ -13,10 +13,10 @@ extern u32 CM_CDECL cm_fn_00945bfe(u32 buffer, u32 count, u32 element_size, u32 
 u32 cm_fn_0054fc10(u32 arg1, u32 arg2, u32 arg3, u32 arg4)
 {
     u8 scratch[0x200];
-    u32 element_size;
+    u32 count;
     u32 result;
 
-    element_size = *(volatile u32 *)(arg4 + 0x37u);
+    count = *(volatile u32 *)(arg4 + 0x37u);
     if (*(volatile u32 *)(arg4 + 0x3fu) != 1u) {
         (void)cm_fn_00944cff(0x009b8dc0u, 0u, 0u,
                              scratch + 0x100u, scratch);
@@ -33,9 +33,9 @@ u32 cm_fn_0054fc10(u32 arg1, u32 arg2, u32 arg3, u32 arg4)
         cm_fn_00945934(0xffffffffu);
     }
     if (arg2 != 0u) {
-        result = cm_fn_00932c30(arg3, 0x34u, element_size, arg1);
-        return (u32)(result == element_size);
+        result = cm_fn_00932c30(arg3, 0x34u, count, arg1);
+        return (u32)(result == count);
     }
-    result = cm_fn_00945bfe(arg3, 0x34u, element_size, arg1);
-    return (u32)(result == element_size);
+    result = cm_fn_00945bfe(arg3, 0x34u, count, arg1);
+    return (u32)(result == count);
 }
