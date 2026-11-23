@@ -3,8 +3,8 @@
 A stub only has to be identical on the original and recovered sides; it is not a
 model of Windows. It records the call (name + stdcall arguments) as an ordered
 event, returns a value derived from the case seed, and pops the documented
-stdcall argument count. A successful FindFirstFileA/FindNextFileA/FileTimeTo*
-call also writes its documented output structure (see `outputs`), so neither side
+stdcall argument count. A successful FindFirstFileA/FindNextFileA/FileTimeTo* call (and ReadFile/WriteFile byte counts)
+also writes its documented output structure (see `outputs`), so neither side
 reads stack garbage from the buffer. Terminal imports end the case instead.
 Never use these values as evidence of game behaviour.
 """
@@ -244,15 +244,58 @@ def search_pattern(read, address: int) -> bytes | None:
     return component or None
 
 
+IO_BUFFER_CAP = 64 * 1024  # largest ReadFile transfer the stub will define
+
+
+def _transfer_count(seed: int, index: int, requested: int) -> int:
+    """0 / 1 / small / full byte count, never above `requested` or IO_BUFFER_CAP."""
+    cap = min(requested, IO_BUFFER_CAP)
+    h = _mix(seed, index, 7001)
+    kind = h & 3
+    if kind == 0 or cap == 0:
+        return 0
+    if kind == 1:
+        return 1
+    if kind == 2:
+        return 1 + (h >> 4) % cap
+    return cap
+
+
+def _file_io_outputs(name, args, value, seed, index, read):
+    """ReadFile/WriteFile byte count (and ReadFile's buffer bytes), synchronous I/O only.
+
+    Both APIs zero the count before any work, so failure writes 0. A successful
+    transfer moves 0..nNumberOfBytes bytes, and ReadFile fills lpBuffer with
+    exactly the bytes it reports. An overlapped call or a NULL count pointer
+    has no synchronous count to define."""
+    buffer, requested, count_ptr, overlapped = args[1], args[2], args[3], args[4]
+    if count_ptr == 0 or overlapped != 0 or read(count_ptr, 4) is None:
+        return []
+    if not value:
+        return [(count_ptr, bytes(4))]
+    n = _transfer_count(seed, index, requested)
+    out = [(count_ptr, n.to_bytes(4, "little"))]
+    if name == "KERNEL32.dll!ReadFile" and n:
+        if read(buffer, n) is None:
+            return []  # the buffer is not mapped: nothing can be defined
+        data = bytearray()
+        for word in range((n + 3) // 4):
+            data += _mix(seed, index, 8000 + word).to_bytes(4, "little")
+        out.append((buffer, bytes(data[:n])))
+    return out
+
+
 def outputs(name: str, args: tuple, value: int, seed: int, index: int, read,
             patterns: dict | None = None) -> list[tuple[int, bytes]]:
     """Documented out-parameter writes for a successful call: [(address, bytes)].
 
-    `read(address, size)` returns bytes, or None when unmapped. A failed call
+    `read(address, size)` returns bytes, or None when unmapped. A failed file-search/file-time call
     writes nothing (the API leaves its output unspecified). Only the file-search
-    and file-time imports are covered; every other stub writes nothing.
+    file-time and ReadFile/WriteFile imports are covered; every other stub writes nothing.
     `patterns` maps a successful FindFirstFileA handle to its search pattern for
     this case, so FindNextFileA continues the same search."""
+    if name in ("KERNEL32.dll!ReadFile", "KERNEL32.dll!WriteFile"):
+        return _file_io_outputs(name, args, value, seed, index, read)
     if name == "KERNEL32.dll!FindFirstFileA":
         if value == 0xFFFFFFFF:
             return []
