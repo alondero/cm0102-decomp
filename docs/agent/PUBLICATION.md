@@ -90,10 +90,14 @@ approve a binary package.
     finding whose blob is absent from the scanned tip and already reachable
     from `refs/remotes/<remote>/main` cannot be added or removed by the
     push, so it is recorded under `public_history` in the receipt and does
-    not block. The receipt also records that ref's commit. Fetch first so the
-    tracking ref is current; the scan does not query the remote. Tip content,
-    new history, path findings and private ancestry still block, and only a
-    reviewed history rewrite removes published blobs.
+    not block. This applies to every content kind (listings, original bytes,
+    asset copies, binaries). The receipt also records that ref's commit.
+    The tracking ref is trusted locally and the scan does not query the
+    remote, so fetch first; it vouches only when it is an ancestor of the
+    scanned commit, so merge origin/main into a behind branch before
+    scanning. A blob present anywhere in the tip, new history, path findings
+    and private ancestry still block, and only a reviewed history rewrite
+    removes published blobs.
 6. A passing receipt binds the exact commit, push URL and known PUBLIC/PRIVATE
    visibility. Supported guarded commands are `git push origin BRANCH:main` and the
    existing same-name PR form `git push origin BRANCH:BRANCH`; both require that

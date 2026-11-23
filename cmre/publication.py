@@ -454,7 +454,13 @@ def scan_commit(repo: Path, ref: str, index: OriginalIndex,
         return {line.partition(" ")[0] for line in _git(repo, "rev-list", "--objects", name).decode().splitlines()}
 
     tracked = reachable(tracking_ref)
-    published = reachable(published_ref) if public_history is not None else set()
+    # Only a published main this commit builds on vouches for its history; a stale, moved or
+    # unrelated tracking ref exempts nothing.
+    published = set()
+    if public_history is not None and published_ref and subprocess.run(
+            ["git", "merge-base", "--is-ancestor", published_ref, commit], cwd=repo,
+            capture_output=True).returncode == 0:
+        published = reachable(published_ref)
     tip = {}
     for line in _git(repo, "ls-tree", "-r", "-z", commit).decode().split("\0"):
         if line:

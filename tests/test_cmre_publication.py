@@ -305,6 +305,49 @@ def test_published_main_does_not_excuse_new_or_tip_content(originals, repo):
     assert public == []
 
 
+def _scan_with_public(originals, repo, **extra):
+    public = []
+    _, findings = pub.scan_commit(repo, "fresh", originals["index"], tracking_ref="refs/remotes/origin/pr",
+                                  published_ref="refs/remotes/origin/main", public_history=public,
+                                  **{"private_refs": (), **extra})
+    return findings, public
+
+
+def test_published_blob_restored_at_another_tip_path_still_blocks(originals, repo):
+    _published_history(originals, repo)
+    _commit(repo, {"moved.txt": originals["image"][100:140].hex().encode()}, "restore elsewhere")
+    findings, public = _scan_with_public(originals, repo)
+    assert sorted({(f.path, f.kind) for f in findings}) == [("a.txt", "original-bytes"), ("moved.txt", "original-bytes")]
+    assert public == []
+
+
+def test_published_ref_that_is_not_an_ancestor_sets_nothing_aside(originals, repo):
+    _published_history(originals, repo)
+    # A tracking ref moved to an unrelated commit must not vouch for this branch's history.
+    _git(repo, "checkout", "-q", "--orphan", "other")
+    _commit(repo, {"a.txt": originals["image"][100:140].hex().encode()}, "copy")
+    _git(repo, "update-ref", "refs/remotes/origin/main", _commit(repo, {"a.txt": None, "e.txt": b"x\n"}, "remove"))
+    _git(repo, "checkout", "-q", "fresh")
+    findings, public = _scan_with_public(originals, repo)
+    assert [(f.path, f.kind) for f in findings] == [("a.txt", "original-bytes")]
+    assert public == []
+
+
+def test_scan_without_public_history_list_blocks_published_history(originals, repo):
+    _published_history(originals, repo)
+    _, findings = pub.scan_commit(repo, "fresh", originals["index"], private_refs=(),
+                                  tracking_ref="refs/remotes/origin/pr", published_ref="refs/remotes/origin/main")
+    assert [(f.path, f.kind) for f in findings] == [("a.txt", "original-bytes")]
+
+
+def test_private_ancestry_still_blocks_when_all_history_is_published(originals, repo):
+    published = _published_history(originals, repo)
+    _git(repo, "update-ref", "refs/private/archive", published)
+    findings, public = _scan_with_public(originals, repo, private_refs=("refs/private/archive",))
+    assert [f.kind for f in findings] == ["private-history"]
+    assert [(f.path, f.kind) for f in public] == [("a.txt", "original-bytes")]
+
+
 def test_missing_published_ref_sets_nothing_aside(originals, repo):
     _commit(repo, {"a.txt": originals["image"][100:140].hex().encode()}, "copy")
     _commit(repo, {"a.txt": None, "b.txt": b"clean\n"}, "remove")
