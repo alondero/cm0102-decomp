@@ -107,23 +107,64 @@ def _mix(seed: int, index: int, salt: int) -> int:
     return h ^ (h >> 15)
 
 
-def find_data(seed: int, index: int) -> bytes:
-    """A valid WIN32_FIND_DATAA chosen only by (seed, call index): documented layout.
+_NAME_CHARS = b"abcdefghijklmnopqrstuvwxyz0123456789"
 
-    Times are valid FILETIMEs, the name is NUL-terminated and fits 8.3, so
-    cAlternateFileName stays empty. Test scaffolding, not a file system."""
-    kind = _mix(seed, index, 1) % 8
+
+def _file_size(h: int) -> int:
+    """nFileSizeLow from the same 0 / 1 / small / full-dword mix as `result`."""
+    kind = h & 3
     if kind < 2:
+        return kind
+    return (h >> 4) % 0x10000 if kind == 2 else h
+MAX_PATH = 260
+
+
+def _plain_match(name: bytes, pattern: bytes) -> bool:
+    """`*` = any run, `?` = exactly one byte, other bytes literal (case-sensitive)."""
+    import fnmatch
+    return fnmatch.fnmatchcase(name.decode("latin-1"),
+                               pattern.decode("latin-1").replace("[", "[[]"))
+
+
+def _pattern_name(seed: int, index: int, pattern: bytes) -> bytes:
+    """A name that plainly matches `pattern`; Windows' DOS wildcard rules accept a superset."""
+    out = bytearray()
+    for position, char in enumerate(pattern):
+        if char == 0x2A:      # '*': zero to eight seeded bytes
+            for k in range(_mix(seed, index, 100 + 2 * position) % 9):
+                out.append(_NAME_CHARS[_mix(seed, index, 1000 + 16 * position + k) % len(_NAME_CHARS)])
+        elif char == 0x3F:    # '?': exactly one seeded byte
+            out.append(_NAME_CHARS[_mix(seed, index, 101 + 2 * position) % len(_NAME_CHARS)])
+        else:
+            out.append(char)
+    return bytes(out[:MAX_PATH - 1])
+
+
+def find_data(seed: int, index: int, pattern: bytes | None = None) -> bytes:
+    """A valid WIN32_FIND_DATAA chosen only by (seed, call index[, pattern]): documented layout.
+
+    With a search pattern (the final lpFileName component), the name matches it,
+    as FindFirstFileA/FindNextFileA document. Without one the name is unconstrained.
+    Times are valid FILETIMEs and cAlternateFileName stays empty (a volume may omit
+    8.3 names). Test scaffolding, not a file system."""
+    kind = _mix(seed, index, 1) % 8
+    if pattern is None:
+        if kind < 2:
+            name, attrs = (b".", b"..")[kind], 0x10
+        else:
+            name = b"F%07X.DAT" % (_mix(seed, index, 2) & 0xFFFFFFF)
+            attrs = (0x10, 0x20, 0x01, 0x80)[_mix(seed, index, 3) % 4]
+            if attrs == 0x10:
+                name = name[:8]
+    elif kind < 2 and _plain_match((b".", b"..")[kind], pattern):
         name, attrs = (b".", b"..")[kind], 0x10
     else:
-        name = b"F%07X.DAT" % (_mix(seed, index, 2) & 0xFFFFFFF)
+        name = _pattern_name(seed, index, pattern)
         attrs = (0x10, 0x20, 0x01, 0x80)[_mix(seed, index, 3) % 4]
-        if attrs == 0x10:
-            name = name[:8]
     times = b"".join(
         (0x01C00000_00000000 + (_mix(seed, index, 4 + i) << 20) + _mix(seed, index, 8 + i)).to_bytes(8, "little")
         for i in range(3))
-    size = 0 if attrs == 0x10 else _mix(seed, index, 12)
+    size = 0 if attrs == 0x10 else _file_size(_mix(seed, index, 12))
     out = (attrs.to_bytes(4, "little") + times + (0).to_bytes(4, "little") + size.to_bytes(4, "little")
            + bytes(8) + name + b"\0")
     return out + bytes(FIND_DATA_SIZE - len(out))
@@ -151,16 +192,41 @@ def systemtime(filetime: int) -> bytes | None:
     return b"".join(f.to_bytes(2, "little") for f in fields)
 
 
-def outputs(name: str, args: tuple, value: int, seed: int, index: int, read) -> list[tuple[int, bytes]]:
+def search_pattern(read, address: int) -> bytes | None:
+    """The final path component of the NUL-terminated lpFileName, or None if unreadable."""
+    raw = bytearray()
+    while len(raw) < MAX_PATH:
+        byte = read(address + len(raw), 1)
+        if byte is None:
+            return None
+        if byte == b"\0":
+            break
+        raw += byte
+    else:
+        return None
+    component = bytes(raw).replace(b"/", b"\\").rsplit(b"\\", 1)[-1].rsplit(b":", 1)[-1]
+    return component or None
+
+
+def outputs(name: str, args: tuple, value: int, seed: int, index: int, read,
+            patterns: dict | None = None) -> list[tuple[int, bytes]]:
     """Documented out-parameter writes for a successful call: [(address, bytes)].
 
     `read(address, size)` returns bytes, or None when unmapped. A failed call
     writes nothing (the API leaves its output unspecified). Only the file-search
-    and file-time imports are covered; every other stub writes nothing."""
+    and file-time imports are covered; every other stub writes nothing.
+    `patterns` maps a successful FindFirstFileA handle to its search pattern for
+    this case, so FindNextFileA continues the same search."""
     if name == "KERNEL32.dll!FindFirstFileA":
-        return [(args[1], find_data(seed, index))] if value != 0xFFFFFFFF else []
+        if value == 0xFFFFFFFF:
+            return []
+        pattern = search_pattern(read, args[0])
+        if patterns is not None and pattern is not None:
+            patterns[value] = pattern
+        return [(args[1], find_data(seed, index, pattern))]
     if name == "KERNEL32.dll!FindNextFileA":
-        return [(args[1], find_data(seed, index))] if value else []
+        pattern = patterns.get(args[0]) if patterns is not None else None
+        return [(args[1], find_data(seed, index, pattern))] if value else []
     if not value or name not in ("KERNEL32.dll!FileTimeToLocalFileTime", "KERNEL32.dll!FileTimeToSystemTime"):
         return []
     raw = read(args[0], 8)
