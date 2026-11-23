@@ -383,7 +383,12 @@ Coordinator procedure:
    (default MiniMax M3.1 Flash → DeepSeek v4.1 Flash `#low` via Go → `#low` via
    Command Code → default effort via Go → default effort via Command Code →
    GPT-6.1 Terra via OpenAI;
-   MiniMax M3 passed 3 of 13 on 2026-11-13 and is off the ladder). DeepSeek runs
+   MiniMax M3 passed 3 of 13 on 2026-11-13 and is off the ladder).
+   A rung may mix providers with `|`, e.g. `--ladder a/x|b/y,c/strong`: each job
+   takes the available member with the fewest running jobs (ties by order), a
+   limited or retired member's share goes to the others, and the rung counts as
+   paused by a usage limit only when every live member is limited. The input lane
+   gets the same groups. Job records keep the concrete model. DeepSeek runs
    use v4.1 Flash. `--audit-model` defaults to `openai/gpt-6.1-terra`; when the
    preferred auditor is limited or retired, the last available ladder rung audits.
    `--stall-minutes` (default 15) kills a worker whose transcript stops growing.

@@ -306,9 +306,12 @@ class Lane:
         self.state['limited'][key] = self.clock() + seconds
 
     def _model(self, attempt):
-        for model in self.ladder[min(attempt, len(self.ladder) - 1):] if self.ladder else []:
-            if self._available(model):
-                return model
+        """The least busy available model of the first rung at or above the attempt that has one;
+        a rung is a group `a|b`, a plain model a group of one."""
+        for entry in self.ladder[min(attempt, len(self.ladder) - 1):] if self.ladder else []:
+            usable = [m for m in (g.strip() for g in entry.split('|')) if m and self._available(m)]
+            if usable:
+                return min(usable, key=lambda m: sum(1 for job, _, _ in self.running if job['model'] == m))
         return None
 
     def _busy(self):

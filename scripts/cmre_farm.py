@@ -86,6 +86,22 @@ NO_ROUTE = re.compile(r'provider\.no-route|model unavailable', re.I)
 NO_ROUTE_SECONDS = 3600
 
 
+def ladder_group(entry):
+    """The models of one ladder entry: `a|b` is a group, a plain model a group of one."""
+    return [m.strip() for m in entry.split('|') if m.strip()]
+
+
+def ladder_models(ladder):
+    """Every concrete model of the ladder in order, groups flattened, repeats dropped."""
+    return list(dict.fromkeys(m for entry in ladder for m in ladder_group(entry)))
+
+
+def parse_ladder(text):
+    """`a|b,c` -> ['a|b', 'c']: comma separates rungs, `|` separates the models of a rung."""
+    rungs = ['|'.join(ladder_group(entry)) for entry in text.split(',')]
+    return [rung for rung in rungs if rung]
+
+
 def _is_free_model(model):
     return model.split('#', 1)[0].endswith('-free')
 
@@ -1343,14 +1359,36 @@ class Farm:
 
     def _audit_model(self, preferred):
         """Keep the preferred auditor when usable, otherwise use an available ladder rung."""
-        return next((model for model in (preferred, *reversed(self.config.ladder))
+        return next((model for model in (preferred, *reversed(ladder_models(self.config.ladder)))
                      if self._available(model)), None)
+
+    def _running_count(self, model):
+        return sum(1 for job, _, _ in self.running if job['model'] == model)
+
+    def _least_busy(self, models):
+        """The model with the fewest running jobs; the group's order breaks ties."""
+        return min(models, key=lambda m: self._running_count(m)) if models else None
+
+    def _rung_paused(self, rung):
+        """A rung paused by a usage limit: every model not retired is limited."""
+        live = [m for m in ladder_group(self.config.ladder[rung]) if m not in self.state['unavailable_models']]
+        return bool(live) and all(self._limited_until(m) for m in live)
+
+    def _paused_from(self, start):
+        return any(self._rung_paused(r) for r in range(start, len(self.config.ladder)))
+
+    def _group_model(self, rung):
+        """A concrete model of the rung: the least busy available one, else the least busy not retired."""
+        group = ladder_group(self.config.ladder[rung])
+        pool = [m for m in group if self._available(m)]             or [m for m in group if m not in self.state['unavailable_models']] or group
+        return self._least_busy(pool)
 
     def _rung_model(self, rung):
         """First available ladder model at or above rung, or (None, rung) when none remain."""
         while rung < len(self.config.ladder):
-            if self._available(self.config.ladder[rung]):
-                return self.config.ladder[rung], rung
+            usable = [m for m in ladder_group(self.config.ladder[rung]) if self._available(m)]
+            if usable:
+                return self._least_busy(usable), rung
             rung += 1
         return None, rung
 
@@ -1377,8 +1415,7 @@ class Farm:
             if model is not None:
                 job.update(model=model, rung=rung)
                 return self.pending.pop(i)
-            if not any(self._limited_until(m) for m in self.config.ladder[job['rung']:]
-                       if m not in self.state['unavailable_models']):
+            if not self._paused_from(job['rung']):
                 self.pending.pop(i)
                 self._park(job['fn'], 'no available model on the ladder')
                 continue
@@ -1719,13 +1756,12 @@ class Farm:
         start = 0 if job.get('_recheck') else job['rung'] + 1
         model, rung = self._rung_model(start)
         # A rung paused by a usage limit is not exhausted: the job waits in pending for it.
-        paused = model is None and any(self._limited_until(m) for m in self.config.ladder[start:]
-                                       if m not in self.state['unavailable_models'])
+        paused = model is None and self._paused_from(start)
         if (model is not None or paused) and self.stopping():
             # The ladder is not exhausted; the next run's frontier scan dispatches it again.
             self.cmre.release(self.config.owner, [fn])
         elif model is not None or paused:
-            model, rung = (model, rung) if model is not None else (self.config.ladder[start], start)
+            model, rung = (model, rung) if model is not None else (self._group_model(start), start)
             source = Path(job['source'])
             prior_source = source.read_bytes() if source.exists() else None
             nxt = self._new_job('translate', fn, model, rung, bytes=job['bytes'],
@@ -2104,7 +2140,7 @@ class Farm:
         rounds = self.state['fix_rounds'].get(fn, 0)
         if rounds < MAX_FIX_ROUNDS and not self.stopping():
             self.state['fix_rounds'][fn] = rounds + 1
-            fix = self._new_job('fix', fn, self.config.ladder[-1], len(self.config.ladder) - 1,
+            fix = self._new_job('fix', fn, self._group_model(len(self.config.ladder) - 1), len(self.config.ladder) - 1,
                                 bytes=self.state['accepted'][fn]['bytes'],
                                 findings=json.loads(json.dumps(findings)),
                                 _origin_review=json.loads(json.dumps(self.state['audits'].get(fn, {}).get('review'))))
@@ -4261,7 +4297,7 @@ def build_parser():
     r = sub.add_parser('run', help='dispatch, gate and accept until the deadline or STOP')
     r.add_argument('run_dir')
     r.add_argument('--workers', type=int, default=12)
-    r.add_argument('--ladder', default=','.join(DEFAULT_LADDER), help='comma-separated provider/model escalation order')
+    r.add_argument('--ladder', default=','.join(DEFAULT_LADDER), help='comma-separated escalation order; a rung may mix models as a|b (least busy available one runs)')
     r.add_argument('--audit-workers', type=int, default=4)
     r.add_argument('--audit-model', default=DEFAULT_AUDIT_MODEL)
     r.add_argument('--attempt-minutes', type=float, default=30)
@@ -4383,7 +4419,7 @@ def run_parser_defaults():
 def main(argv=None):
     a = build_parser().parse_args(argv)
     if a.action == 'probe':
-        models = list(dict.fromkeys(m.strip() for m in a.ladder.split(',') if m.strip()))
+        models = ladder_models(parse_ladder(a.ladder))
         results = probe(models, a.opencode)
         for model, error in results.items():
             print(f'{model}: OK' if error is None else f'{model}: UNAVAILABLE {error[:160]}')
@@ -4601,7 +4637,7 @@ def main(argv=None):
         s['running'] = running_from_events(run_dir / 'events.jsonl')
         print(json.dumps(s, indent=1) if a.json else status_line(s))
         return 0
-    config = FarmConfig(workers=a.workers, ladder=[m.strip() for m in a.ladder.split(',') if m.strip()],
+    config = FarmConfig(workers=a.workers, ladder=parse_ladder(a.ladder),
                         audit_workers=a.audit_workers, audit_model=a.audit_model,
                         attempt_minutes=a.attempt_minutes, hours=a.hours or None, min_bytes=a.min_bytes,
                         max_bytes=a.max_bytes, include_held=a.include_held,
@@ -4628,7 +4664,7 @@ def set_control(run_dir, a):
     and again after any restart, so no setting change needs a drain."""
     values = {key: getattr(a, key) for key in CONTROL_KEYS if getattr(a, key, None) is not None}
     if 'ladder' in values:
-        values['ladder'] = [m.strip() for m in values['ladder'].split(',') if m.strip()]
+        values['ladder'] = parse_ladder(values['ladder'])
         if not values['ladder']:
             print('set: --ladder needs at least one model', file=sys.stderr)
             return 2

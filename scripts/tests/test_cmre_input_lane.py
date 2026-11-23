@@ -837,3 +837,32 @@ def test_a_busy_lane_still_refreshes_on_the_long_period(tmp_path):
     clock['now'] += 101
     l.tick()
     assert ops.candidate_calls == 2
+
+
+# -- mixed model rungs
+
+def test_a_mixed_rung_spreads_jobs_by_running_count_and_skips_limited_members(tmp_path):
+    l, _, _, clock = make_lane(tmp_path, {})
+    l.ladder = ['p/a|q/b', 'r/strong']
+    assert l._model(0) == 'p/a'
+    l.running.append(({'model': 'p/a'}, None, 0))
+    assert l._model(0) == 'q/b'
+    l.running.append(({'model': 'q/b'}, None, 0))
+    l.running.append(({'model': 'q/b'}, None, 0))
+    assert l._model(0) == 'p/a'
+    l.state['limited']['p'] = clock['now'] + 600
+    assert l._model(0) == 'q/b'
+    l.state['limited']['q'] = clock['now'] + 600
+    assert l._model(0) == 'r/strong'      # the whole rung is down: the next rung
+    assert l._model(1) == 'r/strong'
+    l.state['limited']['r'] = clock['now'] + 600
+    assert l._model(0) is None
+
+
+def test_the_lane_reads_grouped_ladders_from_control_and_dispatches_concrete_models(tmp_path):
+    l, _, launcher, _ = make_lane(tmp_path, {'fn_00401000': candidate(700), 'fn_00401100': candidate(600)})
+    (l.run_dir / 'control.json').write_text(json.dumps({'ladder': ['p/a|q/b', 'r/strong']}))
+    l._control()
+    assert l.ladder == ['p/a|q/b', 'r/strong']
+    l.tick()
+    assert sorted(job['model'] for job, _, _ in launcher.started) == ['p/a', 'q/b']
