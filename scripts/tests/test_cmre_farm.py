@@ -6377,3 +6377,52 @@ def test_the_input_lane_receives_grouped_rungs_intact(root):
     f.tick()
     arg = procs[0].command[procs[0].command.index('--ladder') + 1]
     assert arg == 'a/x|b/y,c/strong'
+
+
+LISTING_LINES_TEXT = ''.join(f' *   {0x00401000 + 2 * i:08x}  mov eax, dword ptr [esp + {4 * i}]\n' for i in range(9))
+LISTED = '/* Listing:\n' + LISTING_LINES_TEXT + ' */\n' + GOOD
+
+
+def test_the_translator_prompt_forbids_pasted_instruction_listings(root):
+    job = {'fn': 'fn_00401000', 'bytes': 200, 'source': str(root / 'recovery/c/fn_00401000.c'), 'kind': 'translate'}
+    text = farm.translate_prompt(root, job)
+    assert 'Do not paste' in text and 'instruction' in text and 'address' in text
+
+
+def test_a_next_rung_is_told_to_strip_the_previous_listing(root):
+    job = {'fn': 'fn_00401000', 'bytes': 200, 'source': str(root / 'recovery/c/fn_00401000.c'), 'kind': 'translate',
+           'prior': {'model': 'm/cheap', 'detail': farm.LISTING_REFUSAL + ': 9 lines'}, '_seed_bytes': b'x'}
+    assert 'Remove the address-keyed instruction listing' in farm.translate_prompt(root, job)
+
+
+def test_a_passing_candidate_with_a_pasted_listing_is_sent_back_once_then_gated(root):
+    now = [0.0]
+    f, cmre, launcher = early_fail_farm(root, ReportingHandle('FARM-RESULT: pass', 3), write_source(GOOD), now)
+    launcher.plan = lambda job: (Path(job['source']).write_text(LISTED), ReportingHandle('FARM-RESULT: pass', 3))[1]
+    drain(f, 6)
+    assert len(launcher.resumed) == 1
+    message = launcher.resumed[0][1]
+    assert 'address-keyed instruction listing' in message and 'without changing' in message
+    nudged = [e for e in events(f.run_dir) if e['event'] == 'nudged']
+    assert nudged and nudged[0]['reason'] == 'listing'
+    assert cmre.accepted == ['fn_00401000']
+    assert all(source is None or '00401000  mov' not in Path(source).read_text() for _, source in cmre.tests)
+
+
+def test_a_listing_that_survives_the_nudge_is_refused_before_the_gate(root):
+    now = [0.0]
+    f, cmre, launcher = early_fail_farm(root, ReportingHandle('FARM-RESULT: pass', 3), write_source(LISTED), now)
+    launcher.plan = lambda job: (Path(job['source']).write_text(LISTED), ReportingHandle('FARM-RESULT: pass', 3))[1]
+    drain(f, 8)
+    assert len(launcher.resumed) == 1 and cmre.accepted == []
+    assert farm.LISTING_REFUSAL in json.dumps(f.state['parked'])
+    assert not [s for _, s in cmre.tests if s and 'mov eax' in Path(s).read_text()]
+
+
+def test_a_listing_without_a_resumable_session_escalates_to_the_next_rung(root):
+    f, cmre, launcher = make(root, [item('fn_00401000')],
+                             writes(lambda job: LISTED if job['model'] == 'm/cheap' else GOOD), workers=1)
+    drain(f)
+    assert [j['model'] for j, _, _ in launcher.started] == ['m/cheap', 'm/strong']
+    assert farm.LISTING_REFUSAL in launcher.started[1][0]['prior']['detail']
+    assert cmre.accepted == ['fn_00401000']

@@ -152,6 +152,43 @@ def test_short_listings_and_prose_addresses_are_not_findings(originals):
         assert pub.scan_blob("recovery/c/fn_00401000.c", text.encode(), originals["index"]) == []
 
 
+HEAP_WRAPPER = [
+    ("0056f230", "push esi"), ("0056f231", "mov esi, ecx"), ("0056f233", "call 0x56f250"),
+    ("0056f238", "test byte ptr [esp + 8], 1"), ("0056f23d", "je 0x56f248"), ("0056f23f", "push esi"),
+    ("0056f240", "call 0x944c94"), ("0056f245", "add esp, 4"), ("0056f248", "mov eax, esi"),
+    ("0056f24a", "pop esi"), ("0056f24b", "ret 4"),
+]
+LISTING_SHAPES = {
+    "bare-in-comment": lambda a, i: f" *   {a}  {i}\n",
+    "0x-in-comment": lambda a, i: f" *   0x{a}  {i}\n",
+    "colon-and-arrow-note": lambda a, i: f"{a}: {i} -> keeps the receiver\n",
+    "pipe": lambda a, i: f"{a} | {i}\n",
+    "arrow-separator": lambda a, i: f"0x{a} -> {i}   ; note\n",
+    "trailing-semicolon-note": lambda a, i: f" *   {a}  {i}                      ; note\n",
+}
+
+
+@pytest.mark.parametrize("shape", sorted(LISTING_SHAPES))
+def test_address_keyed_listing_shapes_are_found(originals, shape):
+    text = "/* map\n" + "".join(LISTING_SHAPES[shape](a, i) for a, i in HEAP_WRAPPER) + " */\n"
+    found = pub.scan_blob("recovery/c/fn_0056f230.c", text.encode(), originals["index"])
+    assert kinds(found) == ["instruction-listing"]
+
+
+def test_branch_and_ret_operands_count_toward_a_listing(originals):
+    text = "".join(f" *   {a}  {i}\n" for a, i in HEAP_WRAPPER if i.split()[0] in {"call", "je", "ret"}) * 3
+    assert kinds(pub.scan_blob("recovery/c/fn_0056f230.c", text.encode(), originals["index"])) == ["instruction-listing"]
+
+
+def test_inline_tags_and_prose_with_addresses_are_not_listings(originals):
+    inline = "".join(f"    x = {i}; /* 0x{0x0090b083 + i:08x} */\n" for i in range(12))
+    prose = "".join(f" * 0x{0x00401000 + i:08x} and 0x{0x00402000 + i:08x} call 0x{0x00403000 + i:08x} sites differ\n"
+                    for i in range(12))
+    ranges = "".join(f" * {0x0090f4d0 + i:08x}..{0x0090f4e0 + i:08x} jump 5 times, then ret\n" for i in range(12))
+    for text in (inline, prose, ranges):
+        assert pub.scan_blob("recovery/c/fn_0090b080.c", text.encode(), originals["index"]) == []
+
+
 @pytest.mark.parametrize("secret", [
     "token = 'ghp_" + "a1B2" * 9 + "'",
     "github_pat_" + "A1b2C3d4E5" * 5,
@@ -442,3 +479,21 @@ def test_verify_remote_requires_the_scanned_destination(originals, tmp_path, mon
     assert pub.verify_remote(args) == 0
     target["url"] = "https://example.invalid/changed.git"
     assert pub.verify_remote(args) == 1
+
+
+INSTRUCTION_MAP = """/* Instruction map (listing in the brief):
+ *   0090a310 push esi            -> keep incoming ESI/self across the calls
+ *   0090a311 mov esi, ecx        -> self = ECX (thiscall receiver)
+ *   0090a313 call 0x90a330       -> forward ECX as thiscall receiver
+ *   0090a318 test byte [esp+8],1 -> test the LOW BYTE of the only stack arg
+ *   0090a31f/320/325              -> push self, cdecl cm_fn_00944c94, add esp,4
+ *   0090a328 mov eax, esi        -> return self in EAX (no EDX writer)
+ *   0090a32a pop esi             -> restore the saved register
+ *   0090a32b ret 4               -> one 4-byte caller-cleaned stack arg
+ */
+"""
+
+
+def test_instruction_map_with_compact_address_group_is_found(originals):
+    found = pub.scan_blob("recovery/c/fn_0090a310.c", INSTRUCTION_MAP.encode(), originals["index"])
+    assert kinds(found) == ["instruction-listing"]

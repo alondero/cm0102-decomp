@@ -14,7 +14,7 @@ a commit is pushed, this scanner checks them against the local supplied files:
   coincidental English and identifiers (API, DLL and symbol names) are not
   content; a file may quote briefly, but one quote of TEXT_QUOTE_LIMIT or a
   total of TEXT_FILE_LIMIT characters (a pasted string table) is blocked.
-- instruction-listing: LISTING_LINES or more lines pairing an original address
+- instruction-listing: LISTING_LINES or more lines pairing an original address (bare or 0x, with : | -> separators)
   with an x86 instruction.
 - credential, asset-path (supplied, generated or build paths), binary content,
   and private-history (ancestry shared with the prior local history).
@@ -72,12 +72,22 @@ PRINTABLE = re.compile(rb"[\x20-\x7e\t\r\n]+")
 MNEMONIC = (rb"mov[a-z]*|lea|push[a-z]*|pop[a-z]*|call|jmp|j[a-z]{1,3}|ret[nf]?|cmp[a-z]*|test|x?add|sub|adc|sbb"
             rb"|xor|and|or|not|neg|inc|dec|i?mul|i?div|sh[lr]d?|sa[lr]|ro[lr]|rc[lr]|cdq|cwde|leave|nop|int3?"
             rb"|xchg|set[a-z]{1,3}|cmov[a-z]{1,3}|bt[a-z]?|f[a-z]{1,6}|stos[bwd]?|lods[bwd]?|scas[bwd]?|rep[a-z]*")
+# Immediate and branch-target operands are claimed only by mnemonics that take them, so prose such
+# as "0x401000 and 0x402000" stays prose.
+IMMEDIATE = rb"(?:0x[0-9a-f]+|[0-9]+|(?:loc|sub|v)_[0-9a-f]+)(?![0-9a-z_])"
+TARGET_MNEMONIC = rb"(?:call|jmp|j[a-z]{1,3}|ret[nf]?|push|int3?)"
 OPERAND = rb"(?:%|\[|(?:byte|word|dword|qword|tbyte)\b|e?[a-d]x\b|[a-d][lh]\b|e?[sd]i\b|e?[bs]p\b|st\b|st\(\d\))"
 # A label may stand on its own line above its instruction, as in lifted assembly.
-LISTING = re.compile(rb"(?im)^[^\n]*?(?<![\w])(?:v_|loc_|sub_|0x)?(?:00)?[4-9a-f][0-9a-f]{5}h?(?![0-9a-z_])[ \t]*"
-                     rb"(?::[ \t]*\r?\n?)?[ \t]*"
-                     rb"(?:[0-9a-f]{2}[ \t]+)*(?:(?:lock|rep[a-z]*)[ \t]+)?(?:" + MNEMONIC + rb")"
-                     rb"(?:[ \t]+" + OPERAND + rb"|[ \t]*(?:$|\\n|\"))")
+# The address may be bare or 0x-prefixed and may be followed by ":", "|" or "->" before the instruction.
+_LISTING_ADDRESS = (rb"(?<![\w])(?:v_|loc_|sub_|0x)?(?:00)?[4-9a-f][0-9a-f]{5}h?(?![0-9a-z_])[ \t]*"
+                    rb"(?:(?::[ \t]*\r?\n?|\||->)[ \t]*)?"
+                    rb"(?:[0-9a-f]{2}[ \t]+)*")
+LISTING = re.compile(rb"(?im)^[^\n]*?" + _LISTING_ADDRESS + rb"(?:(?:lock|rep[a-z]*)[ \t]+)?(?:" + MNEMONIC + rb")"
+                     rb"(?:[ \t]+" + OPERAND + rb"|[ \t]*(?:$|\n|\"))")
+# Immediates are claimed only for an address that opens the line, after comment or quote decoration.
+LISTING_TARGET = re.compile(rb"(?im)^[ \t*/#;\"'|]*" + _LISTING_ADDRESS + TARGET_MNEMONIC + rb"[ \t]+" + IMMEDIATE)
+# A compact group such as "0090a31f/320/325 -> note" stands for several listed instructions.
+LISTING_GROUP = re.compile(rb"(?im)^[ \t*/#;\"'|]*(?:v_|loc_|sub_|0x)?(?:00)?[4-9a-f][0-9a-f]{5}(?:/[0-9a-f]{2,6})+[ \t]*(?:->|:|\|)")
 CREDENTIAL = re.compile(rb"gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|-----BEGIN [A-Z ]*PRIVATE KEY-----"
                         rb"|\bAKIA[0-9A-Z]{16}\b|sk-ant-[A-Za-z0-9_-]{20,}|\bxox[abprs]-[A-Za-z0-9-]{10,}"
                         rb"|AIza[0-9A-Za-z_-]{35}")
@@ -335,7 +345,8 @@ def content_findings(path: str, data: bytes, index: OriginalIndex, source_review
 
 def instruction_listing_findings(path: str, data: bytes, source_reviews=None) -> list[Finding]:
     """Advisory provenance findings for authored candidate bytes."""
-    listing = list(LISTING.finditer(data))
+    listing = sorted({m.start(): m for pattern in (LISTING, LISTING_TARGET, LISTING_GROUP) for m in pattern.finditer(data)}.values(),
+                     key=lambda m: m.start())
     if len(listing) < LISTING_LINES or (path, env.digest_bytes(data)) in (source_reviews or {}):
         return []
     first = _line(data, listing[0].start())
