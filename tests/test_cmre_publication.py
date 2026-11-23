@@ -152,12 +152,10 @@ def test_short_listings_and_prose_addresses_are_not_findings(originals):
         assert pub.scan_blob("recovery/c/fn_00401000.c", text.encode(), originals["index"]) == []
 
 
-HEAP_WRAPPER = [
-    ("0056f230", "push esi"), ("0056f231", "mov esi, ecx"), ("0056f233", "call 0x56f250"),
-    ("0056f238", "test byte ptr [esp + 8], 1"), ("0056f23d", "je 0x56f248"), ("0056f23f", "push esi"),
-    ("0056f240", "call 0x944c94"), ("0056f245", "add esp, 4"), ("0056f248", "mov eax, esi"),
-    ("0056f24a", "pop esi"), ("0056f24b", "ret 4"),
-]
+# Synthetic wrapper-shaped instructions at made-up addresses (no original bytes or listings).
+HEAP_WRAPPER = [(f"{0x00401000 + 4 * n:08x}", insn) for n, insn in enumerate([
+    "push esi", "mov esi, ecx", "call 0x401200", "test byte ptr [esp + 8], 1", "je 0x401028",
+    "push esi", "call 0x401300", "add esp, 4", "mov eax, esi", "pop esi", "ret 4"])]
 LISTING_SHAPES = {
     "bare-in-comment": lambda a, i: f" *   {a}  {i}\n",
     "0x-in-comment": lambda a, i: f" *   0x{a}  {i}\n",
@@ -481,17 +479,24 @@ def test_verify_remote_requires_the_scanned_destination(originals, tmp_path, mon
     assert pub.verify_remote(args) == 1
 
 
-INSTRUCTION_MAP = """/* Instruction map (listing in the brief):
- *   0090a310 push esi            -> keep incoming ESI/self across the calls
- *   0090a311 mov esi, ecx        -> self = ECX (thiscall receiver)
- *   0090a313 call 0x90a330       -> forward ECX as thiscall receiver
- *   0090a318 test byte [esp+8],1 -> test the LOW BYTE of the only stack arg
- *   0090a31f/320/325              -> push self, cdecl cm_fn_00944c94, add esp,4
- *   0090a328 mov eax, esi        -> return self in EAX (no EDX writer)
- *   0090a32a pop esi             -> restore the saved register
- *   0090a32b ret 4               -> one 4-byte caller-cleaned stack arg
- */
-"""
+def _instruction_map():
+    """A synthetic instruction map in the shape workers paste, built at runtime so this
+    test file never carries a listing (or original bytes) of its own."""
+    rows = [("push esi", "keep the register"), ("mov esi, ecx", "receiver"),
+            ("call 0x401100", "callee"), ("test byte [esp+8],1", "flag"), (None, "grouped calls"),
+            ("mov eax, esi", "result"), ("pop esi", "restore"), ("ret 4", "cleanup")]
+    lines = ["/* Instruction map (listing in the brief):"]
+    for i, (insn, note) in enumerate(rows):
+        address = 0x00401000 + 3 * i
+        if insn is None:
+            lead = f"{address:08x}/{(address + 1) & 0xfff:03x}/{(address + 6) & 0xfff:03x}"
+            lines.append(f" *   {lead:<29} -> {note}")
+        else:
+            lines.append(f" *   {address:08x} {insn:<19} -> {note}")
+    return "\n".join(lines + [" */", ""])
+
+
+INSTRUCTION_MAP = _instruction_map()
 
 
 def test_instruction_map_with_compact_address_group_is_found(originals):
