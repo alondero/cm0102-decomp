@@ -120,24 +120,52 @@ MAX_PATH = 260
 
 
 def _plain_match(name: bytes, pattern: bytes) -> bool:
-    """`*` = any run, `?` = exactly one byte, other bytes literal (case-sensitive)."""
+    """`*` = any run, `?` = exactly one byte, other bytes literal (case-sensitive).
+
+    Trailing dots and spaces are dropped from the pattern first, as Windows does."""
     import fnmatch
-    return fnmatch.fnmatchcase(name.decode("latin-1"),
-                               pattern.decode("latin-1").replace("[", "[[]"))
+    stripped = pattern.rstrip(b". ")
+    return bool(stripped) and fnmatch.fnmatchcase(name.decode("latin-1"),
+                                                  stripped.decode("latin-1").replace("[", "[[]"))
 
 
-def _pattern_name(seed: int, index: int, pattern: bytes) -> bytes:
-    """A name that plainly matches `pattern`; Windows' DOS wildcard rules accept a superset."""
+MAX_NAME = 255  # longest file-name component (NAME_MAX)
+
+
+def _pattern_name(seed: int, index: int, pattern: bytes) -> bytes | None:
+    """A name that plainly matches `pattern`, or None when no legal name can.
+
+    `pattern` is already trimmed by `_usable_pattern`. The name is never empty, never
+    ends in a dot or space (Windows strips them), and is at most MAX_NAME bytes."""
     out = bytearray()
     for position, char in enumerate(pattern):
         if char == 0x2A:      # '*': zero to eight seeded bytes
-            for k in range(_mix(seed, index, 100 + 2 * position) % 9):
+            count = _mix(seed, index, 100 + 2 * position) % 9
+            if count == 0 and not out and not pattern[position + 1:].replace(b"*", b""):
+                count = 1     # nothing else can supply a character: keep the name non-empty
+            for k in range(count):
                 out.append(_NAME_CHARS[_mix(seed, index, 1000 + 16 * position + k) % len(_NAME_CHARS)])
         elif char == 0x3F:    # '?': exactly one seeded byte
             out.append(_NAME_CHARS[_mix(seed, index, 101 + 2 * position) % len(_NAME_CHARS)])
         else:
             out.append(char)
-    return bytes(out[:MAX_PATH - 1])
+    if out[-1:] in (b".", b" "):
+        if pattern[-1:] != b"*":
+            return None
+        # A trailing '*' that expanded to nothing after a literal dot: add one seeded byte.
+        out.append(_NAME_CHARS[_mix(seed, index, 1000 + 16 * len(pattern) + 8) % len(_NAME_CHARS)])
+    return bytes(out) if len(out) <= MAX_NAME else None
+
+
+# DOS wildcards and characters Windows rejects in a file name: such a pattern cannot constrain names.
+_ILLEGAL_PATTERN_BYTES = frozenset(b'<>"|:\\/') | frozenset(range(0x20))
+
+
+def _usable_pattern(pattern: bytes) -> bytes | None:
+    """The pattern once trailing dots/spaces are dropped; None when it cannot constrain names."""
+    if set(pattern) & _ILLEGAL_PATTERN_BYTES:
+        return None
+    return pattern.rstrip(b". ") or None
 
 
 def find_data(seed: int, index: int, pattern: bytes | None = None) -> bytes:
@@ -147,20 +175,26 @@ def find_data(seed: int, index: int, pattern: bytes | None = None) -> bytes:
     as FindFirstFileA/FindNextFileA document. Without one the name is unconstrained.
     Times are valid FILETIMEs and cAlternateFileName stays empty (a volume may omit
     8.3 names). Test scaffolding, not a file system."""
+    if pattern is not None:
+        pattern = _usable_pattern(pattern)
     kind = _mix(seed, index, 1) % 8
-    if pattern is None:
-        if kind < 2:
-            name, attrs = (b".", b"..")[kind], 0x10
-        else:
-            name = b"F%07X.DAT" % (_mix(seed, index, 2) & 0xFFFFFFF)
-            attrs = (0x10, 0x20, 0x01, 0x80)[_mix(seed, index, 3) % 4]
-            if attrs == 0x10:
-                name = name[:8]
-    elif kind < 2 and _plain_match((b".", b"..")[kind], pattern):
+    # "." and ".." are listed only for a `*` or literal-dot pattern (not `?`), and are directories.
+    dot_listed = kind < 2 and (pattern is None
+                               or (pattern[:1] in (b"*", b".") and _plain_match((b".", b"..")[kind], pattern)))
+    if dot_listed:
         name, attrs = (b".", b"..")[kind], 0x10
+    elif pattern is None:
+        name = b"F%07X.DAT" % (_mix(seed, index, 2) & 0xFFFFFFF)
+        attrs = (0x10, 0x20, 0x01, 0x80)[_mix(seed, index, 3) % 4]
+        if attrs == 0x10:
+            name = name[:8]
     else:
         name = _pattern_name(seed, index, pattern)
+        if name is None:  # no legal name can match: search without the constraint
+            return find_data(seed, index)
         attrs = (0x10, 0x20, 0x01, 0x80)[_mix(seed, index, 3) % 4]
+    if name in (b".", b".."):
+        attrs = 0x10
     times = b"".join(
         (0x01C00000_00000000 + (_mix(seed, index, 4 + i) << 20) + _mix(seed, index, 8 + i)).to_bytes(8, "little")
         for i in range(3))
@@ -205,6 +239,8 @@ def search_pattern(read, address: int) -> bytes | None:
     else:
         return None
     component = bytes(raw).replace(b"/", b"\\").rsplit(b"\\", 1)[-1].rsplit(b":", 1)[-1]
+    if set(component) & _ILLEGAL_PATTERN_BYTES:
+        return None
     return component or None
 
 
@@ -221,8 +257,11 @@ def outputs(name: str, args: tuple, value: int, seed: int, index: int, read,
         if value == 0xFFFFFFFF:
             return []
         pattern = search_pattern(read, args[0])
-        if patterns is not None and pattern is not None:
-            patterns[value] = pattern
+        if patterns is not None:
+            if pattern is None:
+                patterns.pop(value, None)  # this search is unconstrained: drop any earlier pattern on the handle
+            else:
+                patterns[value] = pattern
         return [(args[1], find_data(seed, index, pattern))]
     if name == "KERNEL32.dll!FindNextFileA":
         pattern = patterns.get(args[0]) if patterns is not None else None

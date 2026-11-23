@@ -99,6 +99,7 @@ class Machine:
         self.pristine: dict[int, bytes] = {}
         self._original_pages: set[int] = set()
         self._common_pages: set[int] = set()
+        self.find_patterns: dict[int, bytes] = {}  # FindFirstFileA handle -> search pattern (reset per run)
         self._recovered_pages: dict[int, dict] = {}
         # Real PE protections: a store into .text/.rdata faults, as it would in the process.
         self._map(original.base, original.headers, perms=unicorn.UC_PROT_READ, origin='original')
