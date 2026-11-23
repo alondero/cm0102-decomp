@@ -44,7 +44,8 @@ sys.path.insert(0, str(ROOT))
 
 TOOL_VERSION = 'input-probe/1'
 PROVENANCE_KIND = 'authored-structured-entry-inputs'
-MAX_EXPANDED = 2048     # fixtures one spec may expand to
+MAX_EXPANDED = 600      # fixtures one spec may expand to: the gate runs 600 cases (difftest.DEFAULTS['cases'])
+                        # and a fixture is only drawn among them, so more expansions can never run
 MAX_SELECTED = 48       # fixtures one gate adds: each must still be drawn among ~300 fixture cases
 SPEC_KEYS = {'notes', 'base', 'fixtures'}
 FIXTURE_KEYS = {'name', 'regs', 'stack', 'template', 'zero', 'dwords', 'bytes', 'ascii',
@@ -101,6 +102,11 @@ def _set_path(fixture, field, raw):
         raise ValueError(f'unsupported vary field {field!r}')
 
 
+def _too_many(what):
+    return (f'{what} expands to more than {MAX_EXPANDED} fixtures; the gate runs only '
+            f'{MAX_EXPANDED} cases, so narrow the vary ranges (use fewer, more varied fixtures)')
+
+
 def _variants(compact):
     vary = compact.get('vary', [])
     if not isinstance(vary, list):
@@ -112,7 +118,7 @@ def _variants(compact):
         if 'range' in axis:
             span = range(*[value(v) for v in axis['range']])
             if len(span) > MAX_EXPANDED:   # len() of a range is O(1): refuse before building it
-                raise ValueError(f'vary range expands to more than {MAX_EXPANDED} fixtures; narrow it')
+                raise ValueError(_too_many('vary range'))
             values = list(span)
         else:
             values = list(axis.get('values') or [])
@@ -123,7 +129,7 @@ def _variants(compact):
     for _, values in axes:
         total *= len(values)
     if total > MAX_EXPANDED:
-        raise ValueError(f'vary axes expand to more than {MAX_EXPANDED} fixtures; narrow the vary axes')
+        raise ValueError(_too_many('vary axes'))
     base = {k: v for k, v in compact.items() if k != 'vary'}
     for combo in itertools.product(*[values for _, values in axes]):
         fixture = copy.deepcopy(base)
@@ -194,8 +200,10 @@ def _encode(compact, arg_count, templates, regs_names, arena):
     return fixture
 
 
-def expand(spec, arg_count, templates, regs_names=None, arena=None):
-    """[(name, canonical fixture)] for every fixture and `vary` combination of a spec."""
+def iter_expand(spec, arg_count, templates, regs_names=None, arena=None):
+    """Yield (name, canonical fixture) for every fixture and `vary` combination of a spec,
+    one at a time: a fixture can carry tens of thousands of arena writes, so callers keep
+    only what they need."""
     from cmre import emu
     regs_names = regs_names or emu.REG_NAMES
     arena = _arena_base() if arena is None else arena
@@ -204,20 +212,33 @@ def expand(spec, arg_count, templates, regs_names=None, arena=None):
     base = spec.get('base', {})
     if not isinstance(base, dict):
         raise ValueError('base must be an object')
-    out = []
+    count = 0
     for index, compact in enumerate(spec['fixtures']):
         if not isinstance(compact, dict):
             raise ValueError('each fixture must be an object')
         merged = _merge(base, compact)
         name = str(merged.pop('name', f'f{index}'))
         for n, variant in enumerate(_variants(merged)):
-            out.append((name if 'vary' not in merged else f'{name}#{n}',
-                        _encode(variant, arg_count, templates, regs_names, arena)))
-            if len(out) > MAX_EXPANDED:
-                raise ValueError(f'spec expands to more than {MAX_EXPANDED} fixtures; narrow the vary axes')
-    if not out:
+            count += 1
+            if count > MAX_EXPANDED:
+                raise ValueError(_too_many('spec'))
+            yield (name if 'vary' not in merged else f'{name}#{n}',
+                   _encode(variant, arg_count, templates, regs_names, arena))
+    if not count:
         raise ValueError('spec has no fixtures')
-    return out
+
+
+def expand(spec, arg_count, templates, regs_names=None, arena=None):
+    """[(name, canonical fixture)] for a whole spec (small specs and tests)."""
+    return list(iter_expand(spec, arg_count, templates, regs_names, arena))
+
+
+def picked_fixtures(spec, indices, arg_count, templates, regs_names=None, arena=None):
+    """The canonical fixtures at the given expansion indices, regenerated one at a time."""
+    wanted = set(indices)
+    found = {i: fixture for i, (_, fixture) in enumerate(iter_expand(spec, arg_count, templates, regs_names, arena))
+             if i in wanted}
+    return [found[i] for i in indices]
 
 
 def select(rows, baseline, limit=MAX_SELECTED):
@@ -286,11 +307,12 @@ def _context(va):
 def _run_rows(va, spec, context=None):
     from cmre import difftest
     starts, opts, machine, templates = context or _context(va)
-    rows = []
-    for name, fixture in expand(spec, opts.arg_count, templates):
+    rows = []   # (name, None, covered, outcome, detail): fixtures are regenerated for the picks only
+    for name, fixture in iter_expand(spec, opts.arg_count, templates):
         case = difftest._fixture_case(fixture, templates, opts.arg_count)
         result = machine.run(va, case, opts.budget)
-        rows.append((name, fixture, result.covered & starts, result.outcome, result.detail))
+        rows.append((name, None, result.covered & starts, result.outcome, result.detail))
+        del fixture, case, result
     return starts, opts, machine, templates, rows
 
 
@@ -343,7 +365,7 @@ def gate_spec(va, spec, spec_bytes, proposal_path, model=None):
                   'kind': PROVENANCE_KIND, 'tool': TOOL_VERSION, 'target_sha256': env.TARGET_SHA256,
                   'spec_sha256': hashlib.sha256(spec_bytes).hexdigest(),
                   **({'model': model} if model else {})}
-    proposal = merge_hints(current, [rows[i][1] for i in picked], provenance)
+    proposal = merge_hints(current, picked_fixtures(spec, picked, opts.arg_count, templates), provenance)
     difftest.validate_hints(proposal)
     if not append_only(current, proposal):
         raise ValueError('proposal would change existing hints; only appended fixtures are allowed')
