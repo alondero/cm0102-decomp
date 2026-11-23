@@ -534,6 +534,35 @@ def summary(data: dict) -> dict:
             'claims': data['claims']}
 
 
+class ToolchainEnvironmentError(RuntimeError):
+    """The host, not the code under test, stopped the toolchain; the item proves nothing."""
+
+
+# A toolchain that fails for a real reason prints a diagnostic. Exiting non-zero
+# with no text, or reporting resource exhaustion, means the host failed.
+_ENVIRONMENT_STDERR = re.compile(
+    r'out of memory|virtual memory exhausted|cannot allocate memory|no space left|not enough (?:memory|space)'
+    r"|insufficient (?:system )?resources|(?:cannot|can't|unable to) (?:create|open|write) temporary|cannot fork"
+    r'|resource temporarily unavailable|disk full|no memory', re.I)
+
+
+def _environmental(stderr: str) -> bool:
+    return not stderr.strip() or bool(_ENVIRONMENT_STDERR.search(stderr))
+
+
+def toolchain_failure(report: dict) -> str | None:
+    """Describe an environmental toolchain failure in a test report, else None."""
+    for problem in report.get('problems') or []:
+        if isinstance(problem, str) and problem.startswith('assembler:') and _environmental(problem[len('assembler:'):]):
+            return problem
+    for opt, build_report in sorted((report.get('builds') or {}).items()):
+        if (isinstance(build_report, dict) and build_report.get('status') == 'build-failed'
+                and str(build_report.get('detail', '')).startswith(('compile failed', 'link failed'))
+                and _environmental(build_report.get('stderr') or '')):
+            return f"{opt} {build_report['detail']}: {(build_report.get('stderr') or '').strip()[:200] or 'no diagnostics'}"
+    return None
+
+
 def execute_item(va: int, tier: str, refresh: bool) -> tuple[bool, str]:
     record = read(ledger.record_path(va))
     if refresh and (tier == 'c' or not record.get('c')):
@@ -541,6 +570,9 @@ def execute_item(va: int, tier: str, refresh: bool) -> tuple[bool, str]:
         return ok, report.get('status', 'unknown')
     report = recover.test_c(va, fresh=True) if tier == 'c' else recover.test_lifted(va, fresh=True)
     if report['status'] != 'pass':
+        failure = toolchain_failure(report)
+        if failure:
+            raise ToolchainEnvironmentError(failure)
         return False, report['status']
     if report['source_sha256'] != record[tier]['source_sha256']:
         return False, 'source-drift'

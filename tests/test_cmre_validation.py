@@ -621,3 +621,60 @@ def test_tier_key_round_trip(value):
 def test_invalid_tier_keys_are_rejected(value):
     with pytest.raises(ValueError, match='tier key'):
         v.TierKey.parse(value)
+
+
+# Environmental toolchain failures (memory or disk exhaustion) must not become verdicts.
+
+def _item(tier):
+    return {'va': 1, 'tier': tier, 'dependencies': {'x': 1}}
+
+
+def _wire_execute(monkeypatch, tier, report):
+    monkeypatch.setattr(v, 'worker_identity', lambda: {})
+    monkeypatch.setattr(v, 'snapshot', lambda va, t, deps: {'x': 1})
+    monkeypatch.setattr(v, 'read', lambda path: {'lifted': {'source_sha256': 'h'}, 'c': {'source_sha256': 'h'}})
+    monkeypatch.setattr(recover, 'test_lifted' if tier == 'lifted' else 'test_c', report if callable(report) else lambda *a, **k: report)
+    return v.execute(_item(tier), v.digest({}), False)
+
+
+def _c_report(stderr, detail='compile failed: fn_00000001.c'):
+    return {'status': 'fail', 'source_sha256': 'h', 'problems': [],
+            'builds': {'-O0': {'status': 'build-failed', 'detail': detail, 'stderr': stderr}}}
+
+
+@pytest.mark.parametrize('problem', ['assembler: ', 'assembler: fatal error: can\'t create temporary file: No space left on device',
+                                     'assembler: cc1.exe: out of memory allocating 65536 bytes'])
+def test_environmental_assembler_failure_is_inconclusive_error(monkeypatch, problem):
+    out = _wire_execute(monkeypatch, 'lifted', {'status': 'lift-blocked', 'problems': [problem]})
+    assert out['ok'] is False and out['inconclusive'] is True
+    assert out['detail'].startswith('ToolchainEnvironmentError')
+
+
+@pytest.mark.parametrize('stderr', ['', '  \n', 'cc1.exe: out of memory allocating 4096 bytes',
+                                    'gcc: fatal error: cannot create temporary file: No space left on device',
+                                    'ld: final link failed: No space left on device'])
+def test_environmental_c_build_failure_is_inconclusive_error(monkeypatch, stderr):
+    out = _wire_execute(monkeypatch, 'c', _c_report(stderr))
+    assert out['inconclusive'] is True and out['detail'].startswith('ToolchainEnvironmentError')
+
+
+def test_genuine_lift_block_stays_lift_blocked(monkeypatch):
+    for problems in (['unsupported instruction at 0x401000'],
+                     ["assembler: x.S:12: Error: operand type mismatch for `fld'"]):
+        out = _wire_execute(monkeypatch, 'lifted', {'status': 'lift-blocked', 'problems': problems})
+        assert out['detail'] == 'lift-blocked' and not out['inconclusive']
+
+
+def test_genuine_c_compile_error_and_mismatch_stay_fail(monkeypatch):
+    out = _wire_execute(monkeypatch, 'c', _c_report("fn.c:3:5: error: 'x' undeclared"))
+    assert out['detail'] == 'fail' and not out['inconclusive']
+    out = _wire_execute(monkeypatch, 'c', {'status': 'fail', 'source_sha256': 'h', 'problems': [],
+                                           'builds': {'-O0': {'status': 'fail', 'difftest': {}}}})
+    assert out['detail'] == 'fail' and not out['inconclusive']
+
+
+def test_spawn_failures_are_inconclusive_exceptions(monkeypatch):
+    def boom(*a, **k):
+        raise OSError(12, 'Cannot allocate memory')
+    out = _wire_execute(monkeypatch, 'lifted', boom)
+    assert out['detail'].startswith('OSError') and out['inconclusive'] is True
