@@ -270,6 +270,63 @@ def test_commit_scan_marks_removed_content_already_in_local_tracking_history(ori
     assert "history" in finding.detail and tracking in finding.detail
 
 
+def _published_history(originals, repo):
+    """main publishes a dirty blob and later removes it; a PR branch builds on main."""
+    _commit(repo, {"a.txt": originals["image"][100:140].hex().encode()}, "copy")
+    published = _commit(repo, {"a.txt": None, "b.txt": b"clean\n"}, "remove")
+    _git(repo, "update-ref", "refs/remotes/origin/main", published)
+    return published
+
+
+def test_history_only_content_already_on_published_main_is_set_aside(originals, repo):
+    _published_history(originals, repo)
+    _commit(repo, {"c.txt": b"new clean work\n"}, "pr work")
+    public = []
+    _, findings = pub.scan_commit(repo, "fresh", originals["index"], private_refs=(),
+                                  tracking_ref="refs/remotes/origin/pr", published_ref="refs/remotes/origin/main",
+                                  public_history=public)
+    assert findings == []
+    finding, = public
+    assert (finding.path, finding.kind) == ("a.txt", "original-bytes")
+    assert "refs/remotes/origin/main" in finding.detail
+
+
+def test_published_main_does_not_excuse_new_or_tip_content(originals, repo):
+    _published_history(originals, repo)
+    # The same public blob restored at the tip, and a new dirty blob only in branch history.
+    _commit(repo, {"a.txt": originals["image"][100:140].hex().encode(),
+                   "d.txt": originals["image"][300:340].hex().encode()}, "restore and add")
+    _commit(repo, {"d.txt": None}, "drop new dirt")
+    public = []
+    _, findings = pub.scan_commit(repo, "fresh", originals["index"], private_refs=(),
+                                  tracking_ref="refs/remotes/origin/pr", published_ref="refs/remotes/origin/main",
+                                  public_history=public)
+    assert sorted((f.path, f.kind) for f in findings) == [("a.txt", "original-bytes"), ("d.txt", "original-bytes")]
+    assert public == []
+
+
+def test_missing_published_ref_sets_nothing_aside(originals, repo):
+    _commit(repo, {"a.txt": originals["image"][100:140].hex().encode()}, "copy")
+    _commit(repo, {"a.txt": None, "b.txt": b"clean\n"}, "remove")
+    public = []
+    _, findings = pub.scan_commit(repo, "fresh", originals["index"], private_refs=(),
+                                  tracking_ref="refs/remotes/origin/pr", published_ref="refs/remotes/origin/main",
+                                  public_history=public)
+    assert [(f.path, f.kind) for f in findings] == [("a.txt", "original-bytes")]
+    assert public == []
+
+
+def test_receipt_passes_with_public_history_and_records_it(originals, tmp_path):
+    remote = {"name": "origin", "url": "https://example.invalid/source.git", "visibility": "PUBLIC"}
+    public = [pub.Finding("a.txt", "original-bytes", "detail")]
+    path = pub.write_receipt(tmp_path, "a" * 40, [], originals["index"], remote,
+                             public_history=public, published={"ref": "refs/remotes/origin/main", "commit": "b" * 40})
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    assert receipt["result"] == "pass" and receipt["findings"] == []
+    assert receipt["public_history"] == [{"path": "a.txt", "kind": "original-bytes", "detail": "detail"}]
+    assert receipt["published"] == {"ref": "refs/remotes/origin/main", "commit": "b" * 40}
+
+
 def test_commit_scan_rejects_history_shared_with_private_refs(originals, repo):
     _commit(repo, {"a.txt": b"old local history\n"}, "old")
     _git(repo, "branch", "private")

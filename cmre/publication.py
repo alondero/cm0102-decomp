@@ -408,8 +408,14 @@ def _blobs(repo: Path, specs: list[str]):
 
 
 def scan_commit(repo: Path, ref: str, index: OriginalIndex,
-                private_refs=PRIVATE_REFS, source_reviews=None, *, tracking_ref=None) -> tuple[str, list[Finding]]:
-    """Every path and blob reachable from `ref`, and its ancestry against the private history."""
+                private_refs=PRIVATE_REFS, source_reviews=None, *, tracking_ref=None,
+                published_ref=None, public_history=None) -> tuple[str, list[Finding]]:
+    """Every path and blob reachable from `ref`, and its ancestry against the private history.
+
+    A content finding on a blob absent from the scanned tip and already reachable from
+    `published_ref` (the remote's published main) is history this push can neither add nor
+    remove: when `public_history` is a list it goes there instead of the returned findings.
+    Tip content, path findings and private ancestry always block."""
     repo = Path(repo)
     commit = _git(repo, "rev-parse", "--verify", ref + "^{commit}").decode().strip()
     found = []
@@ -442,21 +448,28 @@ def scan_commit(repo: Path, ref: str, index: OriginalIndex,
     kinds = _git(repo, "cat-file", "--batch-check=%(objectname) %(objecttype)",
                  stdin=("\n".join(named) + "\n").encode()).decode().split()
     named = {sha: named[sha] for sha, kind in zip(kinds[::2], kinds[1::2]) if kind == "blob"}
-    tracked = set()
+    def reachable(name):
+        if not name or subprocess.run(["git", "show-ref", "--verify", "--quiet", name], cwd=repo).returncode:
+            return set()
+        return {line.partition(" ")[0] for line in _git(repo, "rev-list", "--objects", name).decode().splitlines()}
+
+    tracked = reachable(tracking_ref)
+    published = reachable(published_ref) if public_history is not None else set()
     tip = {}
-    if tracking_ref:
-        exists = subprocess.run(["git", "show-ref", "--verify", "--quiet", tracking_ref], cwd=repo).returncode
-        if exists == 0:
-            tracked = {line.partition(" ")[0]
-                       for line in _git(repo, "rev-list", "--objects", tracking_ref).decode().splitlines()}
-        for line in _git(repo, "ls-tree", "-r", "-z", commit).decode().split("\0"):
-            if line:
-                meta, path = line.split("\t", 1)
-                tip[path] = meta.split()[2]
+    for line in _git(repo, "ls-tree", "-r", "-z", commit).decode().split("\0"):
+        if line:
+            meta, path = line.split("\t", 1)
+            tip[path] = meta.split()[2]
+    tip_blobs = set(tip.values())
     for sha, data in _blobs(repo, sorted(named)):
         for path in sorted(named[sha]):
             found += path_findings(path)
             entries = content_findings(path, data, index, source_reviews)
+            if entries and sha in published and sha not in tip_blobs:
+                scope = "reachable history only"
+                public_history += [Finding(row.path, row.kind, f"{row.detail} [{scope}; blob {sha[:12]}; "
+                                           f"already published on {published_ref}]") for row in entries]
+                continue
             if tracking_ref:
                 scope = "commit tree" if tip.get(path) == sha else "reachable history only"
                 present = f"; blob already reachable from local {tracking_ref}" if sha in tracked else ""
@@ -499,7 +512,7 @@ def scan_paths(paths, index: OriginalIndex, source_reviews=None) -> list[Finding
 
 
 def write_receipt(directory: Path, commit: str, findings, index: OriginalIndex, remote: dict,
-                  source_reviews=None) -> Path:
+                  source_reviews=None, *, public_history=(), published=None) -> Path:
     passed = not findings and remote.get("visibility") in PUBLICATION_VISIBILITIES and bool(remote.get("url"))
     receipt = {"schema": RECEIPT_SCHEMA, "commit": commit, "result": "pass" if passed else "fail",
                "created": datetime.now(timezone.utc).isoformat(), "target_sha256": env.TARGET_SHA256,
@@ -507,6 +520,7 @@ def write_receipt(directory: Path, commit: str, findings, index: OriginalIndex, 
                "text_limits": {"minimum": TEXT_MINIMUM, "quote": TEXT_QUOTE_LIMIT, "file": TEXT_FILE_LIMIT},
                "index": {"sha256": index.identity(), "files": len(index.files)},
                "remote": remote, "findings": [asdict(f) for f in findings],
+               "published": published, "public_history": [asdict(f) for f in public_history],
                "source_reviews": [{"path": name, "sha256": sha, **review}
                                   for (name, sha), review in sorted((source_reviews or {}).items())]}
     directory.mkdir(parents=True, exist_ok=True)
@@ -577,11 +591,19 @@ def command(a) -> int:
     if a.commit:
         destination = getattr(a, 'destination', 'main')
         tracking = f"refs/remotes/{a.remote}/{destination}"
+        published_ref = f"refs/remotes/{a.remote}/main"
+        public = []
         commit, findings = scan_commit(env.ROOT, a.commit, index, tuple(a.private_ref or PRIVATE_REFS), source_reviews,
-                                       tracking_ref=tracking)
+                                       tracking_ref=tracking, published_ref=published_ref, public_history=public)
+        head = subprocess.run(["git", "rev-parse", "--verify", "--quiet", published_ref + "^{commit}"],
+                              cwd=env.ROOT, capture_output=True, text=True).stdout.strip()
         remote = remote_state(env.ROOT, a.remote)
-        receipt = write_receipt(RECEIPTS, commit, findings, index, remote, source_reviews)
+        receipt = write_receipt(RECEIPTS, commit, findings, index, remote, source_reviews, public_history=public,
+                                published={"ref": published_ref, "commit": head or None})
         print(f"remote {remote['name']} visibility {remote['visibility']}")
+        if public:
+            print(f"{len(public)} finding(s) only in history already published on {published_ref} "
+                  "(recorded in the receipt; not blocking)")
     elif a.staged:
         findings, receipt = scan_staged(env.ROOT, index, source_reviews), None
     else:
