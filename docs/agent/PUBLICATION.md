@@ -82,10 +82,22 @@ approve a binary package.
     `accepted-mismatch` describes current-tree source identity. Content
     findings identify the scanned blob and distinguish a commit-tree finding
     from a history-only one. If a blob is reachable from the local tracking
-    ref, the diagnostic names that ref; it does not query the remote or
-    weaken the finding. The default destination is `main`; for a same-name
-    PR branch, pass `--destination BRANCH`. Editing the tip cannot remove a
-    history-only blob.
+    ref, the diagnostic names that ref. The default destination is `main`;
+    for a same-name PR branch, pass `--destination BRANCH`. Editing the tip
+    cannot remove a history-only blob.
+
+    Already-published history (Adam's decision, 2026-11-23): a content
+    finding whose blob is absent from the scanned tip and already reachable
+    from `refs/remotes/<remote>/main` cannot be added or removed by the
+    push, so it is recorded under `public_history` in the receipt and does
+    not block. This applies to every content kind (listings, original bytes,
+    asset copies, binaries). The receipt also records that ref's commit.
+    The tracking ref is trusted locally and the scan does not query the
+    remote, so fetch first; it vouches only when it is an ancestor of the
+    scanned commit, so merge origin/main into a behind branch before
+    scanning. A blob present anywhere in the tip, new history, path findings
+    and private ancestry still block, and only a reviewed history rewrite
+    removes published blobs.
 6. A passing receipt binds the exact commit, push URL and known PUBLIC/PRIVATE
    visibility. Supported guarded commands are `git push origin BRANCH:main` and the
    existing same-name PR form `git push origin BRANCH:BRANCH`; both require that

@@ -152,12 +152,10 @@ def test_short_listings_and_prose_addresses_are_not_findings(originals):
         assert pub.scan_blob("recovery/c/fn_00401000.c", text.encode(), originals["index"]) == []
 
 
-HEAP_WRAPPER = [
-    ("0056f230", "push esi"), ("0056f231", "mov esi, ecx"), ("0056f233", "call 0x56f250"),
-    ("0056f238", "test byte ptr [esp + 8], 1"), ("0056f23d", "je 0x56f248"), ("0056f23f", "push esi"),
-    ("0056f240", "call 0x944c94"), ("0056f245", "add esp, 4"), ("0056f248", "mov eax, esi"),
-    ("0056f24a", "pop esi"), ("0056f24b", "ret 4"),
-]
+# Synthetic wrapper-shaped instructions at made-up addresses (no original bytes or listings).
+HEAP_WRAPPER = [(f"{0x00401000 + 4 * n:08x}", insn) for n, insn in enumerate([
+    "push esi", "mov esi, ecx", "call 0x401200", "test byte ptr [esp + 8], 1", "je 0x401028",
+    "push esi", "call 0x401300", "add esp, 4", "mov eax, esi", "pop esi", "ret 4"])]
 LISTING_SHAPES = {
     "bare-in-comment": lambda a, i: f" *   {a}  {i}\n",
     "0x-in-comment": lambda a, i: f" *   0x{a}  {i}\n",
@@ -270,6 +268,106 @@ def test_commit_scan_marks_removed_content_already_in_local_tracking_history(ori
     finding, = findings
     assert finding.kind == "original-bytes"
     assert "history" in finding.detail and tracking in finding.detail
+
+
+def _published_history(originals, repo):
+    """main publishes a dirty blob and later removes it; a PR branch builds on main."""
+    _commit(repo, {"a.txt": originals["image"][100:140].hex().encode()}, "copy")
+    published = _commit(repo, {"a.txt": None, "b.txt": b"clean\n"}, "remove")
+    _git(repo, "update-ref", "refs/remotes/origin/main", published)
+    return published
+
+
+def test_history_only_content_already_on_published_main_is_set_aside(originals, repo):
+    _published_history(originals, repo)
+    _commit(repo, {"c.txt": b"new clean work\n"}, "pr work")
+    public = []
+    _, findings = pub.scan_commit(repo, "fresh", originals["index"], private_refs=(),
+                                  tracking_ref="refs/remotes/origin/pr", published_ref="refs/remotes/origin/main",
+                                  public_history=public)
+    assert findings == []
+    finding, = public
+    assert (finding.path, finding.kind) == ("a.txt", "original-bytes")
+    assert "refs/remotes/origin/main" in finding.detail
+
+
+def test_published_main_does_not_excuse_new_or_tip_content(originals, repo):
+    _published_history(originals, repo)
+    # The same public blob restored at the tip, and a new dirty blob only in branch history.
+    _commit(repo, {"a.txt": originals["image"][100:140].hex().encode(),
+                   "d.txt": originals["image"][300:340].hex().encode()}, "restore and add")
+    _commit(repo, {"d.txt": None}, "drop new dirt")
+    public = []
+    _, findings = pub.scan_commit(repo, "fresh", originals["index"], private_refs=(),
+                                  tracking_ref="refs/remotes/origin/pr", published_ref="refs/remotes/origin/main",
+                                  public_history=public)
+    assert sorted((f.path, f.kind) for f in findings) == [("a.txt", "original-bytes"), ("d.txt", "original-bytes")]
+    assert public == []
+
+
+def _scan_with_public(originals, repo, **extra):
+    public = []
+    _, findings = pub.scan_commit(repo, "fresh", originals["index"], tracking_ref="refs/remotes/origin/pr",
+                                  published_ref="refs/remotes/origin/main", public_history=public,
+                                  **{"private_refs": (), **extra})
+    return findings, public
+
+
+def test_published_blob_restored_at_another_tip_path_still_blocks(originals, repo):
+    _published_history(originals, repo)
+    _commit(repo, {"moved.txt": originals["image"][100:140].hex().encode()}, "restore elsewhere")
+    findings, public = _scan_with_public(originals, repo)
+    assert sorted({(f.path, f.kind) for f in findings}) == [("a.txt", "original-bytes"), ("moved.txt", "original-bytes")]
+    assert public == []
+
+
+def test_published_ref_that_is_not_an_ancestor_sets_nothing_aside(originals, repo):
+    _published_history(originals, repo)
+    # A tracking ref moved to an unrelated commit must not vouch for this branch's history.
+    _git(repo, "checkout", "-q", "--orphan", "other")
+    _commit(repo, {"a.txt": originals["image"][100:140].hex().encode()}, "copy")
+    _git(repo, "update-ref", "refs/remotes/origin/main", _commit(repo, {"a.txt": None, "e.txt": b"x\n"}, "remove"))
+    _git(repo, "checkout", "-q", "fresh")
+    findings, public = _scan_with_public(originals, repo)
+    assert [(f.path, f.kind) for f in findings] == [("a.txt", "original-bytes")]
+    assert public == []
+
+
+def test_scan_without_public_history_list_blocks_published_history(originals, repo):
+    _published_history(originals, repo)
+    _, findings = pub.scan_commit(repo, "fresh", originals["index"], private_refs=(),
+                                  tracking_ref="refs/remotes/origin/pr", published_ref="refs/remotes/origin/main")
+    assert [(f.path, f.kind) for f in findings] == [("a.txt", "original-bytes")]
+
+
+def test_private_ancestry_still_blocks_when_all_history_is_published(originals, repo):
+    published = _published_history(originals, repo)
+    _git(repo, "update-ref", "refs/private/archive", published)
+    findings, public = _scan_with_public(originals, repo, private_refs=("refs/private/archive",))
+    assert [f.kind for f in findings] == ["private-history"]
+    assert [(f.path, f.kind) for f in public] == [("a.txt", "original-bytes")]
+
+
+def test_missing_published_ref_sets_nothing_aside(originals, repo):
+    _commit(repo, {"a.txt": originals["image"][100:140].hex().encode()}, "copy")
+    _commit(repo, {"a.txt": None, "b.txt": b"clean\n"}, "remove")
+    public = []
+    _, findings = pub.scan_commit(repo, "fresh", originals["index"], private_refs=(),
+                                  tracking_ref="refs/remotes/origin/pr", published_ref="refs/remotes/origin/main",
+                                  public_history=public)
+    assert [(f.path, f.kind) for f in findings] == [("a.txt", "original-bytes")]
+    assert public == []
+
+
+def test_receipt_passes_with_public_history_and_records_it(originals, tmp_path):
+    remote = {"name": "origin", "url": "https://example.invalid/source.git", "visibility": "PUBLIC"}
+    public = [pub.Finding("a.txt", "original-bytes", "detail")]
+    path = pub.write_receipt(tmp_path, "a" * 40, [], originals["index"], remote,
+                             public_history=public, published={"ref": "refs/remotes/origin/main", "commit": "b" * 40})
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    assert receipt["result"] == "pass" and receipt["findings"] == []
+    assert receipt["public_history"] == [{"path": "a.txt", "kind": "original-bytes", "detail": "detail"}]
+    assert receipt["published"] == {"ref": "refs/remotes/origin/main", "commit": "b" * 40}
 
 
 def test_commit_scan_rejects_history_shared_with_private_refs(originals, repo):
@@ -481,17 +579,24 @@ def test_verify_remote_requires_the_scanned_destination(originals, tmp_path, mon
     assert pub.verify_remote(args) == 1
 
 
-INSTRUCTION_MAP = """/* Instruction map (listing in the brief):
- *   0090a310 push esi            -> keep incoming ESI/self across the calls
- *   0090a311 mov esi, ecx        -> self = ECX (thiscall receiver)
- *   0090a313 call 0x90a330       -> forward ECX as thiscall receiver
- *   0090a318 test byte [esp+8],1 -> test the LOW BYTE of the only stack arg
- *   0090a31f/320/325              -> push self, cdecl cm_fn_00944c94, add esp,4
- *   0090a328 mov eax, esi        -> return self in EAX (no EDX writer)
- *   0090a32a pop esi             -> restore the saved register
- *   0090a32b ret 4               -> one 4-byte caller-cleaned stack arg
- */
-"""
+def _instruction_map():
+    """A synthetic instruction map in the shape workers paste, built at runtime so this
+    test file never carries a listing (or original bytes) of its own."""
+    rows = [("push esi", "keep the register"), ("mov esi, ecx", "receiver"),
+            ("call 0x401100", "callee"), ("test byte [esp+8],1", "flag"), (None, "grouped calls"),
+            ("mov eax, esi", "result"), ("pop esi", "restore"), ("ret 4", "cleanup")]
+    lines = ["/* Instruction map (listing in the brief):"]
+    for i, (insn, note) in enumerate(rows):
+        address = 0x00401000 + 3 * i
+        if insn is None:
+            lead = f"{address:08x}/{(address + 1) & 0xfff:03x}/{(address + 6) & 0xfff:03x}"
+            lines.append(f" *   {lead:<29} -> {note}")
+        else:
+            lines.append(f" *   {address:08x} {insn:<19} -> {note}")
+    return "\n".join(lines + [" */", ""])
+
+
+INSTRUCTION_MAP = _instruction_map()
 
 
 def test_instruction_map_with_compact_address_group_is_found(originals):
