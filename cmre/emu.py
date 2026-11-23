@@ -99,6 +99,7 @@ class Machine:
         self.pristine: dict[int, bytes] = {}
         self._original_pages: set[int] = set()
         self._common_pages: set[int] = set()
+        self.find_patterns: dict[int, bytes] = {}  # FindFirstFileA handle -> search pattern (reset per run)
         self._recovered_pages: dict[int, dict] = {}
         # Real PE protections: a store into .text/.rdata faults, as it would in the process.
         self._map(original.base, original.headers, perms=unicorn.UC_PROT_READ, origin='original')
@@ -448,7 +449,8 @@ class Machine:
                 return bytes(self.uc.mem_read(address, size))
             except unicorn.UcError:
                 return None
-        for address, blob in imports.outputs(name, args, value, self.import_seed, self.import_count, read):
+        for address, blob in imports.outputs(name, args, value, self.import_seed, self.import_count, read,
+                                             self.find_patterns):
             try:
                 self._transcript_write(address, blob)
             except unicorn.UcError:
@@ -591,6 +593,7 @@ class Machine:
         self.read_sites = {}
         self.dead_stack_reads = []
         self.import_seed, self.import_count = case.import_seed, 0
+        self.find_patterns = {}  # FindFirstFileA handle -> search pattern, this case only
         self._budget_limit, self._budget_steps, self._budget_exhausted = budget, 0, False
         error = None
         try:
