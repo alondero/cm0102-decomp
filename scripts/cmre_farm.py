@@ -1380,7 +1380,8 @@ class Farm:
     def _group_model(self, rung):
         """A concrete model of the rung: the least busy available one, else the least busy not retired."""
         group = ladder_group(self.config.ladder[rung])
-        pool = [m for m in group if self._available(m)]             or [m for m in group if m not in self.state['unavailable_models']] or group
+        pool = ([m for m in group if self._available(m)]
+                or [m for m in group if m not in self.state['unavailable_models']] or group)
         return self._least_busy(pool)
 
     def _rung_model(self, rung):
