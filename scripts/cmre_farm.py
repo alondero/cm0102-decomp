@@ -111,6 +111,7 @@ def _limit_key(model, message=''):
 # size is a stub and is replaced by the draft.
 DRAFT_SEED_MIN_BYTES = 2000
 DRAFT_STUB_FRACTION = 4
+ACCEPT_TICK_SECONDS = 60  # one tick starts no further accept after this much farm-clock time; the rest wait for the next tick
 STALE_SECONDS = 600   # state.json is saved every tick; older than this means the farm is gone
 HARD_HOLDS = ('harness-blocker', 'evidence-needed')
 MAX_FIX_ROUNDS = 1
@@ -2289,8 +2290,12 @@ class Farm:
             self.run_dir, self.root, job['fn'], job['n'], job['kind'], job['_snap'], origin=origin)
 
     def _accept(self):
-        waiting = []
+        waiting, unreached = [], []
+        started = self.clock()
         for index, job in enumerate(self.accept_queue):
+            if index and self.clock() - started >= ACCEPT_TICK_SECONDS:
+                unreached = self.accept_queue[index:]   # a long backlog must not starve control, dispatch and the dashboard
+                break
             fn = job['fn']
             detail = self._fix_evidence_error(job)
             if detail:
@@ -2360,8 +2365,8 @@ class Farm:
                 continue
             self._transaction(job, 'accepted', acceptance_result={'code': code, 'output': output})
             self._accepted(job)
-        self.accept_queue = waiting
-        self.lease_waits.intersection_update(job['n'] for job in waiting)
+        self.accept_queue = waiting + unreached
+        self.lease_waits.intersection_update(job['n'] for job in self.accept_queue)
 
     def _accepted(self, job):
         fn = job['fn']

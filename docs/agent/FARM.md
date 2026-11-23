@@ -40,7 +40,8 @@ the default farm folder. `--port` changes the local port.
   plus idle translation slots indicates a supply constraint. Compare that with
   the gate, writer, and audit queues before changing concurrency. Use the farm's
   `set RUN` command to tune a running farm. Settings apply at the start of the
-  next scheduler tick, which can be delayed by serial acceptance.
+  next scheduler tick, which can be delayed by serial acceptance. Each tick starts no new acceptance after `ACCEPT_TICK_SECONDS` (60 s) of farm-clock time,
+  but always finishes at least one, and leaves the rest of the queue in order for the next tick.
 - **Supply inventory** shows workspace-wide authored, lifted, and unlifted body
   bytes and the largest evidence and harness blocker families. It refreshes
   independently every minute. The selected run's frontier also reflects its

@@ -6184,3 +6184,91 @@ def test_an_abbreviated_start_setting_also_replaces_the_live_control(root, monke
     (run / 'control.json').write_text(json.dumps({'ladder': ['m/old'], 'workers': 3}))
     assert farm.main(['start', str(run), '--lad', 'm/new']) == 0   # argparse accepts unique prefixes
     assert json.loads((run / 'control.json').read_text()) == {'workers': 3}
+
+
+class SlowAcceptCmre(FakeCmre):
+    """Each accept spends `seconds` of the farm's clock, as a held or lease-waiting accept does."""
+
+    def __init__(self, *args, now, seconds, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.now, self.seconds = now, seconds
+
+    def accept(self, fn, *, request):
+        self.now[0] += self.seconds
+        return super().accept(fn, request=request)
+
+
+def queued_accepts(root, count, seconds, accept_codes=None, **cfg):
+    """A farm whose first `count` translations passed and wait in the accept queue."""
+    now = [0.0]
+    items = [item(f'fn_00401{i:03x}') for i in range(count)]
+    f, _, _ = make(root, items, writes(passing), workers=count, continuous=True, rescan_seconds=0, **cfg)
+    cmre = SlowAcceptCmre(items, accept_codes=accept_codes, now=now, seconds=seconds)
+    cmre.root = root
+    f.cmre, f.clock = cmre, lambda: now[0]
+    f._dispatch()
+    f._reap()
+    f._collect()
+    assert [j['fn'] for j in f.accept_queue] == [i.fn for i in items]
+    return f, cmre, now, [i.fn for i in items]
+
+
+def test_a_tick_accepts_only_a_budgeted_prefix_of_a_long_backlog(root):
+    f, cmre, now, fns = queued_accepts(root, 6, seconds=25)
+    f.tick()
+    assert cmre.accepted == fns[:3]
+    assert [j['fn'] for j in f.accept_queue] == fns[3:]
+    assert not f.finished() and not f.drained()
+
+
+def test_settings_and_dispatch_are_not_starved_by_the_accept_backlog(root):
+    f, cmre, now, fns = queued_accepts(root, 6, seconds=25)
+    f.tick()
+    assert len(cmre.accepted) < len(fns)
+    assert farm.main(['set', str(f.run_dir), '--workers', '4']) == 0
+    f.tick()
+    assert f.config.workers == 4
+    assert any(e['event'] == 'config-changed' for e in events(f.run_dir))
+    assert cmre.accepted == fns[:6]
+
+
+def test_every_queued_accept_completes_once_in_order(root):
+    f, cmre, now, fns = queued_accepts(root, 7, seconds=25)
+    for _ in range(10):
+        f.tick()
+    assert cmre.accepted == fns
+    assert f.accept_queue == []
+    assert sorted(f.state['accepted']) == fns
+
+
+def test_one_accept_longer_than_the_budget_still_completes(root):
+    f, cmre, now, fns = queued_accepts(root, 3, seconds=farm.ACCEPT_TICK_SECONDS * 10)
+    f.tick()
+    assert cmre.accepted == fns[:1]
+    assert [j['fn'] for j in f.accept_queue] == fns[1:]
+    f.tick()
+    assert cmre.accepted == fns[:2]
+
+
+def test_waiting_lease_items_stay_ahead_of_unreached_items(root):
+    f, cmre, now, fns = queued_accepts(root, 5, seconds=25, accept_codes=[2, 0, 2])
+    f.tick()
+    # fn0 waits for the lease, fn1 accepts, fn2 waits; the budget ends before fn3 and fn4.
+    assert cmre.accepted == [fns[1]]
+    assert [j['fn'] for j in f.accept_queue] == [fns[0], fns[2], fns[3], fns[4]]
+    assert f.lease_waits == {j['n'] for j in f.accept_queue[:2]}
+    assert not f.drained()
+    f.tick()
+    f.tick()
+    assert sorted(cmre.accepted) == sorted(fns)
+    assert cmre.accepted.count(fns[0]) == 1 and cmre.accepted.count(fns[2]) == 1
+
+
+def test_queued_accepts_keep_their_transactions_across_a_partial_pass(root):
+    f, cmre, now, fns = queued_accepts(root, 4, seconds=40)
+    f.tick()
+    assert cmre.accepted == fns[:2]
+    for job in f.accept_queue:
+        assert f._transaction(job)['phase'] != 'accepted'
+    f.tick()
+    assert cmre.accepted == fns
