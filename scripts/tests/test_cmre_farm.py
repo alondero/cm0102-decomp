@@ -3952,6 +3952,17 @@ def test_handle_reads_a_provider_credit_refusal_as_an_infrastructure_error(tmp_p
     assert handle.infra_error() is None
 
 
+def test_an_error_shaped_object_inside_a_tool_row_is_not_an_infrastructure_error(tmp_path):
+    # Review of the 24 Nov fix: only a row that is itself an error retires a model.
+    log = tmp_path / 'w.jsonl'
+    log.write_text(json.dumps({'type': 'tool_use', 'part': {'state': {'metadata': {
+        'type': 'error', 'status': 403, 'message': 'run out of credits'}}}}) + '\n'
+                   + json.dumps({'type': 'error', 'error': {'type': 'provider.http', 'status': 500,
+                                                            'message': 'upstream says provider.auth'},
+                                 'note': 'statusCode: 403'}) + '\n')
+    assert farm.OpencodeHandle(None, log).infra_error() is None
+
+
 
 def retry_row(after_ms=32932000, status=429, kind='provider.rate-limit', at=1795359067904,
               message='Rate limit exceeded. Please try again later.'):

@@ -2522,10 +2522,8 @@ class Farm:
                         self.last_input_check = None
                         self._event('retry', fn=fn, reason=reason)
                     self.save()
-                else:
-                    self._event('retry-refused', fn=fn, reason=(
-                        'quarantined' if fn in self.state.get('quarantined', {}) else
-                        'not parked when the farm read the request'))
+                else:   # quarantined functions never get here: _writer_busy holds their requests
+                    self._event('retry-refused', fn=fn, reason='not parked when the farm read the request')
                 path.unlink(missing_ok=True)
                 continue
             if request.get('kind') in ('adopt', 'dismiss'):
@@ -3956,10 +3954,11 @@ class CmreAdapter:
         raise NotImplementedError('ledger candidate/input identity evidence unavailable')
 
 
-# OpenCode 2.x writes `"status": 403` where 1.x wrote `statusCode`; xAI's credit refusal (24 Nov) is
-# `provider.auth` with status 403 and a `spending-limit` code.
-INFRA_ERROR = re.compile(r'API key|status(?:Code)?"?\s*:\s*40[123]\b|provider\.auth|run out of credits|'
-                         r'spending-limit|quota|insufficient balance|model not found|ProviderModelNotFound', re.I)
+# Message wording of a permanent provider refusal. `infra_error` also takes an error row's status
+# 401-403 (`status` in OpenCode 2.x, `statusCode` in 1.x) or type `provider.auth`: xAI's credit
+# refusal on 24 Nov was provider.auth, status 403, code `spending-limit`.
+INFRA_ERROR = re.compile(r'API key|run out of credits|spending-limit|quota|insufficient balance|'
+                         r'model not found|ProviderModelNotFound', re.I)
 
 
 LIMIT_ERROR = re.compile(r'usage limit|rate limit|too many requests|go-limit', re.I)
@@ -4115,19 +4114,31 @@ class OpencodeHandle:
         return pending
 
     def infra_error(self):
-        """A provider/auth error event in the worker's JSON stream, if any."""
+        """A provider/auth error event in the worker's JSON stream, if any.
+
+        Only a row that is itself an error counts, and only its `error` object is read: tool
+        output can carry error-shaped text without the provider refusing the worker."""
         try:
             text = self.log.read_text(encoding='utf-8', errors='replace')
         except OSError:
             return None
         for line in text.splitlines():
-            if '"type":"error"' in line.replace(' ', '') and INFRA_ERROR.search(line):
-                try:
-                    data = json.loads(line)['error']
-                    return str(data.get('message') or (data.get('data') or {}).get('message')
-                               or data.get('name') or data.get('type'))
-                except (ValueError, KeyError, TypeError, AttributeError):
-                    return line[:300]
+            if '"type":"error"' not in line.replace(' ', ''):
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            data = row.get('error') if isinstance(row, dict) and row.get('type') == 'error' else None
+            if not isinstance(data, dict):
+                continue
+            message = str(data.get('message') or (data.get('data') or {}).get('message')
+                          or data.get('name') or data.get('type'))
+            nested = data.get('data') if isinstance(data.get('data'), dict) else {}
+            status = data.get('status', data.get('statusCode', nested.get('statusCode')))
+            if (status in (401, 402, 403) or data.get('type') == 'provider.auth'
+                    or INFRA_ERROR.search(f"{message} {(data.get('response') or {}).get('body', '')}")):
+                return message
         return None
 
     def poll(self):
