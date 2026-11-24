@@ -3928,6 +3928,41 @@ def test_handle_reads_a_usage_limit_and_its_reset_time(tmp_path):
     assert farm.OpencodeHandle(None, log).limit_error() is None
 
 
+# 24 Nov: xAI answered every Grok job with this row from 08:17. The farm missed it (it matched only
+# `statusCode`), gated each untouched seed draft and parked 34 functions as Grok's failures.
+XAI_CREDITS_LINE = json.dumps({'type': 'error', 'timestamp': 1795510091433, 'sessionID': 'ses_x', 'error': {
+    'type': 'provider.auth', 'status': 403,
+    'message': 'You have run out of credits or need a Grok subscription. Add credits at '
+               'https://grok.com/?_s=usage or upgrade at https://grok.com/supergrok.',
+    'response': {'body': '{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits"}'}}})
+
+
+def test_handle_reads_a_provider_credit_refusal_as_an_infrastructure_error(tmp_path):
+    log = tmp_path / 'w.jsonl'
+    log.write_text('{"type":"step_start","part":{}}\n' + XAI_CREDITS_LINE + '\n')
+    handle = farm.OpencodeHandle(None, log)
+    assert 'run out of credits' in handle.infra_error()
+    assert handle.limit_error() is None
+    for status in (401, 402, 403):
+        log.write_text(json.dumps({'type': 'error', 'error': {'type': 'provider.http', 'status': status,
+                                                               'message': 'Forbidden'}}) + '\n')
+        assert handle.infra_error() == 'Forbidden', status
+    log.write_text(json.dumps({'type': 'error', 'error': {'type': 'provider.http', 'status': 500,
+                                                           'message': 'Internal error'}}) + '\n')
+    assert handle.infra_error() is None
+
+
+def test_an_error_shaped_object_inside_a_tool_row_is_not_an_infrastructure_error(tmp_path):
+    # Review of the 24 Nov fix: only a row that is itself an error retires a model.
+    log = tmp_path / 'w.jsonl'
+    log.write_text(json.dumps({'type': 'tool_use', 'part': {'state': {'metadata': {
+        'type': 'error', 'status': 403, 'message': 'run out of credits'}}}}) + '\n'
+                   + json.dumps({'type': 'error', 'error': {'type': 'provider.http', 'status': 500,
+                                                            'message': 'upstream says provider.auth'},
+                                 'note': 'statusCode: 403'}) + '\n')
+    assert farm.OpencodeHandle(None, log).infra_error() is None
+
+
 
 def retry_row(after_ms=32932000, status=429, kind='provider.rate-limit', at=1795359067904,
               message='Rate limit exceeded. Please try again later.'):
@@ -4624,6 +4659,31 @@ def test_retry_rung_beyond_the_ladder_is_refused(root, capsys):
     assert 'fn_00401000' in f.state['parked']
     refused = [e for e in events(f.run_dir) if e['event'] == 'retry-refused']
     assert refused and 'outside the ladder (0..1)' in refused[0]['reason']
+
+
+def test_retry_cli_summary_counts_refusals_apart_from_queued(root, capsys):
+    # 24 Nov: `| grep -c queued` counted 186 "queued" lines when every one read "nothing queued".
+    f, _, _ = make(root, [], writes(GOOD), workers=0)
+    f.state['parked']['fn_00401000'] = {'detail': 'x', 'models': ['m/cheap']}
+    f.save()
+    assert farm.main(['retry', str(f.run_dir), 'fn_00401000', 'fn_00402000\r', '--reason', 'r']) == 1
+    out = capsys.readouterr().out
+    assert "fn_00402000\\r: not parked in this run; skipped" in out
+    assert not [line for line in out.splitlines() if 'not parked;' in line and 'queued' in line]
+    assert out.rstrip().endswith('retry: 1 queued, 1 not parked')
+    assert len(list((f.run_dir / 'requests').glob('*.json'))) == 1
+
+
+def test_retry_request_for_a_function_no_longer_parked_is_logged(root):
+    f, _, _ = make(root, [], writes(GOOD), workers=0)
+    f.state['parked']['fn_00401000'] = {'detail': 'x', 'models': ['m/cheap']}
+    f.save()
+    assert farm.main(['retry', str(f.run_dir), 'fn_00401000', '--reason', 'r']) == 0
+    del f.state['parked']['fn_00401000']
+    drain(f, 2)
+    refused = [e for e in events(f.run_dir) if e['event'] == 'retry-refused']
+    assert refused and refused[0]['fn'] == 'fn_00401000' and 'not parked' in refused[0]['reason']
+    assert not list((f.run_dir / 'requests').glob('*.json'))
 
 
 def test_retry_rung_survives_a_restart_before_dispatch(root):
