@@ -2522,6 +2522,8 @@ class Farm:
                         self.last_input_check = None
                         self._event('retry', fn=fn, reason=reason)
                     self.save()
+                else:   # quarantined functions never get here: _writer_busy holds their requests
+                    self._event('retry-refused', fn=fn, reason='not parked when the farm read the request')
                 path.unlink(missing_ok=True)
                 continue
             if request.get('kind') in ('adopt', 'dismiss'):
@@ -3952,7 +3954,10 @@ class CmreAdapter:
         raise NotImplementedError('ledger candidate/input identity evidence unavailable')
 
 
-INFRA_ERROR = re.compile(r'API key|statusCode"?\s*:\s*(?:401|402|403)|quota|insufficient balance|'
+# Message wording of a permanent provider refusal. `infra_error` also takes an error row's status
+# 401-403 (`status` in OpenCode 2.x, `statusCode` in 1.x) or type `provider.auth`: xAI's credit
+# refusal on 24 Nov was provider.auth, status 403, code `spending-limit`.
+INFRA_ERROR = re.compile(r'API key|run out of credits|spending-limit|quota|insufficient balance|'
                          r'model not found|ProviderModelNotFound', re.I)
 
 
@@ -4109,19 +4114,31 @@ class OpencodeHandle:
         return pending
 
     def infra_error(self):
-        """A provider/auth error event in the worker's JSON stream, if any."""
+        """A provider/auth error event in the worker's JSON stream, if any.
+
+        Only a row that is itself an error counts, and only its `error` object is read: tool
+        output can carry error-shaped text without the provider refusing the worker."""
         try:
             text = self.log.read_text(encoding='utf-8', errors='replace')
         except OSError:
             return None
         for line in text.splitlines():
-            if '"type":"error"' in line.replace(' ', '') and INFRA_ERROR.search(line):
-                try:
-                    data = json.loads(line)['error']
-                    return str(data.get('message') or (data.get('data') or {}).get('message')
-                               or data.get('name') or data.get('type'))
-                except (ValueError, KeyError, TypeError, AttributeError):
-                    return line[:300]
+            if '"type":"error"' not in line.replace(' ', ''):
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            data = row.get('error') if isinstance(row, dict) and row.get('type') == 'error' else None
+            if not isinstance(data, dict):
+                continue
+            message = str(data.get('message') or (data.get('data') or {}).get('message')
+                          or data.get('name') or data.get('type'))
+            nested = data.get('data') if isinstance(data.get('data'), dict) else {}
+            status = data.get('status', data.get('statusCode', nested.get('statusCode')))
+            if (status in (401, 402, 403) or data.get('type') == 'provider.auth'
+                    or INFRA_ERROR.search(f"{message} {(data.get('response') or {}).get('body', '')}")):
+                return message
         return None
 
     def poll(self):
@@ -4584,13 +4601,18 @@ def main(argv=None):
             return 2
         parked = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))['parked']
         extra = {} if a.rung is None else {'rung': a.rung}
+        queued = skipped = 0
         for fn in a.fns:
             if fn in parked:
                 _request(run_dir, fn, 'retry', reason=a.reason, **extra)
+                queued += 1
                 print(f'{fn}: queued; a running farm takes it on its next scan')
             else:
-                print(f'{fn}: not parked in this run; nothing queued')
-        return 0
+                skipped += 1
+                # repr-escaped so a CRLF list's trailing \r is visible
+                print(f'{fn!r}'[1:-1] + ': not parked in this run; skipped')
+        print(f'retry: {queued} queued, {skipped} not parked')
+        return 1 if skipped else 0
     if a.action == 'inputs':
         state = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))
         rows = sorted(state.get('input_needed', {}).items(), key=lambda kv: -kv[1].get('bytes', 0))
