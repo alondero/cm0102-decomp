@@ -455,7 +455,8 @@ def test_c(va: int, overrides: dict | None = None, fresh: bool = False, *, sourc
 def ftol_sites(lifted) -> list[str]:
     """Original call/tail-jump sites of the __ftol helper (ADR 0006 condition 4 census)."""
     return [f"{ins.va:#010x}" for va, ins in sorted(lifted.insns.items())
-            if ins.target == operand_evidence.FTOL_HELPER and ins.kind in ("call", "tail_jmp")]
+            if getattr(ins, "target", None) == operand_evidence.FTOL_HELPER
+            and getattr(ins, "kind", None) in ("call", "tail_jmp")]
 
 
 def _digests(report: dict) -> list[str]:
