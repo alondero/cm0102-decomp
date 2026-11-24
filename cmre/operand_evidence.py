@@ -263,6 +263,70 @@ def _cast_operand_span(masked, text, index, names):
             return start, index
 
 
+def _unbracketed_macros(masked, directives):
+    """Names the source #defines whose body is not one token or one fully bracketed group.
+
+    Such a body can rebind a cast written around its use (`#define SUM v + w` makes
+    `(long long)SUM` mean `(long long)v + w`), so the source span is not the expansion's."""
+    bodies = dict(_header_macro_bodies())
+    bodies.update(_macro_bodies(masked, directives))
+    unsafe, callers = set(), {}
+    for name, body in bodies.items():
+        call = re.match(r'([A-Za-z_]\w*)\s*\(', body)
+        if not body or re.fullmatch(r'[0-9][\w.]*', body):
+            continue
+        if re.fullmatch(r'[A-Za-z_]\w*', body):
+            callers[name] = body   # an alias is as bracketed as what it names
+            continue
+        if body.startswith('(') and _closes_at(body, 0) == len(body) - 1:
+            continue
+        if call and _closes_at(body, call.end() - 1) == len(body) - 1:
+            callers[name] = call.group(1)   # `NAME(...)`: one postfix expression if NAME is
+            continue
+        unsafe.add(name)
+    changed = True
+    while changed:   # a call of an unbracketed macro is itself unbracketed
+        changed = False
+        for name, callee in callers.items():
+            if callee in unsafe and name not in unsafe:
+                unsafe.add(name)
+                changed = True
+    return unsafe
+
+
+def _macro_bodies(masked, directives):
+    bodies = {}
+    for start, end in directives:
+        directive = re.sub(r'\\\r?\n', ' ', masked[start:end])
+        match = re.match(r'\s*#\s*define\s+([A-Za-z_]\w*)(\([^)]*\))?(.*)', directive, re.S)
+        if match:
+            bodies[match.group(1)] = match.group(3).strip()
+    return bodies
+
+
+_HEADER_MACROS = None
+
+
+def _header_macro_bodies():
+    global _HEADER_MACROS
+    if _HEADER_MACROS is None:
+        from . import env
+        path = env.ROOT / 'recovery/include/cmre.h'
+        text = path.read_text(encoding='utf-8') if path.exists() else ''
+        masked = _NONCODE.sub(_mask_noncode, text)
+        _HEADER_MACROS = _macro_bodies(masked, _bridge_directive_spans(text))
+    return _HEADER_MACROS
+
+
+def _closes_at(body, index):
+    depth = 0
+    for position in range(index, len(body)):
+        depth += {'(': 1, ')': -1}.get(body[position], 0)
+        if not depth:
+            return position
+    return -1
+
+
 def ftol_cast_sites(text, names=()):
     """Every explicit signed 64-bit cast in code, with the exact span of its operand.
 
@@ -271,6 +335,7 @@ def ftol_cast_sites(text, names=()):
     cannot delimit; `ftol_float_casts` then keeps only the casts of floating operands."""
     masked = _NONCODE.sub(_mask_noncode, text)
     directives = _bridge_directive_spans(text)
+    unbracketed = _unbracketed_macros(masked, directives)
     names = set(names) | type_names(text)
     aliases = sorted(set(_LONG_LONG_TYPEDEF.findall(masked)))
     pattern = _FTOL_CAST if not aliases else re.compile(
@@ -285,6 +350,10 @@ def ftol_cast_sites(text, names=()):
             raise ValueError('unsupported: a 64-bit cast inside a preprocessor directive cannot be '
                              'mutated per __ftol site')
         start, end = _cast_operand_span(masked, text, match.end(), names)
+        rebinding = sorted(set(_IDENT.findall(masked[start:end])) & unbracketed)
+        if rebinding:
+            raise ValueError(f'unsupported: 64-bit cast operand uses macro {rebinding[0]}, whose body is not '
+                             'one bracketed expression; bracket the macro body or expand it')
         sites.append({'index': len(sites), 'line': text.count('\n', 0, match.start()) + 1,
                       'cast': (match.start(), match.end()), 'operand': (start, end)})
     return sites

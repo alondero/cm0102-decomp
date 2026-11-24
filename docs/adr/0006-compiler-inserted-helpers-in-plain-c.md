@@ -107,6 +107,12 @@ also covers each `__ftol` site:
   or merged paths cannot show per-site observation. A site that still calls
   the original helper as an explicit boundary call (`cm_fn_00945640()`; a
   declaration does not count) needs no mutant.
+- A cast operand that uses a macro the source defines must have a body that
+  is one token or one bracketed group; otherwise the expansion can rebind the
+  cast (`#define SUM v + w`) and it fails closed.
+- Raw instruction bytes in inline assembly (`.byte` encodings of `fistp`) are
+  outside the census. This is an adversarial spelling, not model output;
+  review rejects it.
 - Sites are matched by count, not by address. A source that omits a site's
   conversion entirely, while duplicating another cast, is a translation the
   semantic gate and coverage must catch; this proof only shows that every
