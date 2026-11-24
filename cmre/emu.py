@@ -417,6 +417,11 @@ class Machine:
             return
         name = self.trap_names.get(address)
         if name is None or name in imports.TERMINAL:
+            if name in imports.PROCESS_EXIT:
+                # The exit status is observable (ADR 0014): record the call before the case ends.
+                n = imports.STDCALL_ARGS[name]
+                esp = uc.reg_read(R.UC_X86_REG_ESP)
+                self.events.append(("c", name, n, struct.unpack(f"<{n}I", uc.mem_read(esp + 4, 4 * n))))
             if self.transcript is not None:
                 self.stop_reason = ('error', 'import transcript',
                                     'unexpected terminal or unknown import: ' + (name or hex(address)),

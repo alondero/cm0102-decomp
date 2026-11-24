@@ -92,7 +92,6 @@ def test_import_stub_result_is_seeded(machine):
     entry = _code(machine, 0x3000, bytes.fromhex("ff15") + struct.pack("<I", _slot("KERNEL32.dll!GetLastError")) + b"\xc3")
     a = machine.run(entry, emu.Case({"eflags": 0x202}, [0] * 4, bytes(emu.ARENA_SIZE), import_seed=1), 100)
     b = machine.run(entry, emu.Case({"eflags": 0x202}, [0] * 4, bytes(emu.ARENA_SIZE), import_seed=1), 100)
-    c = machine.run(entry, emu.Case({"eflags": 0x202}, [0] * 4, bytes(emu.ARENA_SIZE), import_seed=2), 100)
     assert a.regs[0] == b.regs[0]
     values = {machine.run(entry, emu.Case({"eflags": 0x202}, [0] * 4, bytes(emu.ARENA_SIZE), import_seed=s), 100).regs[0]
               for s in range(16)}
@@ -105,6 +104,26 @@ def test_terminal_imports_still_end_the_case(machine):
     entry = _code(machine, 0x4000, bytes.fromhex("6a00ff15") + struct.pack("<I", _slot("KERNEL32.dll!ExitProcess")) + b"\xc3")
     r = machine.run(entry, case(), 100)
     assert r.outcome == "import"
+
+
+@pytest.mark.parametrize('name', ['KERNEL32.dll!ExitProcess', 'KERNEL32.dll!TerminateProcess'])
+def test_process_exit_records_its_arguments_before_the_case_ends(machine, name):
+    # ADR 0014 review: the trap stopped before recording the call, so a C build that
+    # passed exit status 0 instead of -1 matched the original.
+    import struct
+    from cmre import imports
+
+    def run(status, offset):
+        pushes = b''.join(bytes.fromhex('68') + struct.pack('<I', v)
+                          for v in reversed((0x1234, status)[-imports.STDCALL_ARGS[name]:]))
+        entry = _code(machine, offset, pushes + bytes.fromhex('ff15') + struct.pack('<I', _slot(name)) + b'\xc3')
+        return machine.run(entry, case(), 100)
+
+    base = 0x10000 if name.endswith('ExitProcess') else 0x12000   # the module machine keeps its pages
+    failed, succeeded = run(0xFFFFFFFF, base), run(0, base + 0x1000)
+    assert failed.outcome == succeeded.outcome == 'import'
+    assert [e for e in failed.events if e[0] == 'c'][-1][1:3] == (name, imports.STDCALL_ARGS[name])
+    assert [e for e in failed.events if e[0] == 'c'] != [e for e in succeeded.events if e[0] == 'c']
 
 
 def test_untouched_input_pages_are_not_reported(machine):
