@@ -2522,6 +2522,10 @@ class Farm:
                         self.last_input_check = None
                         self._event('retry', fn=fn, reason=reason)
                     self.save()
+                else:
+                    self._event('retry-refused', fn=fn, reason=(
+                        'quarantined' if fn in self.state.get('quarantined', {}) else
+                        'not parked when the farm read the request'))
                 path.unlink(missing_ok=True)
                 continue
             if request.get('kind') in ('adopt', 'dismiss'):
@@ -3952,8 +3956,10 @@ class CmreAdapter:
         raise NotImplementedError('ledger candidate/input identity evidence unavailable')
 
 
-INFRA_ERROR = re.compile(r'API key|statusCode"?\s*:\s*(?:401|402|403)|quota|insufficient balance|'
-                         r'model not found|ProviderModelNotFound', re.I)
+# OpenCode 2.x writes `"status": 403` where 1.x wrote `statusCode`; xAI's credit refusal (24 Nov) is
+# `provider.auth` with status 403 and a `spending-limit` code.
+INFRA_ERROR = re.compile(r'API key|status(?:Code)?"?\s*:\s*40[123]\b|provider\.auth|run out of credits|'
+                         r'spending-limit|quota|insufficient balance|model not found|ProviderModelNotFound', re.I)
 
 
 LIMIT_ERROR = re.compile(r'usage limit|rate limit|too many requests|go-limit', re.I)
@@ -4584,13 +4590,18 @@ def main(argv=None):
             return 2
         parked = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))['parked']
         extra = {} if a.rung is None else {'rung': a.rung}
+        queued = skipped = 0
         for fn in a.fns:
             if fn in parked:
                 _request(run_dir, fn, 'retry', reason=a.reason, **extra)
+                queued += 1
                 print(f'{fn}: queued; a running farm takes it on its next scan')
             else:
-                print(f'{fn}: not parked in this run; nothing queued')
-        return 0
+                skipped += 1
+                # repr-escaped so a CRLF list's trailing \r is visible
+                print(f'{fn!r}'[1:-1] + ': not parked in this run; skipped')
+        print(f'retry: {queued} queued, {skipped} not parked')
+        return 1 if skipped else 0
     if a.action == 'inputs':
         state = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))
         rows = sorted(state.get('input_needed', {}).items(), key=lambda kv: -kv[1].get('bytes', 0))

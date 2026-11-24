@@ -379,7 +379,10 @@ Coordinator procedure:
    rung 0. Add `--rung N` (0-based) to start at a stronger rung when the cheaper
    rungs already failed the function. The farm saves the rung with its state and
    waits while that rung's models are paused. It refuses a rung outside the
-   ladder with a `retry-refused` event.
+   ladder, or a function no longer parked when it reads the request, with a
+   `retry-refused` event. The command ends with `retry: N queued, M not parked`
+   and exits 1 when any function was skipped. Count that line, not lines
+   containing "queued". Strip CR from Windows lists first.
 
    Options: `--include-held` also takes held functions (each prompt carries
    the hold reason; the audit checks it). `--min-bytes/--max-bytes` bound the
