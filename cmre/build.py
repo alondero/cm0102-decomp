@@ -84,7 +84,9 @@ def syntax_probe(text: str, workdir: Path) -> tuple[int, str]:
     -Wfloat-conversion reports implicit float-to-integer conversions (ADR 0006 sites)."""
     source = workdir / "probe.c"
     source.write_text(text, encoding="utf-8", newline="")
-    cc = [env.tool("gcc"), "-m32", "-fsyntax-only", "-Wfloat-conversion", "-mno-sse3", "-ffreestanding",
+    # No echoed source lines: a comment must not be able to look like a diagnostic.
+    cc = [env.tool("gcc"), "-m32", "-fsyntax-only", "-Wfloat-conversion", "-fno-diagnostics-show-caret",
+          "-mno-sse3", "-ffreestanding",
           "-fno-builtin", f"-I{env.ROOT / 'recovery/include'}", str(source)]
     r = env.run_tool(cc)
     return r.returncode, r.stderr

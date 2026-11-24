@@ -88,15 +88,19 @@ also covers each `__ftol` site:
 
 - A `-fsyntax-only` probe under the gate's C flags classifies every explicit
   signed 64-bit cast in code by its operand type. `-Wfloat-conversion` rejects
-  implicit float-to-integer conversions.
+  implicit float-to-integer conversions; floating narrowing (`long double` to
+  `double`) stays allowed. An explicit cast of a floating value to any other
+  integer type (`(int)t`, `(s32)t`) fails closed, so every float-to-integer
+  conversion in the source is a mutated `(long long)` cast and duplicated
+  casts cannot hide an unwritten site.
 - Each cast of a floating operand gets one mutant with its operand `+ 1.0L`.
   The mutant must show a non-budget differential witness at both O0 and O2,
   under the ADR 0010 condition 3 rule.
 - Fewer floating casts than original sites fails closed. Each site must be its
   own cast: a shared macro or helper, a cast inside a preprocessor directive,
   or merged paths cannot show per-site observation. A site that still calls
-  the original helper as an explicit boundary (`cm_fn_00945640()`) needs no
-  mutant.
+  the original helper as an explicit boundary call (`cm_fn_00945640()`; a
+  declaration does not count) needs no mutant.
 
 The proof runs before farm and direct acceptance, as the CIpow proof does.
 Accepted routines are audited separately (`scripts/cmre_ftol_audit.py`).

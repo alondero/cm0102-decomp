@@ -152,6 +152,11 @@ def bridge_mutant_sources(text):
 FTOL_HELPER = 0x00945640
 FTOL_PROBE_TAG = 'cmre-ftol-float-'
 _FTOL_CAST = re.compile(r'\(\s*(?:(?:signed\s+)?long\s+long(?:\s+int)?|s64|i64|int64_t|__int64)\s*\)')
+# Explicit integer casts other than the registered construct. A floating operand here is a
+# float-to-integer conversion acceptance cannot mutate per site, so it fails closed.
+_OTHER_INT_CAST = re.compile(
+    r'\(\s*(?:(?:const|volatile)\s+)*(?:(?:(?:un)?signed\s+)?(?:char|short(?:\s+int)?|int|long(?:\s+int)?|_Bool)'
+    r'|(?:un)?signed|unsigned\s+long\s+long(?:\s+int)?|u8|s8|u16|s16|u32|s32|u64|BOOL|BYTE|WORD|DWORD)\s*\)')
 # A source-local alias of the construct (`typedef long long ll;`) spells the same cast.
 _LONG_LONG_TYPEDEF = re.compile(r'\btypedef\s+(?:signed\s+)?long\s+long(?:\s+int)?\s+([A-Za-z_]\w*)\s*;')
 _IDENT = re.compile(r'[A-Za-z_]\w*')
@@ -170,6 +175,8 @@ def type_names(*texts):
     names = set()
     for text in texts:
         masked = _NONCODE.sub(_mask_noncode, text)
+        # `typedef s16 alias_s16 __attribute__((may_alias));` names alias_s16
+        masked = re.sub(r'__attribute__\s*\(\((?:[^()]|\([^()]*\))*\)\)', ' ', masked)
         for match in _TYPEDEF.finditer(masked):
             names.add(match.group(1) or match.group(2))
     names.discard(None)
@@ -271,18 +278,32 @@ def ftol_cast_sites(text, names=()):
     aliases = sorted(set(_LONG_LONG_TYPEDEF.findall(masked)))
     pattern = _FTOL_CAST if not aliases else re.compile(
         _FTOL_CAST.pattern + '|' + r'\(\s*(?:%s)\s*\)' % '|'.join(map(re.escape, aliases)))
+    found = [(match, 'wide') for match in pattern.finditer(masked)]
+    found += [(match, 'other') for match in _OTHER_INT_CAST.finditer(masked)]
     sites = []
-    for match in pattern.finditer(masked):
+    for match, width in sorted(found, key=lambda row: row[0].start()):
         before = masked[:match.start()].rstrip()
         word = re.search(r'[A-Za-z_]\w*$', before)
         if word and word.group() not in _CAST_AFTER_KEYWORD:
             continue
-        if any(lo <= match.start() < hi for lo, hi in directives):
-            raise ValueError('unsupported: a 64-bit cast inside a preprocessor directive cannot be '
-                             'mutated per __ftol site')
-        start, end = _cast_operand_span(masked, text, match.end(), names)
+        in_directive = any(lo <= match.start() < hi for lo, hi in directives)
+        if width == 'other':
+            # Integer casts are everywhere in recovered C (macros, literals, sizeof). Only a
+            # delimitable cast in code can be typed; the rest cannot hold a floating operand
+            # the probe would otherwise reject (documented limit, ADR 0006).
+            if in_directive:
+                continue
+            try:
+                start, end = _cast_operand_span(masked, text, match.end(), names)
+            except ValueError:
+                continue
+        else:
+            if in_directive:
+                raise ValueError('unsupported: a 64-bit cast inside a preprocessor directive cannot be '
+                                 'mutated per __ftol site')
+            start, end = _cast_operand_span(masked, text, match.end(), names)
         sites.append({'index': len(sites), 'line': text.count('\n', 0, match.start()) + 1,
-                      'cast': (match.start(), match.end()), 'operand': (start, end)})
+                      'width': width, 'cast': (match.start(), match.end()), 'operand': (start, end)})
     return sites
 
 
@@ -305,6 +326,9 @@ def ftol_probe_source(text, sites):
     return header + ''.join(out)
 
 
+_CONVERSION = re.compile(r"conversion from '[^']+'(?: \{aka '[^']+'\})? to '([^']+)'(?: \{aka '([^']+)'\})?")
+
+
 def ftol_probe_result(returncode, stderr, sites):
     """Indexes of floating-operand casts from probe diagnostics; ValueError on anything else.
 
@@ -313,6 +337,10 @@ def ftol_probe_result(returncode, stderr, sites):
     floating, problems = set(), []
     for line in stderr.splitlines():
         if 'Wfloat-conversion' in line:
+            conversion = _CONVERSION.search(line)
+            target = (conversion.group(2) or conversion.group(1)) if conversion else ''
+            if conversion and re.search(r'\b(?:float|double)\b', target):
+                continue   # floating narrowing (an fstp store), not an __ftol site
             problems.append('implicit float-to-integer conversion; write each __ftol site as an '
                             f'explicit (long long) cast: {line.strip()[:200]}')
         elif ' error: ' in f' {line} ' or line.startswith('error:') or ': error:' in line:
@@ -343,6 +371,10 @@ def ftol_mutant_sources(text, probe, required, names=()):
         return []
     sites = ftol_cast_sites(text, names)
     floating = ftol_float_casts(text, sites, probe)
+    narrow = [site for site in floating if site['width'] != 'wide']
+    if narrow:
+        raise ValueError(f"explicit non-(long long) integer cast of a floating value at line {narrow[0]['line']}; "
+                         'write each __ftol site as its own (long long) cast')
     if len(floating) < required:
         raise ValueError(f'{len(floating)} floating 64-bit cast(s) for {required} original __ftol '
                          'call site(s); write each site as its own (long long) cast')
@@ -360,7 +392,12 @@ def ftol_sites_in_source(text, original_sites):
     A site that still calls the original helper as an explicit boundary (`cm_fn_00945640()`,
     ADR 0010 x87 transport) converts in original code: nothing in the source to observe."""
     masked = _NONCODE.sub(_mask_noncode, text)
-    boundary = len(re.findall(r'\bcm_fn_%08x\s*\(\s*\)' % FTOL_HELPER, masked))
+    boundary = 0
+    for match in re.finditer(r'\bcm_fn_%08x\s*\(\s*\)' % FTOL_HELPER, masked):
+        word = re.search(r'[A-Za-z_]\w*$', masked[:match.start()].rstrip())
+        if word and word.group() not in _CAST_AFTER_KEYWORD:
+            continue   # `long long cm_fn_00945640();` declares; it converts nothing
+        boundary += 1
     return max(0, original_sites - boundary)
 
 

@@ -5273,7 +5273,7 @@ def test_x87_operand_mutants_must_each_fail_and_their_evidence_is_retained(root)
 # per floating (long long) cast. 24 Nov: fn_005ce2d0 passed with 9 of 13 sites unobserved.
 FTOL_SOURCE = ('#include "cmre.h"\n'
                's32 cm_fn_00401000(u32 a)\n'
-               '{ long double v = (long double)a * 1.5L; return (s32)(long long)v; } // PASS\n')
+               '{ long double v = (long double)a * 1.5L; return (long long)v; } // PASS\n')
 
 
 def all_casts_floating(text):
