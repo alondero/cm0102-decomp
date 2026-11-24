@@ -73,3 +73,30 @@ construct MSVC lowers to it, when all of the following hold:
 - Condition 4 is a new acceptance obligation. The weakness is not specific to
   x87: one flipped comparison survived the gate in 12 of 52 mutants of accepted
   C (2026-11-03 sample, [NEXT-PHASE-PLAN.md](../agent/archive/NEXT-PHASE-PLAN.md)).
+
+## Mechanized condition 4 (2026-11-24)
+
+Until this date nothing checked condition 4. fn_005ce2d0 passed the gate with
+9 of its 13 sites unobserved: five had no non-budget case reaching them, and four
+were reached but a mutant survived. 215 accepted C routines (422 KB) call
+`0x00945640` in the original.
+
+The C gate report now records the original's call and tail-jump sites of
+`0x00945640` (`ftol_sites`). For such a routine, the ADR 0010 operand proof
+(`cmre/operand_evidence.py`, receipt schema `cmre-farm-x87-operands/2`)
+also covers each `__ftol` site:
+
+- A `-fsyntax-only` probe under the gate's C flags classifies every explicit
+  signed 64-bit cast in code by its operand type. `-Wfloat-conversion` rejects
+  implicit float-to-integer conversions.
+- Each cast of a floating operand gets one mutant with its operand `+ 1.0L`.
+  The mutant must show a non-budget differential witness at both O0 and O2,
+  under the ADR 0010 condition 3 rule.
+- Fewer floating casts than original sites fails closed. Each site must be its
+  own cast: a shared macro or helper, a cast inside a preprocessor directive,
+  or merged paths cannot show per-site observation. A site that still calls
+  the original helper as an explicit boundary (`cm_fn_00945640()`) needs no
+  mutant.
+
+The proof runs before farm and direct acceptance, as the CIpow proof does.
+Accepted routines are audited separately (`scripts/cmre_ftol_audit.py`).

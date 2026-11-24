@@ -102,10 +102,14 @@ callees as explicit boundaries. C acceptance does not establish composed executi
      O0/O2 emission across the complete reachable body: intermediate precision,
      64-bit conversion/control-word behavior, and original call/store/RNG order.
      Resolve compiler-lowering discrepancies against the original contract,
-     then freeze the corrected pair and its passing baseline. Break each converted
-     value once in a scratch copy (for example drop one FADD) and run
-     `cmre test fn_X --c --source COPY`. If that copy also passes, add evidenced
-     `c_hints` fixtures that reach the value before accepting.
+     then freeze the corrected pair and its passing baseline. Write one explicit
+     `(long long)` cast per original call site in the function body itself: not in
+     a macro or shared helper, and never an implicit float-to-integer assignment.
+     Acceptance (farm and `cmre accept`) mutates each floating `(long long)` cast
+     (operand `+ 1.0L`). Every mutant must fail the gate at O0 and O2, and fewer
+     floating casts than original sites is a BLOCKER. Before testing, break each
+     converted value once in a scratch copy and run `cmre test fn_X --c --source COPY`.
+     If that copy also passes, add evidenced `c_hints` fixtures that reach the value.
    - A `call 0x00945ff0` (`_CIpow`) is `pow` with the base in ST1 and the
      exponent in ST0 ([ADR 0010](../adr/0010-x87-register-argument-bridges.md)).
      `#include "cmre_x87.h"` and write `cm_x87_CIpow(base, exponent)` with both

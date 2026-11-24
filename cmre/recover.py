@@ -444,11 +444,18 @@ def test_c(va: int, overrides: dict | None = None, fresh: bool = False, *, sourc
               "toolchain": env.toolchain_identity(), "builds": builds,
               "jump_contract": contract,
               "x87_contract": fp_contract,
+              "ftol_sites": ftol_sites(lifted),
               "effective_options_sha256": acceptance_request.digest_json(opts.__dict__),
               "source_dependencies": dependencies["files"], "preprocessed_sha256": dependencies["preprocessed"]}
     run_dir.mkdir(parents=True, exist_ok=True)
     ledger.write_json(cached, report)
     return report
+
+
+def ftol_sites(lifted) -> list[str]:
+    """Original call/tail-jump sites of the __ftol helper (ADR 0006 condition 4 census)."""
+    return [f"{ins.va:#010x}" for va, ins in sorted(lifted.insns.items())
+            if ins.target == operand_evidence.FTOL_HELPER and ins.kind in ("call", "tail_jmp")]
 
 
 def _digests(report: dict) -> list[str]:
@@ -596,8 +603,9 @@ def _operand_proof(va, baseline, hints_sha, request):
     if not operand_evidence.operand_proof_needed(raw, baseline):
         return None, None
     if request is not None and (operand_evidence.bridge_call_sites(raw.decode('utf-8'))
-                                or any(b.get('cipow_calls') for b in baseline['builds'].values())):
-        return None, 'A bridge candidate from the farm requires its retained operand proof'
+                                or any(b.get('cipow_calls') for b in baseline['builds'].values())
+                                or operand_evidence.ftol_mutants_required(raw.decode('utf-8'), baseline)):
+        return None, 'A bridge or __ftol candidate from the farm requires its retained operand proof'
     path = env.RUNS / fn / f"c-{baseline['key']}" / 'operands' / str(time.time_ns()) / 'summary.json'
 
     def check_inputs():

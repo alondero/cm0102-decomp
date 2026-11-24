@@ -9,6 +9,8 @@ from . import coordination
 
 _X87_BRIDGE = 'cm_x87_CIpow'
 _X87_BUILD_LEVELS = ('-O0', '-O2')
+# /2 (24 Nov): rows for ADR 0006 condition 4 __ftol sites beside the ADR 0010 CIpow operands.
+OPERAND_SCHEMA = 'cmre-farm-x87-operands/2'
 
 _NONCODE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|/\*.*?\*/|//[^\n]*', re.S)
 
@@ -17,9 +19,17 @@ def _mask_noncode(match):
 
 
 def operand_proof_needed(raw: bytes, gate: dict) -> bool:
-    """Include compiler-expanded calls even when source spelling hid the bridge."""
+    """Include compiler-expanded calls even when source spelling hid the bridge, and every
+    routine whose original calls __ftol (ADR 0006 condition 4)."""
     return (_X87_BRIDGE.encode() in raw
-            or any(level.get('cipow_calls') for level in gate.get('builds', {}).values()))
+            or any(level.get('cipow_calls') for level in gate.get('builds', {}).values())
+            or bool(ftol_site_count(gate)))
+
+
+def ftol_site_count(gate) -> int:
+    """Original __ftol call sites the gate report recorded from the lifted routine."""
+    sites = gate.get('ftol_sites') if isinstance(gate, dict) else None
+    return len(sites) if isinstance(sites, list) else 0
 
 
 def _compiled_sites(gate: dict) -> int:
@@ -135,6 +145,266 @@ def bridge_mutant_sources(text):
             rows.append({'index': site['index'], 'line': site['line'], 'operand': operand,
                          'source': text[:start] + f'(({text[start:end]}) + 1.0L)' + text[end:]})
     return rows
+
+
+# --- ADR 0006 condition 4: __ftol site observation -------------------------
+
+FTOL_HELPER = 0x00945640
+FTOL_PROBE_TAG = 'cmre-ftol-float-'
+_FTOL_CAST = re.compile(r'\(\s*(?:(?:signed\s+)?long\s+long(?:\s+int)?|s64|i64|int64_t|__int64)\s*\)')
+_IDENT = re.compile(r'[A-Za-z_]\w*')
+_NUMBER = re.compile(r'(?:0[xX][0-9a-fA-F]+|\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)[uUlLfF]*')
+# A parenthesis after one of these keywords can still open a cast; after any other identifier it
+# opens a call, a prototype or sizeof/typeof, which is not a value conversion.
+_CAST_AFTER_KEYWORD = {'return', 'case', 'else', 'do'}
+_TYPE_WORDS = {'void', 'char', 'short', 'int', 'long', 'float', 'double', 'signed', 'unsigned',
+               'const', 'volatile', '_Bool', 'struct', 'union', 'enum'}
+_TYPEDEF = re.compile(r'\btypedef\b[^;{}]*?(?:\(\s*\*\s*([A-Za-z_]\w*)\s*\)\s*\([^;]*\)|'
+                      r'\b([A-Za-z_]\w*)\s*(?:\[[^\];]*\]\s*)*);', re.S)
+
+
+def type_names(*texts):
+    """Typedef names declared in the given C texts (the source and cmre.h)."""
+    names = set()
+    for text in texts:
+        masked = _NONCODE.sub(_mask_noncode, text)
+        for match in _TYPEDEF.finditer(masked):
+            names.add(match.group(1) or match.group(2))
+    names.discard(None)
+    return names
+
+
+def _is_type_name(inner, names):
+    tokens = re.findall(r'[A-Za-z_]\w*|\*|\S', inner)
+    if not tokens:
+        return False
+    tagged = False
+    for token in tokens:
+        if token == '*' or token in _TYPE_WORDS or token in names:
+            tagged = token in ('struct', 'union', 'enum')
+            continue
+        if tagged and _IDENT.fullmatch(token):
+            tagged = False
+            continue
+        return False
+    return True
+
+
+def _skip_space(masked, text, index):
+    start = index
+    while index < len(masked) and masked[index].isspace():
+        index += 1
+    if any(char in text[start:index] for char in '\'"'):
+        raise ValueError('unsupported: a literal operand of a 64-bit cast')
+    return index
+
+
+def _matching(masked, opening, pair):
+    depth = 0
+    for index in range(opening, len(masked)):
+        if masked[index] == pair[0]:
+            depth += 1
+        elif masked[index] == pair[1]:
+            depth -= 1
+            if depth == 0:
+                return index
+    raise ValueError(f'unsupported: unterminated {pair[0]} in a 64-bit cast operand')
+
+
+def _cast_operand_span(masked, text, index, names):
+    """[start, end) of the cast-expression a cast at `index` applies to."""
+    index = start = _skip_space(masked, text, index)
+    while index < len(masked):
+        if masked.startswith(('++', '--'), index):
+            index = _skip_space(masked, text, index + 2)
+        elif masked[index] in '-+!~*&':
+            index = _skip_space(masked, text, index + 1)
+        elif masked[index] == '(':
+            closing = _matching(masked, index, '()')
+            if not _is_type_name(masked[index + 1:closing], names):
+                break
+            index = _skip_space(masked, text, closing + 1)
+        else:
+            break
+    if index >= len(masked):
+        raise ValueError('unsupported: 64-bit cast without an operand')
+    word = _IDENT.match(masked, index)
+    if masked[index] == '(':
+        index = _matching(masked, index, '()') + 1
+    elif word and word.group() in ('sizeof', '_Alignof', '__alignof__', '_Generic'):
+        raise ValueError(f'unsupported: {word.group()} operand of a 64-bit cast')
+    elif word:
+        index = word.end()
+    elif number := _NUMBER.match(masked, index):
+        index = number.end()
+    else:
+        raise ValueError(f'unsupported: 64-bit cast operand starts with {masked[index]!r}')
+    while True:
+        after = _skip_space(masked, text, index)
+        if after < len(masked) and masked[after] == '[':
+            index = _matching(masked, after, '[]') + 1
+        elif after < len(masked) and masked[after] == '(':
+            index = _matching(masked, after, '()') + 1
+        elif masked.startswith('->', after) or (after < len(masked) and masked[after] == '.'
+                                                 and not masked[after + 1:after + 2].isdigit()):
+            member = _IDENT.match(masked, _skip_space(masked, text, after + (2 if masked[after] == '-' else 1)))
+            if not member:
+                raise ValueError('unsupported: member access without a member name')
+            index = member.end()
+        elif masked.startswith(('++', '--'), after):
+            index = after + 2
+        else:
+            return start, index
+
+
+def ftol_cast_sites(text, names=()):
+    """Every explicit signed 64-bit cast in code, with the exact span of its operand.
+
+    The ADR 0006 construct for an __ftol site is `(long long)x`. A cast inside a preprocessor
+    directive cannot be mutated per use and fails closed, as do operands this narrow parser
+    cannot delimit; `ftol_float_casts` then keeps only the casts of floating operands."""
+    masked = _NONCODE.sub(_mask_noncode, text)
+    directives = _bridge_directive_spans(text)
+    names = set(names) | type_names(text)
+    sites = []
+    for match in _FTOL_CAST.finditer(masked):
+        before = masked[:match.start()].rstrip()
+        word = re.search(r'[A-Za-z_]\w*$', before)
+        if word and word.group() not in _CAST_AFTER_KEYWORD:
+            continue
+        if any(lo <= match.start() < hi for lo, hi in directives):
+            raise ValueError('unsupported: a 64-bit cast inside a preprocessor directive cannot be '
+                             'mutated per __ftol site')
+        start, end = _cast_operand_span(masked, text, match.end(), names)
+        sites.append({'index': len(sites), 'line': text.count('\n', 0, match.start()) + 1,
+                      'cast': (match.start(), match.end()), 'operand': (start, end)})
+    return sites
+
+
+def ftol_probe_source(text, sites):
+    """The source with each cast operand wrapped in a compile-time floating-type assertion.
+
+    GCC reports `static assertion failed: "cmre-ftol-float-N"` for every cast whose operand
+    is floating, and -Wfloat-conversion reports implicit float-to-integer conversions."""
+    inserts = []
+    for site in sites:
+        start, end = site['operand']
+        inserts += [(start, 0, f"CMRE_FTOL_PROBE({site['index']}, ("), (end, 1, '))')]
+    out, last = [], 0
+    for position, _, piece in sorted(inserts, key=lambda row: (row[0], -row[1])):
+        out += [text[last:position], piece]
+        last = position
+    out.append(text[last:])
+    header = ('#define CMRE_FTOL_PROBE(k, x) ({ _Static_assert(!_Generic((x), float: 1, double: 1, '
+              f'long double: 1, default: 0), "{FTOL_PROBE_TAG}" #k); (x); }})\n')
+    return header + ''.join(out)
+
+
+def ftol_probe_result(returncode, stderr, sites):
+    """Indexes of floating-operand casts from probe diagnostics; ValueError on anything else.
+
+    The assertions are the only expected errors, so the compile fails exactly when some cast is
+    floating. Any other outcome (a compiler that did not start, an unparsed error) fails closed."""
+    floating, problems = set(), []
+    for line in stderr.splitlines():
+        if 'Wfloat-conversion' in line:
+            problems.append('implicit float-to-integer conversion; write each __ftol site as an '
+                            f'explicit (long long) cast: {line.strip()[:200]}')
+        elif ' error: ' in f' {line} ' or line.startswith('error:') or ': error:' in line:
+            tag = re.search(re.escape(FTOL_PROBE_TAG) + r'"?\s*"?(\d+)', line)
+            if tag and 'static assertion failed' in line:
+                floating.add(int(tag.group(1)))
+            else:
+                problems.append(f'probe compile error: {line.strip()[:200]}')
+    if problems:
+        raise ValueError('unsupported: ' + problems[0])
+    if not floating <= {site['index'] for site in sites}:
+        raise ValueError('unsupported: probe reported an unknown cast index')
+    if bool(returncode) != bool(floating):
+        raise ValueError(f'unsupported: probe compile exited {returncode} with '
+                         f'{len(floating)} floating-cast diagnostic(s): {stderr.strip()[:200]!r}')
+    return floating
+
+
+def ftol_mutant_sources(text, probe, required, names=()):
+    """One mutant per floating-operand 64-bit cast (operand + 1.0L), or ValueError.
+
+    `probe(source_text) -> (exit code, diagnostics)` is `build.syntax_probe` in production.
+    `required` is the number of __ftol call sites in the original routine: fewer floating
+    casts means some site is not individually written (for example a shared helper) and
+    cannot be shown observed per site. `names` adds typedef names from included headers."""
+    required = ftol_sites_in_source(text, required)
+    if not required:
+        return []
+    sites = ftol_cast_sites(text, names)
+    floating = ftol_float_casts(text, sites, probe)
+    if len(floating) < required:
+        raise ValueError(f'{len(floating)} floating 64-bit cast(s) for {required} original __ftol '
+                         'call site(s); write each site as its own (long long) cast')
+    rows = []
+    for ordinal, site in enumerate(floating):
+        start, end = site['operand']
+        rows.append({'index': ordinal, 'line': site['line'], 'operand': 'ftol',
+                     'source': text[:start] + f'(({text[start:end]}) + 1.0L)' + text[end:]})
+    return rows
+
+
+def ftol_sites_in_source(text, original_sites):
+    """Original __ftol sites the source must write as casts.
+
+    A site that still calls the original helper as an explicit boundary (`cm_fn_00945640()`,
+    ADR 0010 x87 transport) converts in original code: nothing in the source to observe."""
+    masked = _NONCODE.sub(_mask_noncode, text)
+    boundary = len(re.findall(r'\bcm_fn_%08x\s*\(\s*\)' % FTOL_HELPER, masked))
+    return max(0, original_sites - boundary)
+
+
+def ftol_mutants_required(text, gate):
+    """True when acceptance needs __ftol site mutants for this source."""
+    return bool(ftol_sites_in_source(text, ftol_site_count(gate)))
+
+
+def ftol_float_casts(text, sites, probe):
+    if not sites:
+        return []
+    floating = ftol_probe_result(*probe(ftol_probe_source(text, sites)), sites)
+    return [site for site in sites if site['index'] in floating]
+
+
+def _default_probe(text):
+    import tempfile
+    from pathlib import Path
+    from . import build
+    with tempfile.TemporaryDirectory(prefix='cmre-ftol-') as tmp:
+        return build.syntax_probe(text, Path(tmp))
+
+
+def _header_type_names():
+    from . import env
+    return type_names((env.ROOT / 'recovery/include/cmre.h').read_text(encoding='utf-8'))
+
+
+def operand_mutant_sources(text, gate, probe=None, names=None):
+    """(CIpow rows, __ftol rows) for this source against the gate's original site census."""
+    bridge = bridge_mutant_sources(text)
+    required = ftol_site_count(gate)
+    if not required:
+        return bridge, []
+    ftol = ftol_mutant_sources(text, probe or _default_probe, required,
+                               _header_type_names() if names is None else names)
+    return bridge, ftol
+
+
+def describe_mutant(row):
+    if row['operand'] == 'ftol':
+        return f"__ftol site mutant {row['index'] + 1} (line {row['line']})"
+    return f"x87 operand mutant {row['operand']} for call {row['index'] + 1} (line {row['line']})"
+
+
+def mutant_stem(row):
+    if row['operand'] == 'ftol':
+        return f"ftol-{row['index']:03d}"
+    return f"call-{row['index']:03d}-{row['operand']}"
 
 
 def _baseline_inconclusive(baseline, opt):
@@ -256,7 +526,8 @@ def valid_execution_identity(identity):
     return True
 
 
-def generate(summary_path, fn, job_number, text_bytes, baseline, hints_sha, *, gate, check_inputs, report_event):
+def generate(summary_path, fn, job_number, text_bytes, baseline, hints_sha, *, gate, check_inputs, report_event,
+             probe=None):
     """ADR 0010 condition 3 before any canonical install or acceptance.
 
     Each cm_x87_CIpow call is copied twice, once with +1.0L on the base and
@@ -264,14 +535,17 @@ def generate(summary_path, fn, job_number, text_bytes, baseline, hints_sha, *, g
     both ordinary builds. Reports and sources are bound by SHA-256; exact
     decoded raw bytes drive generation so CRLF is preserved. Survivors,
     build failures, inconclusive runs, unbound reports and source/hint drift
-    are BLOCKERs, and all received evidence stays under RUN/x87-mutants/."""
+    are BLOCKERs, and all received evidence stays under RUN/x87-mutants/.
+
+    ADR 0006 condition 4 adds one mutant per floating (long long) cast when the original
+    calls __ftol (operand + 1.0L), under the same kill rule."""
     if not operand_proof_needed(text_bytes, baseline):
         return None
     encoded = text_bytes
     digest = hashlib.sha256(encoded).hexdigest()
     directory = summary_path.parent
     directory.mkdir(parents=True, exist_ok=True)
-    summary = {'schema': 'cmre-farm-x87-operands/1', 'fn': fn, 'job': job_number,
+    summary = {'schema': OPERAND_SCHEMA, 'fn': fn, 'job': job_number,
                'candidate_sha256': digest, 'hints_sha256': hints_sha,
                'baseline': None, 'mutants': [], 'status': 'running'}
 
@@ -287,10 +561,11 @@ def generate(summary_path, fn, job_number, text_bytes, baseline, hints_sha, *, g
         return retained(f'BLOCKER: x87 operand safeguard: source is not UTF-8: {exc}; '
                         f'evidence {summary_path}')
     try:
-        mutants = bridge_mutant_sources(text)
+        bridge, ftol = operand_mutant_sources(text, baseline, probe)
     except ValueError as exc:
         return retained(f'BLOCKER: x87 operand safeguard: {exc}; evidence {summary_path}')
-    if len(mutants) // 2 < _compiled_sites(baseline):
+    mutants = bridge + ftol
+    if len(bridge) // 2 < _compiled_sites(baseline):
         return retained(f'BLOCKER: x87 compiled bridge calls lack individually parsed source calls; evidence {summary_path}')
     if not mutants:
         return None
@@ -317,7 +592,7 @@ def generate(summary_path, fn, job_number, text_bytes, baseline, hints_sha, *, g
         'report_sha256': hashlib.sha256(baseline_report.read_bytes()).hexdigest(),
         'gate_key': baseline.get('key')}
     for row in mutants:
-        stem = f"call-{row['index']:03d}-{row['operand']}"
+        stem = mutant_stem(row)
         mutant_path = directory / f'{stem}.c'
         report_path = directory / f'{stem}.json'
         coordination.atomic_bytes(mutant_path, row['source'].encode('utf-8'))
@@ -346,14 +621,13 @@ def generate(summary_path, fn, job_number, text_bytes, baseline, hints_sha, *, g
     if blocked:
         row = blocked[0]
         return retained(
-            f"BLOCKER: x87 operand mutant {row['operand']} for call {row['index'] + 1} "
-            f"(line {row['line']}) {row['outcome']}: {row['reason']}; evidence {summary_path}")
+            f"BLOCKER: {describe_mutant(row)} {row['outcome']}: {row['reason']}; evidence {summary_path}")
     summary['status'] = 'killed'
     coordination.atomic_json(summary_path, summary)
     report_event('killed')
     return None
 
-def verify_receipt(path, raw, *, fn, job_number, hints_sha, current_execution, active_gate=None):
+def verify_receipt(path, raw, *, fn, job_number, hints_sha, current_execution, active_gate=None, probe=None):
     text = raw.decode('utf-8')
     digest = hashlib.sha256(raw).hexdigest()
     expected_va = '0x' + fn[3:]
@@ -362,7 +636,7 @@ def verify_receipt(path, raw, *, fn, job_number, hints_sha, current_execution, a
     except (OSError, ValueError) as exc:
         return f'BLOCKER: x87 operand evidence missing or unreadable for acceptance: {path}: {exc}'
     if (not isinstance(summary, dict)
-            or summary.get('schema') != 'cmre-farm-x87-operands/1'
+            or summary.get('schema') != OPERAND_SCHEMA
             or summary.get('fn') != fn or summary.get('job') != job_number
             or summary.get('candidate_sha256') != digest
             or summary.get('hints_sha256') != hints_sha
@@ -409,8 +683,12 @@ def verify_receipt(path, raw, *, fn, job_number, hints_sha, current_execution, a
         if problems:
             return ('BLOCKER: x87 operand proof differs from current C gate: '
                     + '; '.join(problems) + f': {path}')
-    expected = bridge_mutant_sources(text)
-    if len(expected) // 2 < _compiled_sites(active_gate or baseline_evidence):
+    try:
+        bridge, ftol = operand_mutant_sources(text, active_gate or baseline_evidence, probe)
+    except ValueError as exc:
+        return f'BLOCKER: x87 operand safeguard: {exc}; evidence {path}'
+    expected = bridge + ftol
+    if len(bridge) // 2 < _compiled_sites(active_gate or baseline_evidence):
         return f'BLOCKER: x87 compiled bridge calls lack individually parsed source calls; evidence {path}'
     rows = summary.get('mutants')
     if not isinstance(rows, list) or len(rows) != len(expected):
@@ -427,7 +705,7 @@ def verify_receipt(path, raw, *, fn, job_number, hints_sha, current_execution, a
         return f'BLOCKER: x87 operand evidence does not cover every call operand: {path}'
     for expected_row in expected:
         row = by_key[(expected_row['index'], expected_row['operand'])]
-        stem = f"call-{expected_row['index']:03d}-{expected_row['operand']}"
+        stem = mutant_stem(expected_row)
         if row.get('line') != expected_row['line']:
             return f'BLOCKER: x87 operand evidence line changed for {stem}: {path}'
         if row.get('source') != f'{stem}.c' or row.get('report') != f'{stem}.json':
