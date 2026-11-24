@@ -5276,8 +5276,11 @@ FTOL_SOURCE = ('#include "cmre.h"\n'
                '{ long double v = (long double)a * 1.5L; return (long long)v; } // PASS\n')
 
 
-def all_casts_floating(text):
-    """Stand-in for the GCC type probe (CI has no pinned toolchain): every probed cast is floating."""
+def all_casts_floating(text, kind='types'):
+    """Stand-in for the GCC probes (CI has no pinned toolchain): every probed cast is floating,
+    and the -O0 build converts exactly once per 64-bit cast."""
+    if kind == 'fist':
+        return 0, '\tfistpll\t(%esp)\n' * text.count('(long long)'), ''
     tags = re.findall(r'CMRE_FTOL_PROBE\((\d+),', text)
     return 1, ''.join(f'p.c:1:1: error: static assertion failed: "cmre-ftol-float-{k}"\n' for k in tags)
 

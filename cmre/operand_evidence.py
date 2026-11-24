@@ -152,11 +152,6 @@ def bridge_mutant_sources(text):
 FTOL_HELPER = 0x00945640
 FTOL_PROBE_TAG = 'cmre-ftol-float-'
 _FTOL_CAST = re.compile(r'\(\s*(?:(?:signed\s+)?long\s+long(?:\s+int)?|s64|i64|int64_t|__int64)\s*\)')
-# Explicit integer casts other than the registered construct. A floating operand here is a
-# float-to-integer conversion acceptance cannot mutate per site, so it fails closed.
-_OTHER_INT_CAST = re.compile(
-    r'\(\s*(?:(?:const|volatile)\s+)*(?:(?:(?:un)?signed\s+)?(?:char|short(?:\s+int)?|int|long(?:\s+int)?|_Bool)'
-    r'|(?:un)?signed|unsigned\s+long\s+long(?:\s+int)?|u8|s8|u16|s16|u32|s32|u64|BOOL|BYTE|WORD|DWORD)\s*\)')
 # A source-local alias of the construct (`typedef long long ll;`) spells the same cast.
 _LONG_LONG_TYPEDEF = re.compile(r'\btypedef\s+(?:signed\s+)?long\s+long(?:\s+int)?\s+([A-Za-z_]\w*)\s*;')
 _IDENT = re.compile(r'[A-Za-z_]\w*')
@@ -278,32 +273,18 @@ def ftol_cast_sites(text, names=()):
     aliases = sorted(set(_LONG_LONG_TYPEDEF.findall(masked)))
     pattern = _FTOL_CAST if not aliases else re.compile(
         _FTOL_CAST.pattern + '|' + r'\(\s*(?:%s)\s*\)' % '|'.join(map(re.escape, aliases)))
-    found = [(match, 'wide') for match in pattern.finditer(masked)]
-    found += [(match, 'other') for match in _OTHER_INT_CAST.finditer(masked)]
     sites = []
-    for match, width in sorted(found, key=lambda row: row[0].start()):
+    for match in pattern.finditer(masked):
         before = masked[:match.start()].rstrip()
         word = re.search(r'[A-Za-z_]\w*$', before)
         if word and word.group() not in _CAST_AFTER_KEYWORD:
             continue
-        in_directive = any(lo <= match.start() < hi for lo, hi in directives)
-        if width == 'other':
-            # Integer casts are everywhere in recovered C (macros, literals, sizeof). Only a
-            # delimitable cast in code can be typed; the rest cannot hold a floating operand
-            # the probe would otherwise reject (documented limit, ADR 0006).
-            if in_directive:
-                continue
-            try:
-                start, end = _cast_operand_span(masked, text, match.end(), names)
-            except ValueError:
-                continue
-        else:
-            if in_directive:
-                raise ValueError('unsupported: a 64-bit cast inside a preprocessor directive cannot be '
-                                 'mutated per __ftol site')
-            start, end = _cast_operand_span(masked, text, match.end(), names)
+        if any(lo <= match.start() < hi for lo, hi in directives):
+            raise ValueError('unsupported: a 64-bit cast inside a preprocessor directive cannot be '
+                             'mutated per __ftol site')
+        start, end = _cast_operand_span(masked, text, match.end(), names)
         sites.append({'index': len(sites), 'line': text.count('\n', 0, match.start()) + 1,
-                      'width': width, 'cast': (match.start(), match.end()), 'operand': (start, end)})
+                      'cast': (match.start(), match.end()), 'operand': (start, end)})
     return sites
 
 
@@ -362,7 +343,8 @@ def ftol_probe_result(returncode, stderr, sites):
 def ftol_mutant_sources(text, probe, required, names=()):
     """One mutant per floating-operand 64-bit cast (operand + 1.0L), or ValueError.
 
-    `probe(source_text) -> (exit code, diagnostics)` is `build.syntax_probe` in production.
+    `probe(source_text, kind)` is `_default_probe` in production. The -O0 build's x87 integer
+    stores must equal the floating casts, so every conversion in the source is a mutated cast.
     `required` is the number of __ftol call sites in the original routine: fewer floating
     casts means some site is not individually written (for example a shared helper) and
     cannot be shown observed per site. `names` adds typedef names from included headers."""
@@ -371,10 +353,11 @@ def ftol_mutant_sources(text, probe, required, names=()):
         return []
     sites = ftol_cast_sites(text, names)
     floating = ftol_float_casts(text, sites, probe)
-    narrow = [site for site in floating if site['width'] != 'wide']
-    if narrow:
-        raise ValueError(f"explicit non-(long long) integer cast of a floating value at line {narrow[0]['line']}; "
-                         'write each __ftol site as its own (long long) cast')
+    emitted = ftol_emitted_conversions(text, probe)
+    if emitted != len(floating):
+        raise ValueError(f'{emitted} float-to-integer conversion(s) in the -O0 build for {len(floating)} '
+                         'floating (long long) cast(s); write every float-to-integer conversion as its '
+                         'own (long long) cast')
     if len(floating) < required:
         raise ValueError(f'{len(floating)} floating 64-bit cast(s) for {required} original __ftol '
                          'call site(s); write each site as its own (long long) cast')
@@ -409,16 +392,32 @@ def ftol_mutants_required(text, gate):
 def ftol_float_casts(text, sites, probe):
     if not sites:
         return []
-    floating = ftol_probe_result(*probe(ftol_probe_source(text, sites)), sites)
+    floating = ftol_probe_result(*probe(ftol_probe_source(text, sites), 'types'), sites)
     return [site for site in sites if site['index'] in floating]
 
 
-def _default_probe(text):
+def _default_probe(text, kind='types'):
+    """`types`: (exit code, diagnostics) of the type probe. `fist`: (exit code, -O0 assembly, diagnostics)."""
     import tempfile
     from pathlib import Path
     from . import build
     with tempfile.TemporaryDirectory(prefix='cmre-ftol-') as tmp:
+        if kind == 'fist':
+            return build.assembly_probe(text, Path(tmp))
         return build.syntax_probe(text, Path(tmp))
+
+
+# Under -m32 -mno-sse3 GCC lowers every float-to-integer conversion to an x87 integer store,
+# whatever the source spelling (macro, typedef, enum, typeof, compound literal, inline asm).
+_FIST = re.compile(r'^\s*fistt?p?(?:s|l|ll|q)?\b', re.M)
+
+
+def ftol_emitted_conversions(text, probe):
+    """x87 integer stores (fist/fistp/fisttp) in the source's -O0 build: its float-to-integer conversions."""
+    returncode, assembly, stderr = probe(text, 'fist')
+    if returncode:
+        raise ValueError(f'unsupported: -O0 conversion census did not compile: {stderr.strip()[:200]!r}')
+    return len(_FIST.findall(assembly))
 
 
 def _header_type_names():

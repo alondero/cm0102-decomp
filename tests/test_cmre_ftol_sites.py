@@ -10,14 +10,15 @@ from cmre import build, env, operand_evidence as oe
 needs_gcc = pytest.mark.skipif(not Path(env.tool('gcc')).exists(), reason='pinned MinGW gcc unavailable')
 
 
-def probe(text):
+def probe(text, kind='types'):
     with tempfile.TemporaryDirectory() as tmp:
+        if kind == 'fist':
+            return build.assembly_probe(text, Path(tmp))
         return build.syntax_probe(text, Path(tmp))
 
 
 def operands(text, names=()):
-    return [text[s['operand'][0]:s['operand'][1]] for s in oe.ftol_cast_sites(text, names)
-            if s['width'] == 'wide']
+    return [text[s['operand'][0]:s['operand'][1]] for s in oe.ftol_cast_sites(text, names)]
 
 
 @pytest.mark.parametrize('expression,operand', [
@@ -46,9 +47,8 @@ def test_a_local_long_long_typedef_spells_the_same_cast():
 def test_a_typedef_with_a_trailing_attribute_is_a_type_name():
     # fn_004de5d0: `(s32)*(volatile alias_s16 *)e_home` broke the probe.
     text = ('typedef s16 alias_s16 __attribute__((may_alias));\n'
-            'u32 f(u32 e) { return (u32)(s32)*(volatile alias_s16 *)e + (long long)x; }\n')
-    spans = [text[s['operand'][0]:s['operand'][1]] for s in oe.ftol_cast_sites(text, {'s32', 'u32'})]
-    assert spans == ['(s32)*(volatile alias_s16 *)e', '*(volatile alias_s16 *)e', 'x']
+            'u32 f(u32 e) { return (u32)(long long)*(volatile alias_s16 *)e; }\n')
+    assert operands(text) == ['*(volatile alias_s16 *)e']
 
 
 def test_casts_nest_and_chain():
@@ -138,30 +138,41 @@ def test_an_empty_bracket_declaration_of_the_helper_cancels_no_site():
     assert oe.ftol_sites_in_source(text, 3) == 1
 
 
-@needs_gcc
-@pytest.mark.parametrize('narrow', ['(int)w', '(s32)w', '(u32)w', '(unsigned long long)w', '(u8)(w * 2.0L)'])
-def test_an_explicit_narrow_cast_of_a_floating_value_fails_closed(narrow):
-    # Review: two padded (long long) casts of v passed while the w site went unobserved.
-    text = ('#include "cmre.h"\n'
-            's32 cm_fn_00401000(s32 c, long double v, long double w)\n'
-            '{ s32 r; if (c) r = (s32)(long long)v; else r = (s32)(long long)v; '
-            f'return r + {narrow}; }}\n')
-    with pytest.raises(ValueError, match=r'non-\(long long\) integer cast of a floating value at line 3'):
-        oe.ftol_mutant_sources(text, probe, 2)
+PADDED = ('#include "cmre.h"\n'
+          'enum E { E0, E1 };\n'
+          'typedef unsigned int uint;\n'
+          '#define TOI(x) ((s32)(x))\n'
+          'struct S { s32 d; };\n'
+          's32 cm_fn_00401000(s32 c, long double v, long double w)\n'
+          '{ s32 r; if (c) r = (s32)(long long)v; else r = (s32)(long long)v;\n'
+          '  return r + (s32)(%s); }\n')
 
 
 @needs_gcc
-def test_integer_narrow_casts_and_float_narrowing_stay_allowed():
+@pytest.mark.parametrize('second', [
+    '(int)w', '(s32)w', '(unsigned long long)w', '(u8)(w * 2.0L)', '(enum E)w', '(uint)w',
+    '(long unsigned)w', '(s32 const)w', '(__typeof__(c))w', 'TOI(w)', '(int)_Generic(w, default: w)',
+    '(struct S){w}.d', '({ enum E e = w; e; })',
+    '({ s32 q; __asm__("fistpl %0" : "=m"(q) : "t"(w) : "st"); q; })'])
+def test_every_float_to_integer_conversion_must_be_a_mutated_cast(second):
+    # Review: two padded (long long) casts of v passed while the second site, spelled
+    # any way the source parse cannot see, went unobserved. The -O0 build counts them all.
+    # (unsigned long long) lowers to two stores; the compound literal is an implicit conversion.
+    with pytest.raises(ValueError, match=r'[34] float-to-integer conversion\(s\) in the -O0 build for 2'
+                                         r'|implicit float-to-integer conversion'):
+        oe.ftol_mutant_sources(PADDED % second, probe, 2)
+
+
+@needs_gcc
+def test_integer_casts_and_float_narrowing_stay_allowed():
     # Review: -Wfloat-conversion also reports long double -> double stores, a false block.
     text = ('#include "cmre.h"\n'
             '#define LOW(x) ((u8)(x))\n'
             'double g;\n'
             's32 cm_fn_00401000(u32 a, s32 n)\n'
             '{ long double v = (long double)a * 1.5L; g = v * 2.0L; float h = v;\n'
-            '  return (s32)(long long)v + (s32)n + (int)\'a\' + (int)sizeof(v) + LOW(n) + (s32)h; }\n')
-    with pytest.raises(ValueError, match='line 6'):   # (s32)h is a float-to-int cast
-        oe.ftol_mutant_sources(text, probe, 1)
-    assert len(oe.ftol_mutant_sources(text.replace(' + (s32)h', ''), probe, 1)) == 1
+            '  return (s32)(long long)v + (s32)n + (int)\'a\' + (int)sizeof(v) + LOW(n) + (s32)(h > 0); }\n')
+    assert len(oe.ftol_mutant_sources(text, probe, 1)) == 1
 
 
 @needs_gcc

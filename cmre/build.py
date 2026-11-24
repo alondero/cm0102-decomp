@@ -92,6 +92,18 @@ def syntax_probe(text: str, workdir: Path) -> tuple[int, str]:
     return r.returncode, r.stderr
 
 
+def assembly_probe(text: str, workdir: Path) -> tuple[int, str, str]:
+    """(exit code, assembly, diagnostics) of an -O0 compile of C text to assembly under the gate's C flags."""
+    source, output = workdir / "probe.c", workdir / "probe.s"
+    source.write_text(text, encoding="utf-8", newline="")
+    cc = [env.tool("gcc"), "-m32", "-S", "-O0", "-mno-sse3", "-mno-stack-arg-probe",
+          "-fno-asynchronous-unwind-tables", "-ffreestanding", "-fno-builtin",
+          f"-I{env.ROOT / 'recovery/include'}", str(source), "-o", str(output)]
+    r = env.run_tool(cc)
+    assembly = output.read_text(encoding="utf-8", errors="replace") if output.exists() and not r.returncode else ""
+    return r.returncode, assembly, r.stderr
+
+
 def build(source: Path, entry_symbol: str, workdir: Path, opt: str = "-O0", extra_defs: dict[str, int] | None = None) -> Built:
     """Build a .S or .c recovery into a PE linked at env.LINK_BASE.
 
