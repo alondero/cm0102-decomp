@@ -152,6 +152,8 @@ def bridge_mutant_sources(text):
 FTOL_HELPER = 0x00945640
 FTOL_PROBE_TAG = 'cmre-ftol-float-'
 _FTOL_CAST = re.compile(r'\(\s*(?:(?:signed\s+)?long\s+long(?:\s+int)?|s64|i64|int64_t|__int64)\s*\)')
+# A source-local alias of the construct (`typedef long long ll;`) spells the same cast.
+_LONG_LONG_TYPEDEF = re.compile(r'\btypedef\s+(?:signed\s+)?long\s+long(?:\s+int)?\s+([A-Za-z_]\w*)\s*;')
 _IDENT = re.compile(r'[A-Za-z_]\w*')
 _NUMBER = re.compile(r'(?:0[xX][0-9a-fA-F]+|\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)[uUlLfF]*')
 # A parenthesis after one of these keywords can still open a cast; after any other identifier it
@@ -266,8 +268,11 @@ def ftol_cast_sites(text, names=()):
     masked = _NONCODE.sub(_mask_noncode, text)
     directives = _bridge_directive_spans(text)
     names = set(names) | type_names(text)
+    aliases = sorted(set(_LONG_LONG_TYPEDEF.findall(masked)))
+    pattern = _FTOL_CAST if not aliases else re.compile(
+        _FTOL_CAST.pattern + '|' + r'\(\s*(?:%s)\s*\)' % '|'.join(map(re.escape, aliases)))
     sites = []
-    for match in _FTOL_CAST.finditer(masked):
+    for match in pattern.finditer(masked):
         before = masked[:match.start()].rstrip()
         word = re.search(r'[A-Za-z_]\w*$', before)
         if word and word.group() not in _CAST_AFTER_KEYWORD:

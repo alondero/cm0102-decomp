@@ -37,6 +37,11 @@ def test_cast_operand_is_the_cast_expression_it_binds(expression, operand):
     assert operands(f'void f(void) {{ y = {expression}; }}\n', {'f80'}) == [operand]
 
 
+def test_a_local_long_long_typedef_spells_the_same_cast():
+    text = 'typedef long long ll;\nint f(long double v) { return (int)(ll)v; }\n'
+    assert operands(text) == ['v']
+
+
 def test_casts_nest_and_chain():
     text = 'int f(long double t) { return (s16)(long long)((long long)t * 2.0L); }\n'
     assert operands(text) == ['((long long)t * 2.0L)', 't']
