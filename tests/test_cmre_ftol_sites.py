@@ -72,6 +72,9 @@ def test_prototypes_sizeof_calls_and_noncode_are_not_casts():
     ('#define LONG(x) \\\n    (x) + w', 'LONG(v)'),
     ('#define SUM v + w\n#define VIA(x) SUM', 'VIA(v)'),
     ('#define TWICE(x) x * 2.5L\n#define CALL(x) TWICE(x)', 'CALL(v)'),
+    ('#define ID(x) x', 'ID(v + w)'),
+    ('#define PICK(a, b) b', 'PICK(0, v + w)'),
+    ('#define SUM v + w\n#undef SUM\n#define SUM (v)', 'SUM'),
 ])
 def test_a_cast_operand_using_an_unbracketed_source_macro_fails_closed(macro, use):
     text = f'{macro}\nint f(long double v, long double w) {{ return (int)((long long){use}); }}\n'
@@ -84,10 +87,11 @@ def test_bracketed_and_single_token_macros_keep_their_span():
     # fn_0083f3a0 `#define SLOT(o) W((u32)scratch + (o))` over `#define W(a) CM_GLOBAL(...)`.
     text = ('#define SUM (v + w)\n#define HALF(x) ((x) * 0.5L)\n#define V v\n#define K 3\n'
             '#define KD(va) CM_GLOBAL(double, va)\n#define W(a) CM_GLOBAL(volatile u16,(a))\n'
-            '#define SLOT(o) W((u32)s + (o))\n'
+            '#define SLOT(o) W((u32)s + (o))\n#define APPLY(f, x) f(x)\n'
             'int f(long double v, long double w) { return (long long)SUM + (long long)HALF(v) '
-            '+ (long long)V + (long long)K + (long long)KD(0x00a00000) + (long long)SLOT(4); }\n')
-    assert operands(text) == ['SUM', 'HALF(v)', 'V', 'K', 'KD(0x00a00000)', 'SLOT(4)']
+            '+ (long long)V + (long long)K + (long long)KD(0x00a00000) + (long long)SLOT(4) '
+            '+ (long long)APPLY(KD, 8); }\n')
+    assert operands(text) == ['SUM', 'HALF(v)', 'V', 'K', 'KD(0x00a00000)', 'SLOT(4)', 'APPLY(KD, 8)']
 
 
 def test_a_cast_after_return_or_case_is_still_a_cast():

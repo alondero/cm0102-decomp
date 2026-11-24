@@ -267,27 +267,31 @@ def _unbracketed_macros(masked, directives):
     """Names the source #defines whose body is not one token or one fully bracketed group.
 
     Such a body can rebind a cast written around its use (`#define SUM v + w` makes
-    `(long long)SUM` mean `(long long)v + w`), so the source span is not the expansion's."""
-    bodies = dict(_header_macro_bodies())
-    bodies.update(_macro_bodies(masked, directives))
-    unsafe, callers = set(), {}
-    for name, body in bodies.items():
+    `(long long)SUM` mean `(long long)v + w`), so the source span is not the expansion's.
+    A name is unsafe if any of its definitions is, so #undef and redefinition cannot launder it."""
+    definitions = _header_macro_bodies() + _macro_bodies(masked, directives)
+    unsafe, callers = set(), []
+    for name, params, body in definitions:
         call = re.match(r'([A-Za-z_]\w*)\s*\(', body)
         if not body or re.fullmatch(r'[0-9][\w.]*', body):
             continue
         if re.fullmatch(r'[A-Za-z_]\w*', body):
-            callers[name] = body   # an alias is as bracketed as what it names
+            if body in params:
+                unsafe.add(name)   # `#define ID(x) x` passes its argument's text through
+            else:
+                callers.append((name, body))   # an alias is as bracketed as what it names
             continue
         if body.startswith('(') and _closes_at(body, 0) == len(body) - 1:
             continue
         if call and _closes_at(body, call.end() - 1) == len(body) - 1:
-            callers[name] = call.group(1)   # `NAME(...)`: one postfix expression if NAME is
+            if call.group(1) not in params:   # a parameter callee is one call whatever it names
+                callers.append((name, call.group(1)))   # `NAME(...)`: one postfix expression if NAME is
             continue
         unsafe.add(name)
     changed = True
     while changed:   # a call of an unbracketed macro is itself unbracketed
         changed = False
-        for name, callee in callers.items():
+        for name, callee in callers:
             if callee in unsafe and name not in unsafe:
                 unsafe.add(name)
                 changed = True
@@ -295,19 +299,22 @@ def _unbracketed_macros(masked, directives):
 
 
 def _macro_bodies(masked, directives):
-    bodies = {}
+    """Every #define as (name, parameter names, body), in source order."""
+    definitions = []
     for start, end in directives:
-        directive = re.sub(r'\\\r?\n', ' ', masked[start:end])
+        directive = re.sub(r'\\r?\n', ' ', masked[start:end])
         match = re.match(r'\s*#\s*define\s+([A-Za-z_]\w*)(\([^)]*\))?(.*)', directive, re.S)
         if match:
-            bodies[match.group(1)] = match.group(3).strip()
-    return bodies
+            params = frozenset(_IDENT.findall(match.group(2) or ''))
+            definitions.append((match.group(1), params, match.group(3).strip()))
+    return definitions
 
 
 _HEADER_MACROS = None
 
 
 def _header_macro_bodies():
+    # Cached per process: a header change alters the execution identity and needs a restart.
     global _HEADER_MACROS
     if _HEADER_MACROS is None:
         from . import env
