@@ -375,7 +375,11 @@ Coordinator procedure:
    A differential mismatch on the new corpus starts at the first available
    model rung. `retry RUN fn_X --reason "<what changed>"` requests a fresh
    gate for an input-bound candidate or queues a translation for other parked
-   functions, for example after a harness release.
+   functions, for example after a harness release. A plain retry starts again at
+   rung 0. Add `--rung N` (0-based) to start at a stronger rung when the cheaper
+   rungs already failed the function. The farm saves the rung with its state and
+   waits while that rung's models are paused. It refuses a rung outside the
+   ladder with a `retry-refused` event.
 
    Options: `--include-held` also takes held functions (each prompt carries
    the hold reason; the audit checks it). `--min-bytes/--max-bytes` bound the

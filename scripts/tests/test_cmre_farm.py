@@ -4599,6 +4599,51 @@ def test_retry_request_returns_a_parked_function_to_the_running_farm(root):
     assert 'case 7 eax' in again['prior']['detail'] and again['prior']['model'] == 'm/strong'
 
 
+def test_retry_at_a_named_rung_skips_the_rungs_that_already_failed(root):
+    wrong = writes(lambda job: f"u32 cm_fn_00401000(u32 a) {{ return a * {job['n']} + 7; }}\n")
+    f, cmre, launcher = make(root, [item('fn_00401000')], wrong, workers=1, continuous=True, rescan_seconds=0)
+    drain(f)
+    assert 'fn_00401000' in f.state['parked'] and len(launcher.started) == 2
+    assert farm.main(['retry', str(f.run_dir), 'fn_00401000', '--reason', 'strong rung only', '--rung', '1']) == 0
+    launcher.behaviour = writes(passing)
+    drain(f)
+    assert cmre.accepted == ['fn_00401000']
+    again = launcher.started[2][0]
+    assert again['model'] == 'm/strong' and again['rung'] == 1
+    assert 'case 7 eax' in again['prior']['detail']
+
+
+def test_retry_rung_beyond_the_ladder_is_refused(root, capsys):
+    f, _, _ = make(root, [], writes(GOOD), workers=0)
+    f.state['parked']['fn_00401000'] = {'detail': 'x', 'models': ['m/cheap']}
+    f.save()
+    assert farm.main(['retry', str(f.run_dir), 'fn_00401000', '--reason', 'r', '--rung', '-1']) == 2
+    assert not list((f.run_dir / 'requests').glob('*.json'))
+    assert farm.main(['retry', str(f.run_dir), 'fn_00401000', '--reason', 'r', '--rung', '2']) == 0
+    drain(f, 2)
+    assert 'fn_00401000' in f.state['parked']
+    refused = [e for e in events(f.run_dir) if e['event'] == 'retry-refused']
+    assert refused and 'outside the ladder (0..1)' in refused[0]['reason']
+
+
+def test_retry_rung_survives_a_restart_before_dispatch(root):
+    wrong = writes(lambda job: f"u32 cm_fn_00401000(u32 a) {{ return a * {job['n']} + 7; }}\n")
+    f, _, _ = make(root, [item('fn_00401000')], wrong, workers=1, continuous=True, rescan_seconds=0)
+    drain(f)
+    assert farm.main(['retry', str(f.run_dir), 'fn_00401000', '--reason', 'restart', '--rung', '1']) == 0
+    f.config.workers = 0
+    drain(f, 2)
+    assert 'fn_00401000' not in f.state['parked'] and f.state['retry_rungs']['fn_00401000']['rung'] == 1
+    f.save()
+    f2, cmre2, launcher2 = make(root, [item('fn_00401000')], writes(passing), workers=1,
+                                continuous=True, rescan_seconds=0)
+    drain(f2)
+    assert cmre2.accepted == ['fn_00401000']
+    first = launcher2.started[0][0]
+    assert first['model'] == 'm/strong' and first['rung'] == 1
+    assert 'case 7 eax' in first['prior']['detail'] and not f2.state['retry_rungs']
+
+
 def test_reclassify_registers_old_parked_candidates_for_the_input_lane(root):
     # Runs before 2026-11-16 parked 254 of 300 functions with an empty reason and no input record.
     names = ['fn_00401000', 'fn_00401100', 'fn_00401200', 'fn_00401300']
