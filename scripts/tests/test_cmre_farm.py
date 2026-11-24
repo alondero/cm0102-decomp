@@ -5269,6 +5269,67 @@ def test_x87_operand_mutants_must_each_fail_and_their_evidence_is_retained(root)
     assert summary['mutants'][0]['line'] == 4
 
 
+# ADR 0006 condition 4: the gate report's census of original __ftol call sites adds one mutant
+# per floating (long long) cast. 24 Nov: fn_005ce2d0 passed with 9 of 13 sites unobserved.
+FTOL_SOURCE = ('#include "cmre.h"\n'
+               's32 cm_fn_00401000(u32 a)\n'
+               '{ long double v = (long double)a * 1.5L; return (long long)v; } // PASS\n')
+
+
+def all_casts_floating(text, kind='types'):
+    """Stand-in for the GCC probes (CI has no pinned toolchain): every probed cast is floating,
+    and the -O0 build converts exactly once per 64-bit cast."""
+    if kind == 'fist':
+        return 0, '\tfistpll\t(%esp)\n' * text.count('(long long)'), ''
+    tags = re.findall(r'CMRE_FTOL_PROBE\((\d+),', text)
+    return 1, ''.join(f'p.c:1:1: error: static assertion failed: "cmre-ftol-float-{k}"\n' for k in tags)
+
+
+@pytest.fixture
+def ftol_probe(monkeypatch):
+    monkeypatch.setattr(farm.operand_evidence, '_default_probe', all_casts_floating)
+
+
+def ftol_gate(root, cmre, outcome, sites=('0x00401010',)):
+    gate = x87_gate(root, cmre, outcome)
+
+    def census(fn, source=None):
+        return {**gate(fn, source), 'ftol_sites': list(sites)}
+    cmre.test = census
+
+
+def test_ftol_site_mutants_must_each_fail_and_their_evidence_is_retained(root, ftol_probe):
+    f, cmre, _ = make(root, [item('fn_00401000')], writes(FTOL_SOURCE), workers=1, ladder=['m/cheap'])
+    ftol_gate(root, cmre, 'killed')
+    drain(f)
+    assert cmre.accepted == ['fn_00401000']
+    summary = json.loads(next((f.run_dir / 'x87-mutants').glob('*/summary.json')).read_text())
+    assert summary['schema'] == 'cmre-farm-x87-operands/2' and summary['status'] == 'killed'
+    assert [(row['operand'], row['source'], row['line']) for row in summary['mutants']] == [
+        ('ftol', 'ftol-000.c', 3)]
+    mutant = (next((f.run_dir / 'x87-mutants').glob('*/summary.json')).parent / 'ftol-000.c').read_text()
+    assert '(long long)((v) + 1.0L)' in mutant
+
+
+@pytest.mark.parametrize('outcome', ['survivor', 'inconclusive', 'build-failed'])
+def test_an_unkilled_ftol_site_mutant_blocks_acceptance(root, ftol_probe, outcome):
+    f, cmre, _ = make(root, [item('fn_00401000')], writes(FTOL_SOURCE), workers=1, ladder=['m/cheap'])
+    ftol_gate(root, cmre, outcome)
+    drain(f)
+    assert cmre.accepted == []
+    detail = f.state['parked']['fn_00401000']['detail']
+    assert detail.startswith('BLOCKER: __ftol site mutant 1 (line 3)') and outcome in detail
+
+
+def test_a_source_with_fewer_floating_casts_than_ftol_sites_blocks_acceptance(root, ftol_probe):
+    f, cmre, _ = make(root, [item('fn_00401000')], writes(FTOL_SOURCE), workers=1, ladder=['m/cheap'])
+    ftol_gate(root, cmre, 'killed', sites=('0x00401010', '0x00401020'))
+    drain(f)
+    assert cmre.accepted == []
+    detail = f.state['parked']['fn_00401000']['detail']
+    assert detail.startswith('BLOCKER: x87 operand safeguard:') and '1 floating 64-bit cast(s) for 2' in detail
+
+
 @pytest.mark.parametrize('outcome,needle', [
     ('survivor', 'survivor'),
     ('build-failed', 'build-failed'),

@@ -73,3 +73,50 @@ construct MSVC lowers to it, when all of the following hold:
 - Condition 4 is a new acceptance obligation. The weakness is not specific to
   x87: one flipped comparison survived the gate in 12 of 52 mutants of accepted
   C (2026-11-03 sample, [NEXT-PHASE-PLAN.md](../agent/archive/NEXT-PHASE-PLAN.md)).
+
+## Mechanized condition 4 (2026-11-24)
+
+Until this date nothing checked condition 4. fn_005ce2d0 passed the gate with
+9 of its 13 sites unobserved: five had no non-budget case reaching them, and four
+were reached but a mutant survived. 215 accepted C routines (422 KB) call
+`0x00945640` in the original.
+
+The C gate report now records the original's call and tail-jump sites of
+`0x00945640` (`ftol_sites`). For such a routine, the ADR 0010 operand proof
+(`cmre/operand_evidence.py`, receipt schema `cmre-farm-x87-operands/2`)
+also covers each `__ftol` site:
+
+- A `-fsyntax-only` probe under the gate's C flags classifies every explicit
+  signed 64-bit cast in code by its operand type. `-Wfloat-conversion` rejects
+  implicit float-to-integer conversions; floating narrowing (`long double` to
+  `double`) stays allowed.
+- Under `-mno-sse3` GCC lowers every float-to-integer conversion to an x87
+  integer store (`fist`/`fistp`/`fisttp`), whatever the spelling (`(int)t`, a
+  typedef, enum, macro, `typeof`, compound literal or inline assembly). With
+  every floating `(long long)` cast replaced by an opaque marker call, the
+  source's -O0 build under the gate's flags must contain no such store. Every
+  conversion in the source is then a mutated cast; padding and folding cannot
+  hide a differently spelled site.
+- A `(long long)` cast of a floating constant is folded at compile time (by
+  MSVC too) and fails closed rather than standing in for a site.
+- Each cast of a floating operand gets one mutant with its operand `+ 1.0L`.
+  The mutant must show a non-budget differential witness at both O0 and O2,
+  under the ADR 0010 condition 3 rule.
+- Fewer floating casts than original sites fails closed. Each site must be its
+  own cast: a shared macro or helper, a cast inside a preprocessor directive,
+  or merged paths cannot show per-site observation. A site that still calls
+  the original helper as an explicit boundary call (`cm_fn_00945640()`; a
+  declaration does not count) needs no mutant.
+- A cast operand that uses a macro the source defines must have a body that
+  is one token or one bracketed group; otherwise the expansion can rebind the
+  cast (`#define SUM v + w`) and it fails closed.
+- Raw instruction bytes in inline assembly (`.byte` encodings of `fistp`) are
+  outside the census. This is an adversarial spelling, not model output;
+  review rejects it.
+- Sites are matched by count, not by address. A source that omits a site's
+  conversion entirely, while duplicating another cast, is a translation the
+  semantic gate and coverage must catch; this proof only shows that every
+  conversion the source does contain is observed.
+
+The proof runs before farm and direct acceptance, as the CIpow proof does.
+Accepted routines are audited separately (`scripts/cmre_ftol_audit.py`).
