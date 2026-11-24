@@ -51,6 +51,10 @@ by it.
    under a chopping control word, the same mechanism as the original `__ftol`.
 3. ADR 0006 condition 4 applies to bridge operands: a mutation of each
    operand's computation must fail the gate, or evidenced fixtures are added.
+   A mutant fails the gate only with a concrete, non-budget mismatch at both
+   ordinary builds. Budget-inconclusive cases are allowed up to the number the
+   passing baseline already has at that build (2026-11-24). Those cases exhaust
+   the budget on both sides and cannot yield a witness.
 4. Inline assembly stays forbidden in `recovery/c/` sources. A new bridge needs
    an entry here with the helper's listing contract and a build test.
 

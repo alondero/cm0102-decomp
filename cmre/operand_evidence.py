@@ -137,8 +137,22 @@ def bridge_mutant_sources(text):
     return rows
 
 
-def bridge_mutant_outcome(report):
-    """'killed' only for a differential witness in both ordinary builds."""
+def _baseline_inconclusive(baseline, opt):
+    """The passing baseline's own inconclusive count at opt, or 0 when it grants no allowance."""
+    if not isinstance(baseline, dict) or baseline.get('status') != 'pass':
+        return 0
+    build = (baseline.get('builds') or {}).get(opt)
+    diff = build.get('difftest') if isinstance(build, dict) else None
+    count = diff.get('inconclusive') if isinstance(diff, dict) else None
+    return count if type(count) is int and count > 0 else 0
+
+
+def bridge_mutant_outcome(report, baseline=None):
+    """'killed' only for a differential witness in both ordinary builds.
+
+    Cases the passing baseline already leaves inconclusive (execution budget on
+    both sides) are not new uncertainty: a mutant may carry up to that many at
+    each build, but still needs a concrete non-budget witness at both."""
     if not isinstance(report, dict):
         return 'unresolved', 'gate-report-not-an-object'
     if report.get('problems'):
@@ -164,8 +178,11 @@ def bridge_mutant_outcome(report):
         inconclusive = diff.get('inconclusive')
         if type(inconclusive) is not int or inconclusive < 0:
             return 'unresolved', f'{opt}-inconclusive-counter-missing'
-        if inconclusive:
+        allowed = _baseline_inconclusive(baseline, opt)
+        if inconclusive and not allowed:
             return 'unresolved', f'{opt}-inconclusive-{inconclusive}'
+        if inconclusive > allowed:
+            return 'unresolved', f'{opt}-inconclusive-{inconclusive}-exceeds-baseline-{allowed}'
         mismatches = diff.get('mismatches')
         if not isinstance(mismatches, list) or not mismatches:
             return 'unresolved', f'{opt}-mismatch-missing'
@@ -309,7 +326,7 @@ def generate(summary_path, fn, job_number, text_bytes, baseline, hints_sha, *, g
             gate_report = gate(mutant_path)
         except (Exception, SystemExit) as exc:
             gate_report = {'status': 'error', 'problems': [f'{type(exc).__name__}: {exc}']}
-        outcome, reason = bridge_mutant_outcome(gate_report)
+        outcome, reason = bridge_mutant_outcome(gate_report, baseline)
         source_sha = hashlib.sha256(mutant_path.read_bytes()).hexdigest()
         identity_problems = bridge_report_identity_problems(
             gate_report, source_sha, expected_va, profile=profile, execution_identity=execution, baseline=baseline)
@@ -429,7 +446,7 @@ def verify_receipt(path, raw, *, fn, job_number, hints_sha, current_execution, a
         if hashlib.sha256(report_bytes).hexdigest() != row.get('report_sha256'):
             return f'BLOCKER: x87 operand evidence report bytes changed for {stem}: {path}'
         report = json.loads(report_bytes)
-        outcome, reason = bridge_mutant_outcome(report)
+        outcome, reason = bridge_mutant_outcome(report, baseline_evidence)
         if outcome != 'killed' or row.get('outcome') != 'killed':
             return (f'BLOCKER: x87 operand evidence is not a kill for {stem}: '
                     f'{outcome}: {reason}; {path}')
