@@ -121,6 +121,16 @@ callees as explicit boundaries. C acceptance does not establish composed executi
      `cmre accept fn_X --c` requires retained evidence that a changed base and
      a changed exponent each produce a mismatch at O0 and O2 for every call.
      If a control survives, add evidenced `c_hints` fixtures that reach it.
+   - A call to `0x00945934` (CRT `exit`) or `0x00945945` (`_exit`) does not return
+     ([ADR 0014](../adr/0014-crt-exit-does-not-return.md)): it ends in `ExitProcess`.
+     Write `cm_fn_00945934(status);` (or `cm_fn_00945945(status);`) as the last
+     statement of its path, typically `if (cond) { ...; cm_fn_00945934(-1); }`.
+     Only the fall-through edge from the call is dead. The next address is usually
+     a join point that other branches reach, so translate it for them. Do not model
+     the dead edge (missing `add esp`, shifted stack, `exit_returned` state), and
+     never withhold a passing candidate because "non-return is unproven". The gate
+     compares the exit status. Other routines called before `exit` stay ordinary
+     returning boundaries.
    - MSVC pushes arguments right to left and may run a nested call between pushes.
      Pushes before `call A` that A's `(void)` signature does not take belong to the
      next call: `push x; push y; call A; push eax; push fmt; call B` is `B(fmt, A(), y, x)`.

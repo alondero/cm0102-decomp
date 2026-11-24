@@ -68,6 +68,8 @@ STDCALL_ARGS = {
 # Control does not come back normally (or unwinds frames): end the case here.
 TERMINAL = {"KERNEL32.dll!ExitProcess", "KERNEL32.dll!RaiseException", "KERNEL32.dll!RtlUnwind",
             "KERNEL32.dll!TerminateProcess", "KERNEL32.dll!UnhandledExceptionFilter"}
+# Terminal imports whose arguments are plain values (exit status, process handle): recorded.
+PROCESS_EXIT = {"KERNEL32.dll!ExitProcess", "KERNEL32.dll!TerminateProcess"}
 
 
 def stub_code(name: str) -> bytes:

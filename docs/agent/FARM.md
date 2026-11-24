@@ -864,10 +864,10 @@ moves; these are the byte pools, largest first:
 | Input-bound candidates (`cmre_farm.py inputs RUN`) | 34 KB, 53 fn (14 KB / 21 fn at coverage 0.5 or more) | Authored `c_hints` fixtures; the farm re-gates the retained candidate by itself |
 | Stack-probe fault address (`callee-stack-probe-address`, `*stack-probe*`) | 22 KB, ~7 fn | A harness rule for a stack-exhaustion fault at the same original instruction whose address differs only by frame layout (`fn_006146b0`: 598 of 600 cases equal) |
 | Virtual-entry inventory (`missing-real-virtual-entry`, `virtual-target-inventory-entry`) | 19 KB, 35 fn | Inventory entries for real vtable targets (the `fn_0051c020` seed flow of 15 Nov) |
-| Exit and post-fatal continuation (`exit-return-stack-continuation`, `returning-exit*`) | 12 KB, 23 fn | A harness rule for execution after a call that does not return in the game |
+| Exit and post-fatal continuation (`exit-return-stack-continuation`, `returning-exit*`) | 12 KB, 23 fn | Resolved by [ADR 0014](../adr/0014-crt-exit-does-not-return.md) (24 Nov): `exit`/`_exit` end in `ExitProcess`, so C ends the path at the call; entries cleared to `ready` |
 | Unlifted | 1.98 MB, 1,060 fn | Captures from the running game (items 1 and 4) |
 
-The import, x87 live-stack, stack-probe, virtual-entry and exit pools are each
+The import, x87 live-stack, stack-probe and virtual-entry pools are each
 one harness release, not per-function work: retrying those functions on any
 model repeats the recorded failure. Sessions build these releases themselves
 (Adam, 2026-11-16): an ADR, the change in a worktree with failing regression
