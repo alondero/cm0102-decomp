@@ -1655,6 +1655,22 @@ class Farm:
                     if self._start_recheck(job):
                         translators.append(job)
                     continue
+                wanted = self.state.get('retry_rungs', {}).get(item.fn)
+                if wanted is not None:
+                    # An operator retry that names a rung skips the rungs that already failed it.
+                    stronger, rung = self._rung_model(wanted['rung'])
+                    if stronger is None:
+                        if self._paused_from(wanted['rung']):
+                            # Wait for the named rung; a later scan offers the function again.
+                            self.seen.discard(item.fn)
+                            self.cmre.release(self.config.owner, [item.fn])
+                            continue
+                        self.state['retry_rungs'].pop(item.fn)
+                        self._park(item.fn, 'no available model on the ladder at or above the retry rung')
+                        continue
+                    self.state['retry_rungs'].pop(item.fn)
+                    self.retried.setdefault(item.fn, wanted.get('record') or {})
+                    job.update(model=stronger, rung=rung)
                 previous, candidate = self.retried.pop(item.fn, None), _read(Path(job['source']))
                 if previous and candidate is not None:
                     job['prior'] = {'model': (previous.get('models') or ['unknown'])[-1],
@@ -2489,8 +2505,18 @@ class Farm:
                 if fn in self.state['parked'] and fn not in self.state.get('quarantined', {}):
                     reason = request.get('reason', '')[:300]
                     retained = self.state.get('input_needed', {}).get(fn)
+                    rung = request.get('rung')
+                    if rung is not None and not (type(rung) is int and 0 <= rung < len(self.config.ladder)):
+                        self._event('retry-refused', fn=fn,
+                                    reason=f'rung {rung!r} is outside the ladder (0..{len(self.config.ladder) - 1})')
+                        path.unlink(missing_ok=True)
+                        continue
                     if retained is None:
-                        self._unpark(fn, 'retry', reason=reason)
+                        if rung is not None:
+                            # Saved with the state so a restart before dispatch keeps the rung.
+                            self.state.setdefault('retry_rungs', {})[fn] = {
+                                'rung': rung, 'record': self.state['parked'][fn]}
+                        self._unpark(fn, 'retry', reason=reason, **({} if rung is None else {'rung': rung}))
                     else:
                         retained['retry_requested'] = True
                         self.last_input_check = None
@@ -4388,6 +4414,9 @@ def build_parser():
     rt.add_argument('run_dir')
     rt.add_argument('fns', nargs='+', metavar='fn_XXXXXXXX')
     rt.add_argument('--reason', required=True, help='what changed since they parked (harness release, new inputs)')
+    rt.add_argument('--rung', type=int, default=None,
+                    help='start the retry at this ladder rung (0-based) instead of the first, '
+                         'to skip rungs that already failed it')
     ra = sub.add_parser('reaudit', help='audit accepted functions afresh under the current audit rules')
     ra.add_argument('run_dir')
     ra.add_argument('fns', nargs='+', metavar='fn_XXXXXXXX')
@@ -4550,10 +4579,14 @@ def main(argv=None):
                 print(f'{fn}: not accepted in this run; nothing queued')
         return 0
     if a.action == 'retry':
+        if a.rung is not None and a.rung < 0:
+            print('--rung must be 0 or more', file=sys.stderr)
+            return 2
         parked = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))['parked']
+        extra = {} if a.rung is None else {'rung': a.rung}
         for fn in a.fns:
             if fn in parked:
-                _request(run_dir, fn, 'retry', reason=a.reason)
+                _request(run_dir, fn, 'retry', reason=a.reason, **extra)
                 print(f'{fn}: queued; a running farm takes it on its next scan')
             else:
                 print(f'{fn}: not parked in this run; nothing queued')
