@@ -302,7 +302,7 @@ def _macro_bodies(masked, directives):
     """Every #define as (name, parameter names, body), in source order."""
     definitions = []
     for start, end in directives:
-        directive = re.sub(r'\\r?\n', ' ', masked[start:end])
+        directive = re.sub(r'\\\r?\n', ' ', masked[start:end])
         match = re.match(r'\s*#\s*define\s+([A-Za-z_]\w*)(\([^)]*\))?(.*)', directive, re.S)
         if match:
             params = frozenset(_IDENT.findall(match.group(2) or ''))

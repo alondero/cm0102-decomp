@@ -82,6 +82,14 @@ def test_a_cast_operand_using_an_unbracketed_source_macro_fails_closed(macro, us
         oe.ftol_cast_sites(text)
 
 
+@pytest.mark.parametrize('newline', ['\n', '\r\n'])
+def test_a_continued_bracketed_macro_keeps_its_span_with_either_line_ending(newline):
+    # Review: a heredoc dropped the backslash before \r? and CRLF continuations stopped joining.
+    text = (f'#define KD(va) \\{newline}    CM_GLOBAL(double, va){newline}'
+            f'int f(void) {{ return (long long)KD(0x00a00000); }}{newline}')
+    assert operands(text) == ['KD(0x00a00000)']
+
+
 def test_bracketed_and_single_token_macros_keep_their_span():
     # The accepted corpus's shape: fn_005961d0 `#define KD(va) CM_GLOBAL(double, va)`,
     # fn_0083f3a0 `#define SLOT(o) W((u32)scratch + (o))` over `#define W(a) CM_GLOBAL(...)`.
