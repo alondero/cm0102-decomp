@@ -90,12 +90,15 @@ also covers each `__ftol` site:
   signed 64-bit cast in code by its operand type. `-Wfloat-conversion` rejects
   implicit float-to-integer conversions; floating narrowing (`long double` to
   `double`) stays allowed.
-- The source's -O0 build under the gate's flags must contain exactly as many
-  x87 integer stores (`fist`/`fistp`/`fisttp`) as floating `(long long)` casts.
-  Under `-mno-sse3` GCC lowers every float-to-integer conversion to such a
-  store, whatever the spelling (`(int)t`, a typedef, enum, macro, `typeof`,
-  compound literal or inline assembly), so every conversion in the source is
-  a mutated cast and duplicated casts cannot hide a differently spelled site.
+- Under `-mno-sse3` GCC lowers every float-to-integer conversion to an x87
+  integer store (`fist`/`fistp`/`fisttp`), whatever the spelling (`(int)t`, a
+  typedef, enum, macro, `typeof`, compound literal or inline assembly). With
+  every floating `(long long)` cast replaced by an opaque marker call, the
+  source's -O0 build under the gate's flags must contain no such store. Every
+  conversion in the source is then a mutated cast; padding and folding cannot
+  hide a differently spelled site.
+- A `(long long)` cast of a floating constant is folded at compile time (by
+  MSVC too) and fails closed rather than standing in for a site.
 - Each cast of a floating operand gets one mutant with its operand `+ 1.0L`.
   The mutant must show a non-budget differential witness at both O0 and O2,
   under the ADR 0010 condition 3 rule.

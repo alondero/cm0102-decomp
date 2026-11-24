@@ -151,6 +151,8 @@ def bridge_mutant_sources(text):
 
 FTOL_HELPER = 0x00945640
 FTOL_PROBE_TAG = 'cmre-ftol-float-'
+FTOL_CONST_TAG = 'cmre_ftol_const_'
+FTOL_MARKER = 'cmre_ftol_mark'
 _FTOL_CAST = re.compile(r'\(\s*(?:(?:signed\s+)?long\s+long(?:\s+int)?|s64|i64|int64_t|__int64)\s*\)')
 # A source-local alias of the construct (`typedef long long ll;`) spells the same cast.
 _LONG_LONG_TYPEDEF = re.compile(r'\btypedef\s+(?:signed\s+)?long\s+long(?:\s+int)?\s+([A-Za-z_]\w*)\s*;')
@@ -302,9 +304,29 @@ def ftol_probe_source(text, sites):
         out += [text[last:position], piece]
         last = position
     out.append(text[last:])
-    header = ('#define CMRE_FTOL_PROBE(k, x) ({ _Static_assert(!_Generic((x), float: 1, double: 1, '
-              f'long double: 1, default: 0), "{FTOL_PROBE_TAG}" #k); (x); }})\n')
+    floating = '_Generic((x), float: 1, double: 1, long double: 1, default: 0)'
+    # GCC leaves __builtin_constant_p of a local to the optimizer, so the constant check is a
+    # block-scope array type: unresolved it is a VLA, a floating constant makes its size negative.
+    header = (f'#define CMRE_FTOL_PROBE(k, x) ({{ _Static_assert(!{floating}, "{FTOL_PROBE_TAG}" #k); '
+              f'typedef char {FTOL_CONST_TAG}##k[1 - 2 * ({floating} && __builtin_constant_p(x))]; (x); }})\n')
     return header + ''.join(out)
+
+
+def ftol_marker_source(text, floating):
+    """The source with each floating (long long) cast replaced by an opaque marker call.
+
+    Its -O0 build must contain no x87 integer store: any that remains is a float-to-integer
+    conversion this proof does not mutate, however it is spelled."""
+    edits = []
+    for site in floating:
+        cast_start, cast_end = site['cast']
+        edits += [(cast_start, cast_end, f'{FTOL_MARKER}('), (site['operand'][1], site['operand'][1], ')')]
+    out, last = [], 0
+    for start, end, piece in sorted(edits, key=lambda row: (row[0], row[1] - row[0])):
+        out += [text[last:start], piece]
+        last = end
+    out.append(text[last:])
+    return f'extern long long {FTOL_MARKER}(long double);\n' + ''.join(out)
 
 
 _CONVERSION = re.compile(r"conversion from '[^']+'(?: \{aka '[^']+'\})? to '([^']+)'(?: \{aka '([^']+)'\})?")
@@ -326,7 +348,13 @@ def ftol_probe_result(returncode, stderr, sites):
                             f'explicit (long long) cast: {line.strip()[:200]}')
         elif ' error: ' in f' {line} ' or line.startswith('error:') or ': error:' in line:
             tag = re.search(re.escape(FTOL_PROBE_TAG) + r'"?\s*"?(\d+)', line)
-            if tag and 'static assertion failed' in line:
+            constant = re.search(r"size of array '%s(\d+)' is negative" % re.escape(FTOL_CONST_TAG), line)
+            if constant:
+                index = int(constant.group(1))
+                where = next((f" at line {site['line']}" for site in sites if site['index'] == index), '')
+                problems.append(f'(long long) cast of a floating constant{where} is folded at compile '
+                                'time, not an __ftol site')
+            elif tag and 'static assertion failed' in line:
                 floating.add(int(tag.group(1)))
             else:
                 problems.append(f'probe compile error: {line.strip()[:200]}')
@@ -343,8 +371,9 @@ def ftol_probe_result(returncode, stderr, sites):
 def ftol_mutant_sources(text, probe, required, names=()):
     """One mutant per floating-operand 64-bit cast (operand + 1.0L), or ValueError.
 
-    `probe(source_text, kind)` is `_default_probe` in production. The -O0 build's x87 integer
-    stores must equal the floating casts, so every conversion in the source is a mutated cast.
+    `probe(source_text, kind)` is `_default_probe` in production. With every floating cast
+    replaced by an opaque marker call, the -O0 build must hold no x87 integer store, so every
+    conversion in the source is a mutated cast; a cast of a floating constant fails closed.
     `required` is the number of __ftol call sites in the original routine: fewer floating
     casts means some site is not individually written (for example a shared helper) and
     cannot be shown observed per site. `names` adds typedef names from included headers."""
@@ -353,11 +382,11 @@ def ftol_mutant_sources(text, probe, required, names=()):
         return []
     sites = ftol_cast_sites(text, names)
     floating = ftol_float_casts(text, sites, probe)
-    emitted = ftol_emitted_conversions(text, probe)
-    if emitted != len(floating):
-        raise ValueError(f'{emitted} float-to-integer conversion(s) in the -O0 build for {len(floating)} '
-                         'floating (long long) cast(s); write every float-to-integer conversion as its '
-                         'own (long long) cast')
+    hidden = ftol_emitted_conversions(ftol_marker_source(text, floating), probe)
+    if hidden:
+        raise ValueError(f'{hidden} float-to-integer conversion(s) in the -O0 build are not floating '
+                         '(long long) casts; write every float-to-integer conversion as its own '
+                         '(long long) cast')
     if len(floating) < required:
         raise ValueError(f'{len(floating)} floating 64-bit cast(s) for {required} original __ftol '
                          'call site(s); write each site as its own (long long) cast')
@@ -408,8 +437,9 @@ def _default_probe(text, kind='types'):
 
 
 # Under -m32 -mno-sse3 GCC lowers every float-to-integer conversion to an x87 integer store,
-# whatever the source spelling (macro, typedef, enum, typeof, compound literal, inline asm).
-_FIST = re.compile(r'^\s*fistt?p?(?:s|l|ll|q)?\b', re.M)
+# whatever the source spelling (macro, typedef, enum, typeof, compound literal, inline asm,
+# which may put it anywhere on a line).
+_FIST = re.compile(r'\bfistt?p?(?:s|l|ll|q)?\b')
 
 
 def ftol_emitted_conversions(text, probe):

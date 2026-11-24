@@ -153,14 +153,47 @@ PADDED = ('#include "cmre.h"\n'
     '(int)w', '(s32)w', '(unsigned long long)w', '(u8)(w * 2.0L)', '(enum E)w', '(uint)w',
     '(long unsigned)w', '(s32 const)w', '(__typeof__(c))w', 'TOI(w)', '(int)_Generic(w, default: w)',
     '(struct S){w}.d', '({ enum E e = w; e; })',
-    '({ s32 q; __asm__("fistpl %0" : "=m"(q) : "t"(w) : "st"); q; })'])
+    '({ s32 q; __asm__("fistpl %0" : "=m"(q) : "t"(w) : "st"); q; })',
+    '({ s32 q; __asm__("nop; fistpl %0" : "=m"(q) : "t"(w) : "st"); q; })'])
 def test_every_float_to_integer_conversion_must_be_a_mutated_cast(second):
     # Review: two padded (long long) casts of v passed while the second site, spelled
-    # any way the source parse cannot see, went unobserved. The -O0 build counts them all.
-    # (unsigned long long) lowers to two stores; the compound literal is an implicit conversion.
-    with pytest.raises(ValueError, match=r'[34] float-to-integer conversion\(s\) in the -O0 build for 2'
+    # any way the source parse cannot see, went unobserved. The marker build shows them all.
+    with pytest.raises(ValueError, match=r'conversion\(s\) in the -O0 build are not floating'
                                          r'|implicit float-to-integer conversion'):
         oe.ftol_mutant_sources(PADDED % second, probe, 2)
+
+
+@needs_gcc
+@pytest.mark.parametrize('body,needle', [
+    # GCC folds these at -O0, so a count of emitted stores balanced the unmutated (int)w.
+    ('(s32)(long long)v + (s32)(long long)0.5L + (int)w', 'floating constant at line 3'),
+    ('(s32)(long long)v + (s32)(long long)(0.25L * 2) + (int)w', 'floating constant at line 3'),
+    ('(s32)(long long)v + (s32)(long long)v + (int)w', r'1 float-to-integer conversion\(s\)'),
+])
+def test_folded_casts_cannot_balance_an_unmutated_conversion(body, needle):
+    text = ('#include "cmre.h"\n'
+            's32 cm_fn_00401000(long double v, long double w)\n'
+            f'{{ return {body}; }}\n')
+    with pytest.raises(ValueError, match=needle):
+        oe.ftol_mutant_sources(text, probe, 2)
+
+
+@needs_gcc
+def test_a_cast_of_an_assigned_local_is_not_a_constant():
+    # fn_00696940: __builtin_constant_p of a local is not an integer constant expression.
+    text = ('#include "cmre.h"\n'
+            'volatile long long converted;\n'
+            'void cm_fn_00401000(long double v)\n'
+            '{ long double t, squared; t = v; squared = t * t; converted = (long long)squared; }\n')
+    assert len(oe.ftol_mutant_sources(text, probe, 1)) == 1
+
+
+@needs_gcc
+def test_casts_folded_together_are_not_a_false_block():
+    text = ('#include "cmre.h"\n'
+            's32 cm_fn_00401000(long double v)\n'
+            '{ return (s32)(long long)v + (s32)(long long)v; }\n')
+    assert len(oe.ftol_mutant_sources(text, probe, 2)) == 2
 
 
 @needs_gcc
