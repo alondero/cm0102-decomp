@@ -4,6 +4,19 @@
 #define D(a) CM_GLOBAL(volatile u32, (a))
 #define W(a) CM_GLOBAL(volatile u16, (a))
 
+/* ABI taken from the original instructions in the pinned 3.9.68 image named
+   above. At each call site the receiver 0x00b74450 is loaded into ECX
+   immediately before the call (preferred-image VAs 0x0046e370, 0x0046e37b,
+   0x0046e388, 0x0046e406 and 0x0046e44b), so each callee's first declared
+   parameter is that thiscall receiver.
+   Boundary resolution for the held concern: the first 0x7ff010 call consumes a
+   single live stack argument (0x15); the zero pushed just before it survives
+   as the trailing argument of the first 0x7ff270 call rather than being an
+   output pointer passed to 0x7ff010. The second 0x7ff010 call likewise takes a
+   single stack argument (0x13); 0x803320 takes the 0x7ff010 result as its one
+   stack argument, and both 0x7ff270 calls take three stack arguments. Results
+   are opaque u32 values: no file-search, time or OUT-buffer state is invented
+   or consumed beyond what the listing shows. */
 extern u32 CM_THISCALL cm_fn_007ff010(u32 self, u32 id);
 extern u32 CM_THISCALL cm_fn_00803320(u32 self, u32 input);
 extern void CM_THISCALL cm_fn_007ff270(u32 self, u32 id, u32 value, u32 mode);

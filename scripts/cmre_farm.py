@@ -416,10 +416,12 @@ def devin_config(root, job):
     if job['kind'] != 'audit':
         proposal = job.get('hint_source', str(Path(job['source']).with_suffix('.hints.json')))
         allow += [f'Write({_rel(root, proposal)})', f'Write({Path(proposal).as_posix()})']
-    exec_patterns = [f'{PY} -m cmre {command} *' for command in WORKER_COMMANDS]
-    exec_patterns += [f'{PY} scripts/cmre_hint_check.py *', *READ_ONLY_SHELL]
+    # Devin Exec rules are command prefixes, not shell globs.
+    exec_patterns = [f'{PY} -m cmre {command}' for command in WORKER_COMMANDS]
+    exec_patterns += [f'{PY} scripts/cmre_hint_check.py',
+                      *(rule[:-2] if rule.endswith(' *') else rule for rule in READ_ONLY_SHELL)]
     allow += [f'Exec({pattern})' for pattern in exec_patterns]
-    return {'permissions': {'allow': allow, 'deny': ['Exec(sudo *)', 'Exec(rm *)', 'Exec(del *)'], 'ask': []}}
+    return {'permissions': {'allow': allow, 'deny': ['Exec(sudo)', 'Exec(rm)', 'Exec(del)'], 'ask': []}}
 
 
 def _hold_text(hold):
@@ -4476,7 +4478,9 @@ class DevinLauncher:
             '--model', devin_model_name(job['model']),
             '--process-model', 'in-process',
             '--respect-workspace-trust=false',
-            '--permission-mode', 'accept-edits',
+            # Print mode cannot answer confirmation prompts. Normal mode plus the
+            # scoped allow rules auto-approves only the listed worker operations.
+            '--permission-mode', 'auto',
             '--config', str(cfg_path),
             '--prompt-file', str(prompt_path),
             '--export', str(export_path),

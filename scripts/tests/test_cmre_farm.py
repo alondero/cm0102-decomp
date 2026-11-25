@@ -6704,12 +6704,16 @@ def test_devin_launcher_routing_config_report_and_resume(root, monkeypatch):
     assert cmd[0] == 'devin-test'
     assert '--model' in cmd and cmd[cmd.index('--model') + 1] == 'swe-2-1-medium'
     assert '--process-model' in cmd and cmd[cmd.index('--process-model') + 1] == 'in-process'
+    assert '--permission-mode' in cmd and cmd[cmd.index('--permission-mode') + 1] == 'auto'
     assert '--respect-workspace-trust=false' in cmd
     assert '-p' in cmd
     cfg = json.loads(handle.config_path.read_text(encoding='utf-8'))
     assert 'Write(run/src/fn_00401000.c)' in cfg['permissions']['allow']
     assert 'Write(run/hints/fn_00401000-1.json)' in cfg['permissions']['allow']
-    assert any(r.startswith('Exec(py -3.13 -m cmre test ') for r in cfg['permissions']['allow'])
+    assert any(r.startswith('Exec(py -3.13 -m cmre test') for r in cfg['permissions']['allow'])
+    exec_rules = [r for r in cfg['permissions']['allow'] if r.startswith('Exec(')]
+    assert exec_rules and all(not r.endswith(' *') for r in exec_rules)
+    assert cfg['permissions']['deny'] == ['Exec(sudo)', 'Exec(rm)', 'Exec(del)']
 
     handle.export_path.write_text(json.dumps({
         'session_id': 'ses-devin-1',

@@ -405,6 +405,13 @@ Coordinator procedure:
    (not `deepseek-v4.1-flash-fast`), at the same capability/effort tiers as Go.
    Its provider quota/availability is independent of Go. Workers use the same
    permissions, gate tests and serial acceptance; no separate installed agent is needed.
+    `devin/<model>` routes through the headless Devin CLI. Use `--model-cap
+    devin/<model>=5` (or `--model-cap devin=5`) to bound its concurrency. The
+    non-interactive launcher uses `--permission-mode auto` with scoped per-job
+    allow/deny rules. Devin `Exec(...)` rules are command prefixes, not globs;
+    unmatched writes and non-read-only commands still require confirmation and
+    are rejected in print mode.
+    Probe and smoke-test the installed CLI before enabling a new Devin model.
    `--opencode v2` (default) runs the npm OpenCode 2.x build with one temporary
    agent file per job in `.opencode/agents/` carrying its permissions; it has a
    256k output ceiling and the current credentials. `--opencode v1` runs the
