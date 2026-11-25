@@ -610,6 +610,12 @@ def test_retry_requires_a_resume_receipt(corpus):
         v.plan([1], retry_failed=True)
 
 
+def test_retry_refuses_audit_because_audit_reexecutes_every_tier(corpus, monkeypatch):
+    first = complete(v.plan([1, 2]), monkeypatch, fail='00000002-c')
+    with pytest.raises(ValueError, match='--audit re-executes every tier'):
+        v.plan([1, 2], resume=str(first.path), retry_failed=True, audit=True)
+
+
 @pytest.mark.parametrize('value', ['00000001-c', '00000002-lifted'])
 def test_tier_key_round_trip(value):
     key = v.TierKey.parse(value)

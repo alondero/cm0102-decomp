@@ -250,6 +250,9 @@ def plan(vas: list[int], *, refresh: bool = False, reuse: str | None = None,
         raise ValueError('Select either resume or reuse')
     if retry_failed and not resume:
         raise ValueError('Retry failed requires an explicit resume receipt')
+    if retry_failed and audit:
+        raise ValueError('--audit re-executes every tier, so it cannot be a failures-only retry; '
+                         'drop --audit to retry failures, or drop --retry-failed for a full audit')
     path, prior = _prior(resume or reuse)
     identity = global_identity()
     execution = {k: v for k, v in identity.items() if k not in LOCAL_IDENTITY_FIELDS}
