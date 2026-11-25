@@ -3439,8 +3439,12 @@ def test_v1_launcher_raises_the_output_cap(root, monkeypatch):
 
 
 def test_cli_selects_the_opencode_build(root):
-    assert isinstance(farm.make_launcher('v2', root, root / 'run'), farm.OpencodeV2Launcher)
-    assert isinstance(farm.make_launcher('v1', root, root / 'run'), farm.OpencodeLauncher)
+    v2_launcher = farm.make_launcher('v2', root, root / 'run')
+    v1_launcher = farm.make_launcher('v1', root, root / 'run')
+    assert isinstance(v2_launcher, farm.MultiLauncher)
+    assert isinstance(v2_launcher.opencode, farm.OpencodeV2Launcher)
+    assert isinstance(v2_launcher.devin, farm.DevinLauncher)
+    assert isinstance(v1_launcher.opencode, farm.OpencodeLauncher)
     v2 = farm.probe_command('v2', 'm/x')
     assert v2[1:3] == ['run', '-m'] and '--standalone' not in v2 and v2[-1] == 'Reply with exactly: OK'
     assert farm.probe_command('v1', 'm/x')[:3] == ['opencode', '--pure', 'run']
@@ -6592,3 +6596,136 @@ def test_a_listing_without_a_resumable_session_escalates_to_the_next_rung(root):
     assert [j['model'] for j, _, _ in launcher.started] == ['m/cheap', 'm/strong']
     assert farm.LISTING_REFUSAL in launcher.started[1][0]['prior']['detail']
     assert cmre.accepted == ['fn_00401000']
+
+
+def test_parse_model_caps_and_live_set_control(root):
+    assert farm.parse_model_caps('devin=6, opencode-go/hy4-flash-free=4') == {
+        'devin': 6,
+        'opencode-go/hy4-flash-free': 4,
+    }
+    assert farm.parse_model_caps('') == {}
+    with pytest.raises(ValueError):
+        farm.parse_model_caps('devin')
+    f, _, _ = make(root, [], writes(GOOD), workers=0)
+    assert farm.main(['set', str(f.run_dir), '--model-cap', 'devin=6']) == 0
+    f.tick()
+    assert f.config.model_caps == {'devin': 6}
+
+
+def test_model_cap_limits_provider_and_falls_through_to_other_models(root):
+    items = [item(f'fn_004010{i:02x}') for i in range(4)]
+    f, cmre, launcher = make(root, items, writes(GOOD), workers=4,
+                             ladder=['devin/swe-2-1-medium|m/backup'])
+    f.config.model_caps = {'devin': 2}
+    # Hold jobs open for one tick so all 4 dispatch concurrently.
+    pending_handles = []
+    class HeldHandle:
+        def poll(self): return None
+        def last_activity(self): return None
+        def limit_error(self): return None
+        def pending_limit(self): return None
+        def infra_error(self): return None
+        def finish_reason(self): return None
+        def worker_report(self): return None
+        def kill(self): pass
+    def hold_start(job, prompt, config):
+        launcher.started.append((dict(job), prompt, config))
+        Path(job['source']).write_text(GOOD, encoding='utf-8')
+        h = HeldHandle()
+        pending_handles.append(h)
+        return h
+    launcher.start = hold_start
+    f.tick()
+    dispatched = [j['model'] for j, _, _ in launcher.started]
+    assert dispatched.count('devin/swe-2-1-medium') == 2
+    assert dispatched.count('m/backup') == 2
+
+
+def test_model_cap_waits_without_parking_when_no_other_rung_is_usable(root):
+    items = [item('fn_00401000'), item('fn_00401001')]
+    f, cmre, launcher = make(root, items, writes(passing), workers=2,
+                             ladder=['devin/swe-2-1-medium'])
+    f.config.model_caps = {'devin': 1}
+    release = [False]
+    class GatedHandle:
+        def poll(self): return 0 if release[0] else None
+        def last_activity(self): return None
+        def limit_error(self): return None
+        def pending_limit(self): return None
+        def infra_error(self): return None
+        def finish_reason(self): return None
+        def worker_report(self): return None
+        def kill(self): pass
+    orig_start = launcher.start
+    def gated_start(job, prompt, config):
+        if not release[0]:
+            launcher.started.append((dict(job), prompt, config))
+            Path(job['source']).write_text(passing(job), encoding='utf-8')
+            return GatedHandle()
+        return orig_start(job, prompt, config)
+    launcher.start = gated_start
+    f.tick()
+    assert len(f.running) == 1
+    assert not f.state['parked']
+    # Simulate a pending retry job waiting while the single devin slot is occupied.
+    f.pending.append(f._new_job('translate', 'fn_00401002', 'devin/swe-2-1-medium', 0, bytes=200))
+    f.tick()
+    assert not f.state['parked']
+    assert any(j['fn'] == 'fn_00401002' for j in f.pending)
+    release[0] = True
+    drain(f)
+    assert sorted(cmre.accepted) == ['fn_00401000', 'fn_00401001', 'fn_00401002']
+
+
+def test_devin_launcher_routing_config_report_and_resume(root, monkeypatch):
+    launched = []
+    class FakeProc:
+        def __init__(self, pid=123):
+            self.pid = pid
+            self._code = 0
+        def poll(self):
+            return self._code
+    def fake_popen(cmd, **kwargs):
+        launched.append((list(cmd), kwargs))
+        return FakeProc(100 + len(launched))
+    monkeypatch.setattr(farm.subprocess, 'Popen', fake_popen)
+
+    run_dir = root / 'run'
+    devin_l = farm.DevinLauncher(root, run_dir, executable='devin-test')
+    multi = farm.MultiLauncher(farm.OpencodeV2Launcher(root, run_dir, executable='oc-test'), devin_l)
+    job = {
+        'fn': 'fn_00401000', 'kind': 'translate', 'n': 1, 'model': 'devin/swe-2-1-medium',
+        'source': str(run_dir / 'src/fn_00401000.c'),
+        'hint_source': str(run_dir / 'hints/fn_00401000-1.json'),
+    }
+    handle = multi.start(job, 'translate this', {})
+    assert isinstance(handle, farm.DevinHandle)
+    cmd = launched[0][0]
+    assert cmd[0] == 'devin-test'
+    assert '--model' in cmd and cmd[cmd.index('--model') + 1] == 'swe-2-1-medium'
+    assert '--process-model' in cmd and cmd[cmd.index('--process-model') + 1] == 'in-process'
+    assert '--respect-workspace-trust=false' in cmd
+    assert '-p' in cmd
+    cfg = json.loads(handle.config_path.read_text(encoding='utf-8'))
+    assert 'Write(run/src/fn_00401000.c)' in cfg['permissions']['allow']
+    assert 'Write(run/hints/fn_00401000-1.json)' in cfg['permissions']['allow']
+    assert any(r.startswith('Exec(py -3.13 -m cmre test ') for r in cfg['permissions']['allow'])
+
+    handle.export_path.write_text(json.dumps({
+        'session_id': 'ses-devin-1',
+        'steps': [{'message': 'Done\nFARM-RESULT: pass', 'tool_calls': [{'arguments': {'command': 'py -3.13 -m cmre test fn_00401000'}}]}],
+    }), encoding='utf-8')
+    handle.log.write_text('HTTP 429 concurrent session limit resets in 1h 5m\n', encoding='utf-8')
+    assert handle.session_id() == 'ses-devin-1'
+    report = handle.worker_report()
+    assert report['result'] == 'FARM-RESULT: pass' and report['gate_runs'] >= 1
+    msg, secs = handle.limit_error()
+    assert '429' in msg and secs == 3900
+
+    resumed = multi.resume(job, handle, 'strip listing')
+    assert isinstance(resumed, farm.DevinHandle)
+    assert '-r' in launched[1][0] and launched[1][0][launched[1][0].index('-r') + 1] == 'ses-devin-1'
+    assert handle.poll() == 0 and not handle.config_path.exists()
+
+    pcmd = farm.probe_command('v2', 'devin/swe-2-1-high')
+    assert '--model' in pcmd and pcmd[pcmd.index('--model') + 1] == 'swe-2-1-high'
