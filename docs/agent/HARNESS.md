@@ -145,7 +145,8 @@ diagnostic cannot authorize a pin change or replace inventory revalidation.
    them; the command remains failing while any retained failure is present.
    Add `--retry-failed` to explicitly execute failed tiers while retaining matching
    successes and original receipts. `--audit` explicitly reruns the whole selection,
-   including previous failures. Schema-2
+   including previous failures, so it is refused with `--retry-failed`: to retry
+   an audit sweep's failures, repeat its command without `--audit`. Schema-2
    receipts retain their original strict `--resume` contract. Migration can reuse
    an accepted tier's current run report only after recomputing its exact key
    from execution identity, effective options, source and selected build inputs.
