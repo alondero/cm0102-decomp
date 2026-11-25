@@ -66,7 +66,8 @@ NOTABLE_EVENTS = ('farm-exit', 'open-defect', 'model-unavailable', 'model-limite
 # Settings `set` may change on a running farm (RUN/control.json), applied on the next tick.
 CONTROL_KEYS = ('workers', 'audit_workers', 'min_bytes', 'max_bytes', 'ladder', 'audit_model',
                 'confirm_model', 'include_held', 'skip_ranges', 'attempt_minutes', 'stall_minutes',
-                'lift_lane_minutes', 'input_lane_workers', 'defect_lane_workers', 'defect_lane_model')
+                'lift_lane_minutes', 'input_lane_workers', 'defect_lane_workers', 'defect_lane_model',
+                'model_caps')
 SUPPLY_KEYS = ('min_bytes', 'max_bytes', 'include_held', 'skip_ranges')   # changes that reselect the frontier
 DASHBOARD_PORT = 8042           # FARM.md "Live pipeline dashboard"; `run --dashboard-port 0` disables
 DASHBOARD_CHECK_SECONDS = 60    # how often a running farm checks that the page is served
@@ -100,6 +101,35 @@ def parse_ladder(text):
     """`a|b,c` -> ['a|b', 'c']: comma separates rungs, `|` separates the models of a rung."""
     rungs = ['|'.join(ladder_group(entry)) for entry in text.split(',')]
     return [rung for rung in rungs if rung]
+
+
+def is_devin_model(model):
+    """True when a ladder/config model routes through Devin CLI (`devin/<model>`)."""
+    return str(model or '').startswith('devin/')
+
+
+def devin_model_name(model):
+    """Strip the `devin/` prefix and any `#effort` suffix for `devin --model`."""
+    return str(model).split('/', 1)[1].split('#', 1)[0]
+
+
+def parse_model_caps(text):
+    """Parse `key=N,...` per-provider or per-model concurrency caps into `{key: N}`."""
+    caps = {}
+    for entry in (p.strip() for p in (text or '').split(',')):
+        if not entry:
+            continue
+        if '=' not in entry:
+            raise ValueError(f'model cap must be key=N, got {entry!r}')
+        key, raw = entry.split('=', 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f'empty key in model cap {entry!r}')
+        n = int(raw.strip())
+        if n < 0:
+            raise ValueError(f'model cap for {key!r} must be >= 0, got {n}')
+        caps[key] = n
+    return caps
 
 
 def _is_free_model(model):
@@ -193,6 +223,7 @@ class FarmConfig:
     defect_lane_model: str | None = None   # None: the lane's default model
     only: tuple = ()               # restrict the frontier to these functions (trial runs); () takes all
     dashboard_port: int = 0        # serve the live dashboard here while the farm runs; 0: never
+    model_caps: dict = field(default_factory=dict)  # provider or model -> max concurrent running jobs
 
 
 def parse_ranges(text):
@@ -376,6 +407,19 @@ def v2_agent(root, job):
     lines += [f'  - {{ action: "{a}", resource: "{r}", effect: {e} }}' for a, r, e in rules]
     lines += ['---', 'You are a CM0102 farm worker. Follow the user message exactly.', '']
     return '\n'.join(lines)
+
+
+def devin_config(root, job):
+    """Devin CLI `config.json` with the same per-job edit/exec allowlist as worker_config()."""
+    own = job['audit_path'] if job['kind'] == 'audit' else job['source']
+    allow = ['Read(**)', f'Write({_rel(root, own)})', f'Write({Path(own).as_posix()})']
+    if job['kind'] != 'audit':
+        proposal = job.get('hint_source', str(Path(job['source']).with_suffix('.hints.json')))
+        allow += [f'Write({_rel(root, proposal)})', f'Write({Path(proposal).as_posix()})']
+    exec_patterns = [f'{PY} -m cmre {command} *' for command in WORKER_COMMANDS]
+    exec_patterns += [f'{PY} scripts/cmre_hint_check.py *', *READ_ONLY_SHELL]
+    allow += [f'Exec({pattern})' for pattern in exec_patterns]
+    return {'permissions': {'allow': allow, 'deny': ['Exec(sudo *)', 'Exec(rm *)', 'Exec(del *)'], 'ask': []}}
 
 
 def _hold_text(hold):
@@ -1242,6 +1286,8 @@ class Farm:
             value = control[key]
             if key == 'skip_ranges':
                 value = tuple(tuple(pair) for pair in value)
+            elif key == 'model_caps' and isinstance(value, str):
+                value = parse_model_caps(value)
             if value != getattr(self.config, key):
                 changes[key] = [getattr(self.config, key), value]
                 setattr(self.config, key, value)
@@ -1369,10 +1415,32 @@ class Farm:
     def _available(self, model):
         return model not in self.state['unavailable_models'] and self._limited_until(model) is None
 
+    def _running_for_cap(self, key):
+        """Running jobs matching a provider (`devin`) or model (`devin/swe-2-1-medium`) cap key."""
+        if '/' in key:
+            target = key.split('#', 1)[0]
+            return sum(1 for job, _, _ in self.running if job['model'].split('#', 1)[0] == target)
+        return sum(1 for job, _, _ in self.running if job['model'].split('/', 1)[0] == key)
+
+    def _at_cap(self, model):
+        """True when a provider or model concurrency cap leaves no room for another running job."""
+        caps = self.config.model_caps or {}
+        if not caps:
+            return False
+        bare = model.split('#', 1)[0]
+        provider = bare.split('/', 1)[0]
+        for key in (model, bare, provider):
+            if key in caps and self._running_for_cap(key) >= caps[key]:
+                return True
+        return False
+
+    def _usable(self, model):
+        return self._available(model) and not self._at_cap(model)
+
     def _audit_model(self, preferred):
         """Keep the preferred auditor when usable, otherwise use an available ladder rung."""
         return next((model for model in (preferred, *reversed(ladder_models(self.config.ladder)))
-                     if self._available(model)), None)
+                     if self._usable(model)), None)
 
     def _running_count(self, model):
         return sum(1 for job, _, _ in self.running if job['model'] == model)
@@ -1389,17 +1457,26 @@ class Farm:
     def _paused_from(self, start):
         return any(self._rung_paused(r) for r in range(start, len(self.config.ladder)))
 
+    def _rung_capped(self, rung):
+        """A rung with at least one available model that is currently at its concurrency cap."""
+        live = [m for m in ladder_group(self.config.ladder[rung]) if m not in self.state['unavailable_models']]
+        return any(self._available(m) and self._at_cap(m) for m in live)
+
+    def _capped_from(self, start):
+        return any(self._rung_capped(r) for r in range(start, len(self.config.ladder)))
+
     def _group_model(self, rung):
         """A concrete model of the rung: the least busy available one, else the least busy not retired."""
         group = ladder_group(self.config.ladder[rung])
-        pool = ([m for m in group if self._available(m)]
+        pool = ([m for m in group if self._usable(m)]
+                or [m for m in group if self._available(m)]
                 or [m for m in group if m not in self.state['unavailable_models']] or group)
         return self._least_busy(pool)
 
     def _rung_model(self, rung):
-        """First available ladder model at or above rung, or (None, rung) when none remain."""
+        """First usable ladder model at or above rung, or (None, rung) when none remain."""
         while rung < len(self.config.ladder):
-            usable = [m for m in ladder_group(self.config.ladder[rung]) if self._available(m)]
+            usable = [m for m in ladder_group(self.config.ladder[rung]) if self._usable(m)]
             if usable:
                 return self._least_busy(usable), rung
             rung += 1
@@ -1428,7 +1505,7 @@ class Farm:
             if model is not None:
                 job.update(model=model, rung=rung)
                 return self.pending.pop(i)
-            if not self._paused_from(job['rung']):
+            if not self._paused_from(job['rung']) and not self._capped_from(job['rung']):
                 self.pending.pop(i)
                 self._park(job['fn'], 'no available model on the ladder')
                 continue
@@ -4281,13 +4358,199 @@ class OpencodeLauncher:
         return OpencodeHandle(process, logs / f'{stem}.jsonl')
 
 
+DEVIN_EXECUTABLE = Path(os.environ.get('LOCALAPPDATA', '')) / 'devin/cli/bin/devin.exe'
+
+
+def _devin_executable():
+    return str(DEVIN_EXECUTABLE) if DEVIN_EXECUTABLE.is_file() else 'devin'
+
+
+class DevinHandle:
+    """Running `devin -p` worker handle with the same monitoring interface as OpencodeHandle."""
+
+    def __init__(self, process, log, export_path=None, config_path=None):
+        self.process = process
+        self.log = Path(log)
+        self.export_path = Path(export_path) if export_path else None
+        self.config_path = Path(config_path) if config_path else None
+
+    def finish_reason(self):
+        return None
+
+    def session_id(self):
+        if not self.export_path:
+            return None
+        try:
+            data = json.loads(self.export_path.read_text(encoding='utf-8', errors='replace'))
+        except (OSError, ValueError):
+            return None
+        sid = data.get('session_id') if isinstance(data, dict) else None
+        return str(sid) if sid else None
+
+    def worker_report(self):
+        try:
+            text = self.log.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            return None
+        chunks = [text]
+        runs = len(re.findall(r'\s-m\s+cmre\s+test\s', text))
+        if self.export_path and self.export_path.is_file():
+            try:
+                data = json.loads(self.export_path.read_text(encoding='utf-8', errors='replace'))
+            except (OSError, ValueError):
+                data = {}
+            for step in data.get('steps') or []:
+                if not isinstance(step, dict):
+                    continue
+                msg = step.get('message')
+                if isinstance(msg, str):
+                    chunks.append(msg)
+                for tc in step.get('tool_calls') or []:
+                    args = json.dumps(tc.get('arguments') or '') if isinstance(tc, dict) else ''
+                    if 'cmre test' in args or '-m cmre test' in args:
+                        runs += 1
+        found = re.findall(r'^\s*(FARM-RESULT:.*?)\s*$', '\n'.join(chunks), re.M)
+        return {'result': found[-1] if found else None, 'gate_runs': runs}
+
+    def last_activity(self):
+        mtimes = []
+        for path in (self.log, self.export_path):
+            if path:
+                try:
+                    mtimes.append(time.monotonic() - (time.time() - path.stat().st_mtime))
+                except OSError:
+                    pass
+        return max(mtimes) if mtimes else None
+
+    def limit_error(self):
+        try:
+            text = self.log.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            return None
+        for line in text.splitlines():
+            if LIMIT_ERROR.search(line) or re.search(r'\b429\b|concurrent session|lane limit', line, re.I):
+                reset = re.search(r'resets in (?:(\d+)h)?\s*(?:(\d+)m)?', line)
+                seconds = (int(reset.group(1) or 0) * 3600 + int(reset.group(2) or 0) * 60) if reset else 0
+                return line.strip()[:300], seconds or DEFAULT_LIMIT_SECONDS
+        return None
+
+    def pending_limit(self):
+        return None
+
+    def infra_error(self):
+        try:
+            text = self.log.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            return None
+        for line in text.splitlines():
+            if INFRA_ERROR.search(line) or re.search(r'not logged in|auth login|\b(401|402|403)\b', line, re.I):
+                return line.strip()[:300]
+        return None
+
+    def poll(self):
+        code = self.process.poll()
+        if code is not None and self.config_path:
+            self.config_path.unlink(missing_ok=True)
+        return code
+
+    def kill(self):
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/PID', str(self.process.pid), '/T', '/F'], capture_output=True)
+        else:
+            self.process.kill()
+        if self.config_path:
+            self.config_path.unlink(missing_ok=True)
+
+
+class DevinLauncher:
+    """Headless `devin -p --process-model in-process` worker launcher for `devin/<model>` rungs."""
+
+    def __init__(self, root, run_dir, executable=None):
+        self.root = Path(root)
+        self.run_dir = Path(run_dir)
+        self.executable = str(executable or _devin_executable())
+
+    def _command(self, job, prompt_path, cfg_path, export_path, *, resume_sid=None):
+        command = [
+            self.executable,
+            '--model', devin_model_name(job['model']),
+            '--process-model', 'in-process',
+            '--respect-workspace-trust=false',
+            '--permission-mode', 'accept-edits',
+            '--config', str(cfg_path),
+            '--prompt-file', str(prompt_path),
+            '--export', str(export_path),
+            '--verbosity', '2',
+        ]
+        if resume_sid:
+            command += ['-r', resume_sid]
+        command.append('-p')
+        return command
+
+    def start(self, job, prompt, config):
+        logs = self.run_dir / 'logs'
+        logs.mkdir(parents=True, exist_ok=True)
+        stem = f"{job['fn']}-{job['kind']}-{job['n']}"
+        prompt_path = logs / f'{stem}.prompt.txt'
+        cfg_path = logs / f'{stem}.devin.json'
+        export_path = logs / f'{stem}.export.json'
+        log_path = logs / f'{stem}.log'
+        prompt_path.write_text(prompt, encoding='utf-8')
+        cfg_path.write_text(json.dumps(devin_config(self.root, job), indent=1), encoding='utf-8')
+        command = self._command(job, prompt_path, cfg_path, export_path)
+        flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == 'nt' else 0
+        out = log_path.open('wb')
+        process = subprocess.Popen(command, cwd=self.root, env=dict(os.environ), stdout=out,
+                                   stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, creationflags=flags)
+        out.close()
+        return DevinHandle(process, log_path, export_path, cfg_path)
+
+    def resume(self, job, handle, message):
+        sid = getattr(handle, 'session_id', lambda: None)()
+        if not sid:
+            return None
+        logs = self.run_dir / 'logs'
+        stem = f"{job['fn']}-{job['kind']}-{job['n']}"
+        continue_path = logs / f'{stem}.continue.txt'
+        cfg_path = logs / f'{stem}.devin.json'
+        export_path = logs / f'{stem}.export.json'
+        log_path = logs / f'{stem}.log'
+        continue_path.write_text(message, encoding='utf-8')
+        cfg_path.write_text(json.dumps(devin_config(self.root, job), indent=1), encoding='utf-8')
+        command = self._command(job, continue_path, cfg_path, export_path, resume_sid=sid)
+        flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == 'nt' else 0
+        with log_path.open('ab') as out:
+            process = subprocess.Popen(command, cwd=self.root, env=dict(os.environ), stdout=out,
+                                       stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, creationflags=flags)
+        return DevinHandle(process, log_path, export_path, cfg_path)
+
+
+class MultiLauncher:
+    """Route `devin/<model>` jobs to DevinLauncher and all other models to OpenCode."""
+
+    def __init__(self, opencode, devin):
+        self.opencode, self.devin = opencode, devin
+
+    def start(self, job, prompt, config):
+        target = self.devin if is_devin_model(job.get('model')) else self.opencode
+        return target.start(job, prompt, config)
+
+    def resume(self, job, handle, message):
+        target = self.devin if is_devin_model(job.get('model')) else self.opencode
+        return target.resume(job, handle, message)
+
+
 def make_launcher(build, root, run_dir):
-    """opencode 2.x (npm, 256k output, current credentials) or 1.x (Chocolatey `opencode` on PATH)."""
-    return OpencodeV2Launcher(root, run_dir) if build == 'v2' else OpencodeLauncher(root, run_dir)
+    """opencode 2.x (npm, 256k output, current credentials) or 1.x, plus Devin CLI for `devin/...`."""
+    opencode = OpencodeV2Launcher(root, run_dir) if build == 'v2' else OpencodeLauncher(root, run_dir)
+    return MultiLauncher(opencode, DevinLauncher(root, run_dir))
 
 
 def probe_command(build, model):
     prompt = 'Reply with exactly: OK'
+    if is_devin_model(model):
+        return [_devin_executable(), '--model', devin_model_name(model), '--process-model', 'in-process',
+                '--respect-workspace-trust=false', '--permission-mode', 'auto', '--verbosity', '0', '-p', prompt]
     if build == 'v2':
         return [str(V2_EXECUTABLE), 'run', '-m', model, '--format', 'json', prompt]
     return ['opencode', '--pure', 'run', '--model', model, '--format', 'json', prompt]
@@ -4303,6 +4566,9 @@ def probe(models, build='v2'):
             text = done.stdout + done.stderr
         except (OSError, subprocess.TimeoutExpired) as exc:
             results[model] = str(exc)[:200]
+            continue
+        if is_devin_model(model):
+            results[model] = None if done.returncode == 0 and 'OK' in text else (text.strip() or 'no answer')[:200]
             continue
         error = None
         for line in text.splitlines():
@@ -4397,6 +4663,8 @@ def build_parser():
     r.add_argument('--only', help='comma-separated fn_XXXXXXXX: translate only these (trial runs)')
     r.add_argument('--dashboard-port', type=int, default=DASHBOARD_PORT,
                    help='serve the live dashboard on this loopback port while the farm runs; 0 disables')
+    r.add_argument('--model-cap', default='',
+                   help='comma-separated provider=N or model=N concurrency caps, e.g. devin=6')
     st = sub.add_parser('start', help='run the farm detached under a restart supervisor; args as for run')
     st.add_argument('run_dir')
     st.add_argument('run_args', nargs=argparse.REMAINDER)
@@ -4420,6 +4688,8 @@ def build_parser():
     se.add_argument('--input-lane-workers', type=int, help='input-lane model workers; 0 dispatches no new input jobs')
     se.add_argument('--defect-lane-workers', type=int, help='defect-lane model workers; 0 dispatches no new defect jobs')
     se.add_argument('--defect-lane-model', help='defect-lane model for new jobs')
+    se.add_argument('--model-cap', dest='model_caps',
+                    help="comma-separated provider=N or model=N concurrency caps; '' clears")
     se.add_argument('--add-hours', type=float, help='extend the deadline')
     ln = sub.add_parser('lanes', help='every state the farm cannot leave by itself: owner, bytes, next action')
     ln.add_argument('run_dir')
@@ -4727,7 +4997,8 @@ def main(argv=None):
                         lift_lane_minutes=a.lift_lane_minutes, input_lane_workers=a.input_lane_workers,
                         defect_lane_workers=a.defect_lane_workers, defect_lane_model=a.defect_lane_model,
                         only=tuple(fn.strip() for fn in (a.only or '').split(',') if fn.strip()),
-                        dashboard_port=a.dashboard_port)
+                        dashboard_port=a.dashboard_port,
+                        model_caps=parse_model_caps(a.model_cap))
     from concurrent.futures import ThreadPoolExecutor
     with RunLock(run_dir), ThreadPoolExecutor(max_workers=max(1, a.verify_threads)) as verifier:
         (run_dir / 'STOP').unlink(missing_ok=True)
@@ -4754,6 +5025,8 @@ def set_control(run_dir, a):
         values['confirm_model'] = values['confirm_model'] or None
     if 'skip_ranges' in values:
         values['skip_ranges'] = parse_ranges(values['skip_ranges'])
+    if 'model_caps' in values:
+        values['model_caps'] = parse_model_caps(values['model_caps'])
     if not values and a.add_hours is None:
         print('set: nothing to change', file=sys.stderr)
         return 2
