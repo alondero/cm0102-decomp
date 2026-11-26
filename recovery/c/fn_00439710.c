@@ -1,6 +1,21 @@
-/* WIP: one failed invocation, coverage .5612/inc0 without semantic mismatch.
-   Constructor00438937 stores00968554; slot00968590 points00438bf0,
-   absent from inventory. No substitute virtual target. */
+/* Original-instruction authority: CM0102 3.9.68 SHA-256
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+   All addresses below are preferred-image VAs.
+   00439731 supplies the receiver; 004398c9 returns without stack cleanup.
+   0043978f and 004397c5..004397c8 push four virtual arguments;
+   004397c8 supplies ECX=self and 004397ca calls the unmodified +3c slot.
+   The previous hold concerned slot 00968590 -> 00438bf0, missing from
+   the target inventory. This translation retains that actual memory dispatch:
+   no replacement target, direct-call binding, or invented return is used.
+   Target inventory admission remains external evidence, not a C fix.
+   Current canonical retest: O0/O2 coverage 0.5612, inc=0; case 0
+   explain reports difference={}. Thus the coverage hold is NOT resolved.
+   No private hint change is proposed: neither the supplied parent listing
+   nor this matching case proves the missing target's function entry.
+   004397f3..00439810 push the fifteen constructor arguments, with ECX
+   from allocation at 00439811. 0043982f loads the receiver for 0043989a.
+   00439862..00439879 retain the error-format arguments across the no-arg
+   00439869 call; the combined cleanup is at 0043988e. */
 #include "cmre.h"
 #define D(a) CM_GLOBAL(volatile u32, (a))
 #define W(a) CM_GLOBAL(volatile u16, (a))

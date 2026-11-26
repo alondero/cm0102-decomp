@@ -1,13 +1,16 @@
 /* Preferred-image VA 0x00430050, image base 0x00400000.
    SHA-256 0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
-   ECX receiver, ret 0. The sole direct caller forwards EAX unchanged.
+   ECX receiver at VA 0x00430071, ret 0 at VA 0x00430209.
    L = entry ESP-0x41c, the base of the original 0x410-byte scratch.
    L+0 holds four initialized bytes, L+4/L+8 are virtual-call outputs, L+0xc
    records the second allocation. Error buffers are L+0x10/L+0x210 and
    L+0x110/L+0x310, respectively. The original DWORD pushes from L+4/L+8
-   contain unknown upper halves, but 0x00522e00 observes only their low WORDs
-   at VAs 0x00522e5e/0x00522e6c. Its seventh stack argument is likewise read
-   only as a WORD at 0x00522e31; the caller's scratch-pointer high half is dead. */
+   are retained as DWORD reads at VAs 0x0043012b/0x00430146.
+   VA 0x0043010a dispatches through the actual slot +0x3c, with ECX=self
+   and four pushed arguments (VAs 0x004300cf, 0x00430105..0x00430107).
+   The reported real target VA 0x0042f5d0 is not replaced or stubbed here:
+   absent original-entry inventory support is a gate-evidence limitation,
+   not behavior that a faithful caller translation can repair. */
 #include "cmre.h"
 
 extern unsigned long long cm_fn_00944e46(u32 size);
@@ -23,7 +26,7 @@ extern char *cm_fn_0090d130(void);
 extern u32 cm_fn_00944c9f(u32 destination, u32 format, ...);
 extern u32 cm_fn_00944cff(u32 source, u32 a, u32 b, void *first, void *second);
 
-u32 CM_FASTCALL cm_fn_00430050(u32 self)
+u32 CM_THISCALL cm_fn_00430050(u32 self)
 {
     volatile struct { u32 prev, handler, state; } frame;
     u32 scratch_words[0x104];
@@ -36,8 +39,8 @@ u32 CM_FASTCALL cm_fn_00430050(u32 self)
     u32 virtual_result;
     u32 allocation;
     u16 word40;
-    u16 out4;
-    u16 out8;
+    u32 out4;
+    u32 out8;
     u32 field4;
     u32 slot;
     u32 object;
@@ -83,10 +86,10 @@ u32 CM_FASTCALL cm_fn_00430050(u32 self)
     *(volatile u32 *)(scratch + 12) = allocation;
     frame.state = 0;
     if (allocation != 0) {
-        out4 = *(volatile u16 *)(scratch + 4);
+        out4 = *(volatile u32 *)(scratch + 4);
         word40 = *(volatile u16 *)(self + 0x40u);
         field4 = *(volatile u32 *)(self + 4u);
-        out8 = *(volatile u16 *)(scratch + 8);
+        out8 = *(volatile u32 *)(scratch + 8);
         object = cm_fn_00522e00(allocation, self, 4, members, out8,
             field4, virtual_result, word40, 0, 1, out4, 0x14, 0, 1,
             0, (u32)scratch);

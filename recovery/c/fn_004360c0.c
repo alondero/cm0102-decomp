@@ -7,7 +7,16 @@
    L+0x110/L+0x310, respectively. The original DWORD pushes from L+4/L+8
    contain unknown upper halves, but 0x00522e00 observes only their low WORDs
    at VAs 0x00522e5e/0x00522e6c. Its seventh stack argument is likewise read
-   only as a WORD at 0x00522e31; the caller's scratch-pointer high half is dead. */
+   only as a WORD at 0x00522e31; the caller's scratch-pointer high half is dead.
+
+   Boundary still unresolved by source: the real constructor vtable slot +0x3c
+   targets preferred-image VA 0x00435640, reported absent from the pinned
+   function inventory. Do not substitute an inventoried target or fake fixture.
+   Parent must establish original-entry inventory/contract support and revalidate.
+   Caller ABI evidence in the pinned image named above: VA 0x0043613f pushes
+   the final zero, VAs 0x00436175-0x00436177 push the two output pointers and
+   first zero, VA 0x00436178 sets ECX=self, and VA 0x0043617a dispatches slot
+   +0x3c. These instructions establish the boundary, not target composition. */
 #include "cmre.h"
 
 extern unsigned long long cm_fn_00944e46(u32 size);
@@ -23,7 +32,7 @@ extern char *cm_fn_0090d130(void);
 extern u32 cm_fn_00944c9f(u32 destination, u32 format, ...);
 extern u32 cm_fn_00944cff(u32 source, u32 a, u32 b, void *first, void *second);
 
-u32 CM_FASTCALL cm_fn_004360c0(u32 self)
+u32 CM_THISCALL cm_fn_004360c0(u32 self)
 {
     volatile struct { u32 prev, handler, state; } frame;
     u32 scratch_words[0x104];
@@ -36,8 +45,8 @@ u32 CM_FASTCALL cm_fn_004360c0(u32 self)
     u32 virtual_result;
     u32 allocation;
     u16 word40;
-    u16 out4;
-    u16 out8;
+    u32 out4;
+    u32 out8;
     u32 field4;
     u32 slot;
     u32 object;
@@ -83,12 +92,14 @@ u32 CM_FASTCALL cm_fn_004360c0(u32 self)
     *(volatile u32 *)(scratch + 12) = allocation;
     frame.state = 0;
     if (allocation != 0) {
-        out4 = *(volatile u16 *)(scratch + 4);
+        /* VA 0x0043619b reads a DWORD even though the argument is a WORD. */
+        out4 = *(volatile u32 *)(scratch + 4);
         word40 = *(volatile u16 *)(self + 0x40u);
         field4 = *(volatile u32 *)(self + 4u);
-        out8 = *(volatile u16 *)(scratch + 8);
-        object = cm_fn_00522e00(allocation, self, 4, members, out8,
-            field4, virtual_result, word40, 0, 1, out4, 0x14, 0, 1,
+        /* VA 0x004361b6 likewise reads all four bytes. */
+        out8 = *(volatile u32 *)(scratch + 8);
+        object = cm_fn_00522e00(allocation, self, 4, members, (u16)out8,
+            field4, virtual_result, word40, 0, 1, (u16)out4, 0x14, 0, 1,
             0, (u32)scratch);
     } else {
         object = 0;

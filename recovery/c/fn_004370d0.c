@@ -1,6 +1,13 @@
-/* WIP: one failed invocation, coverage .5612/inc0 without semantic mismatch.
-   Original constructor00436437 stores vtable009683ec; slot+3c points to
-   original004366f0, absent from inventory. Do not substitute a target. */
+/* Preferred-image VAs; CM0102 3.9.68 SHA-256
+   0c78e7da6d0bcb4603fa179449bbe6d1b6b5e1c627a22c445d14d489bd9bff86.
+   Entry receiver: 004370f1 reads ECX; 00437289 is RET without stack pop.
+   The indirect boundary is deliberately retained, not rebound:
+   0043717f reads [self], 0043718a calls [vtable+3c], ECX=self at
+   00437188. Pushes 0043714f, 00437185..87 supply (0, L+8, L+4, 0).
+   The supplied held-job report identifies target004366f0 as missing from
+   inventory. This listing alone cannot establish that target's entry or
+   cleanup. Parent inventory evidence is still required; no target
+   substitution or invented fixture is used here. */
 #include "cmre.h"
 #define D(a) CM_GLOBAL(volatile u32, (a))
 #define W(a) CM_GLOBAL(volatile u16, (a))
@@ -19,6 +26,8 @@ extern u32 CM_CDECL cm_fn_005e8290(u32, u32, u32);
 u32 CM_THISCALL cm_fn_004370d0(u32 self)
 {
     volatile struct { u32 prev, handler, state; } frame;
+    /* L is ESP immediately after 004370e5; four saved registers account
+       for 16 bytes. Keep all original scratch addresses in this allocation. */
     u8 scratch[0x410];
     u32 clubs, table, value, target, schedule, allocated, flag, year, competition;
     u32 rounds, child, holder, result, name, extension, line, text;
@@ -50,6 +59,7 @@ u32 CM_THISCALL cm_fn_004370d0(u32 self)
     value = D(table + 0x76);
     D(clubs + 0xc) = value;
     table = D(self);
+    /* Original target-table read, not an assumption about the bound entry. */
     target = D(table + 0x3c);
     schedule = ((u32 (CM_THISCALL *)(u32, u32, u32, u32, u32))target)
         (self, 0, (u32)scratch + 8, (u32)scratch + 4, 0);
