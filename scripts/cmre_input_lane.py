@@ -373,6 +373,7 @@ class Lane:
         if self.stopping():
             return
         screens = 0
+        deferred = []
         while len(self.running) < self.workers and self.queue:
             fn = self.queue[0]
             info = self.candidates.get(fn)
@@ -381,7 +382,7 @@ class Lane:
                 continue
             if info.get('coverage') is None:
                 if screens >= SCREEN_JOBS:
-                    return   # bounded per tick: screens must not starve result handling
+                    break   # bounded per tick: screens must not starve result handling
                 screens += 1
                 self.queue.pop(0)
                 if not self._screen(fn):
@@ -395,7 +396,8 @@ class Lane:
             attempts = row.setdefault('attempts', [])
             model = self._model(len(current_attempts(row, self.harness)))
             if model is None:
-                return   # every remaining rung is limited: wait
+                deferred.append(self.queue.pop(0))   # limited for now: later candidates may be usable
+                continue
             self.queue.pop(0)
             self.state['counter'] += 1
             n = self.state['counter']
@@ -421,6 +423,7 @@ class Lane:
             self.running.append((job, handle, self.clock()))
             self.event('dispatch', fn=fn, n=n, model=model, bytes=info['bytes'], coverage=info.get('coverage'))
             self.save()
+        self.queue = deferred + self.queue
 
     # results
     def collect(self):
