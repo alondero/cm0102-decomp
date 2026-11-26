@@ -802,6 +802,9 @@ New lifts reach the C translators on the next frontier rescan.
   `lift-blocked` row set under an older harness is re-screened once. Accepted rows
   stay done. An idle lane re-scans candidates at most once a minute (at once after a
   gate result or accept); a busy lane every ten minutes.
+- Scheduling: a candidate whose remaining rungs are provider-limited is deferred for
+  that scan without spending an attempt so later usable candidates can dispatch;
+  deferral does not change its priority when the cooldown ends.
 - Skipped: hard work holds, blocked records, lift `lift-blocked`, `fail` and
   `error`. A mismatch found with authored inputs is recorded in
   `RUN/input-lane/state.json` for triage and is never reshaped away.

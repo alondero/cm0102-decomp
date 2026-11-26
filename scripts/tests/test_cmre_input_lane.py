@@ -868,6 +868,32 @@ def test_the_lane_reads_grouped_ladders_from_control_and_dispatches_concrete_mod
     assert sorted(job['model'] for job, _, _ in launcher.started) == ['p/a', 'q/b']
 
 
+# --- provider-limited head candidates -------------------------------------------------
+
+def test_a_limited_high_rung_head_does_not_block_a_later_dispatchable_candidate(tmp_path):
+    head, later = 'fn_00401000', 'fn_00402000'
+    l, _, launcher, _ = make_lane(tmp_path, {head: candidate(1000, 0.58), later: candidate(900, 0.57)},
+                                  workers=1)
+    l.state['functions'][head] = {'key': 'k1', 'attempts': attempts_under('H1', 2)}
+    l._pause('q/strong', 'quota', 600)
+    l.tick()
+    assert [(job['fn'], job['model']) for job, _, _ in launcher.started] == [(later, 'p/cheap')]
+    assert len(l.state['functions'][head]['attempts']) == 2
+
+
+def test_a_deferred_head_keeps_priority_when_its_provider_cools_down(tmp_path):
+    head, later, queued = 'fn_00401000', 'fn_00402000', 'fn_00403000'
+    l, _, launcher, clock = make_lane(tmp_path, {head: candidate(1000, 0.58), later: candidate(900, 0.57),
+                                                 queued: candidate(800, 0.56)}, workers=1)
+    l.state['functions'][head] = {'key': 'k1', 'attempts': attempts_under('H1', 2)}
+    l._pause('q/strong', 'quota', 60)
+    l.tick()
+    clock['now'] += 61
+    l.tick()
+    assert [(job['fn'], job['model']) for job, _, _ in launcher.started] == [
+        (later, 'p/cheap'), (head, 'q/strong')]
+
+
 # --- memory bound of a varied spec -------------------------------------------------
 
 class _FakeMachine:
