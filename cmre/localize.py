@@ -193,7 +193,9 @@ def _register_names(profile, returns):
 def _gate_case(va, opts, original, region, index):
     """The gate's input for case number `index`, replayed as `difftest.explain` does:
     a hinted input directly (number >= opts.cases, ADR 0015), or the random stream
-    up to that case with its discovery runs. Leaves `original` armed for that case."""
+    up to that case with its discovery runs. Leaves `original` armed for that case.
+    `run` picks the lowest-numbered mismatch, so a random case is localized before
+    a hinted one."""
     original_image = image.primary()
     globals_seen = set()
     for number, case, discovering in difftest.gate_cases(opts, globals_seen, difftest.arena_templates(),
@@ -219,7 +221,8 @@ def _replay(va, lifted, built, opts, profile, returns, mismatch):
     if profile == "semantic":
         difftest._stop_indirect(original, recovered, region, built, recover._indirect_calls(lifted))
 
-    case = _gate_case(va, opts, original, region, mismatch["case"])
+    index = mismatch["case"]
+    case = _gate_case(va, opts, original, region, index)
 
     entries = difftest._entries()
     registers = ()

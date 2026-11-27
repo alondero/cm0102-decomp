@@ -195,3 +195,21 @@ def test_localize_rebuilds_a_hinted_mismatch_case_not_a_random_one():
     assert localize._gate_case(LEAP, opts, original, region, 2).stack == expected.stack
     with pytest.raises(ValueError, match='case'):
         localize._gate_case(LEAP, opts, original, region, 4 + 3)
+
+
+def test_localize_reads_no_undefined_global_names():
+    import builtins
+    import inspect
+    import symtable
+    from cmre import localize
+    known = set(vars(localize)) | set(dir(builtins))
+
+    def missing(table):
+        found = [(table.get_name(), name) for name in table.get_identifiers()
+                 if table.lookup(name).is_global() and name not in known]
+        for child in table.get_children():
+            found += missing(child)
+        return found
+
+    source = inspect.getsource(localize)
+    assert missing(symtable.symtable(source, localize.__file__, 'exec')) == []
