@@ -99,8 +99,10 @@ drained eight times in 19 hours and then sat idle for nine.
 5. **Resume the same RUN directory** across sessions. It remembers what is
    parked and which candidates wait for inputs; a new directory dispatches the
    whole held queue again.
-6. **Validation budget.** Run `cmre_session.py check` once at the handoff after
-   the final `stop`. Scope each harness release using the
+6. **Validation budget.** The coordinator owns session validation as defined in
+   the [preflight](PLAYBOOK.md#1-preflight): it runs `cmre_session.py start` at
+   session open and `check` at the handoff after the final `stop`, while workers
+   inherit the parent receipt. Scope each harness release using the
    [validation budget](PLAYBOOK.md#validation-budget). The session decides when a
    full revalidation or composition run is warranted and records why
    ([ADR 0011](../adr/0011-engineering-decision-rights.md)).
@@ -251,6 +253,11 @@ Coordinator procedure:
      parking, and a failure while the farm stops is left for the next run's scan.
      Audits and confirmations also use an available ladder model; they wait only
      when all their lanes are unavailable. Tell Adam once, since Extra Usage is his call.
+     Simultaneous error rows are classified row by row in ordinary reaping as in the
+     input lane: one row that is both usage-limit-shaped and auth-shaped remains a
+     timed usage limit, while an independent auth/infra row additionally retires the
+     model beside the usage-limit pause — both pauses are recorded, the job spends no
+     attempt and is requeued once.
    - `farm-crash-loop`: the supervisor gave up after five restarts in an hour.
      Read `RUN/farm.err`, report the traceback to Adam, and start the same RUN
      again once the cause is fixed.
@@ -373,16 +380,33 @@ Coordinator procedure:
    accepts it on a pass. Rechecks can run while all model providers are
    unavailable and stay eligible across restarts and temporary claim conflicts.
    A differential mismatch on the new corpus starts at the first available
-   model rung. `retry RUN fn_X --reason "<what changed>"` requests a fresh
-   gate for an input-bound candidate or queues a translation for other parked
-   functions, for example after a harness release. A plain retry starts again at
-   rung 0. Add `--rung N` (0-based) to start at a stronger rung when the cheaper
-   rungs already failed the function. The farm saves the rung with its state and
+   model rung. The same re-gate applies to a function parked on a private hint
+   proposal once its canonical hints move on (below); do not write a manual
+   retry for that arrival. `retry RUN fn_X --reason "<what changed>"` requests
+   a fresh gate for an input-bound candidate or queues a translation for other
+   parked functions, for example after a harness release. Name the input,
+   harness or source delta in `--reason`; a deterministic mismatch with no
+   delta goes to hand translation or input work instead of another model ladder
+   pass. A plain retry starts again at rung 0. Add `--rung N` (0-based) to
+   start at a stronger rung when the cheaper rungs already failed the function.
+   The farm saves the rung with its state and
    waits while that rung's models are paused. It refuses a rung outside the
    ladder, or a function no longer parked when it reads the request, with a
    `retry-refused` event. The command ends with `retry: N queued, M not parked`
    and exits 1 when any function was skipped. Count that line, not lines
    containing "queued". Strip CR from Windows lists first.
+
+   `py -3.13 scripts/cmre_farm.py input-supply RUN` (`--json`, `--top N`) is the
+   one ordered input-supply queue: parked input-needed candidates, pending hint
+   proposals and unlifted input-lane rows, largest bytes first. Every row shows
+   its disposition — `recheck-pending`, `awaiting-inputs`, `awaiting-validation`,
+   `queued`, `plateaued` with its obligation, or `deferred` with the explicit
+   reason — so an input arrival never silently ends in neither a recheck nor a
+   recorded reason. Input-lane row classification is harness- and hint-key-aware:
+   old-harness history, legacy rows with no harness digest and changed inputs are queued
+   again, while three attempts under the current harness are deferred until new inputs
+   or a harness release. Same-key pass-unaccepted rows stay out across harness releases;
+   changed inputs reopen them.
 
    Options: `--include-held` also takes held functions (each prompt carries
    the hold reason; the audit checks it). `--min-bytes/--max-bytes` bound the
@@ -480,6 +504,12 @@ writer lease, acceptance rechecks canonical source and hints, the canonical
 gate, and any prior review or operand proof. Worker/model pass claims are not
 acceptance evidence. Completed collection is
 recorded only after terminal status; interrupted collection remains resumable.
+Journals in a terminal phase (`complete`, `failed`, `conflict` or `reverify`)
+are operationally sealed: startup trusts only their validated controller-shaped
+headers for bookkeeping, while their retained prior/candidate bytes remain
+historical evidence rather than restart inputs. A malformed or unproven header
+falls back to the full strict journal parser; nonterminal journals still use
+that full path.
 
 Acceptance requests use schema 2 and name the controller's write-once
 `dispatch/JOB/receipt.json`, created before launch or explicit adoption admission.
@@ -519,11 +549,23 @@ receipt. A valid proposal produces `hint-evidence-needed`, not automatic canonic
 application or acceptance. Worker tests still use canonical hints and do not
 validate the private proposal. The parent validates it and applies it with
 `scripts/cmre_hint_apply.py` while the farm runs (the function is parked, so no
-job holds its inputs), then requests fresh verification under the reviewed
-inputs with `retry`; an input-bound candidate is re-gated automatically. There is
+job holds its inputs). An input-bound candidate with a retained-candidate
+binding is then re-gated automatically; do not write a manual `retry` for that
+arrival. There is
 no claimed real-worker mutation-provenance adapter. Unrelated canonical changes
 are preserved and parked; provider/auth paths never restore canonical hints.
 Private drafts replaced on redispatch are retained with their dispatch metadata.
+
+Hint proposals carry terminal states. A proposal is `pending` while the canonical
+hints keep the identity it was dispatched with. When the inputs move on, the farm
+closes it `applied` (the canonical hints are now the proposal bytes) or
+`superseded` (anything else), or `accepted` when the function is accepted
+(`hint-proposal-closed` event). On that input arrival the farm moves the retained
+candidate into the input-needed recheck machinery and re-gates it without a model
+call — the `retry` above is only needed when no retained-candidate binding exists
+(rows recorded before 2026-11-27 without a `RUN/src` candidate), which the row
+records as an explicit `deferred` reason instead. Terminal proposals leave the
+`hint-evidence` lane.
 
 For an accepted lift with no accepted C, the hint applier permits append-only
 `c_hints` fixtures/captures and provenance without changing shared inputs or
@@ -788,23 +830,72 @@ the fixtures that reach new instructions to the canonical hints under the writer
 lease, and runs `cmre accept`. A refused accept restores the previous hints.
 New lifts reach the C translators on the next frontier rescan.
 
+- One gate appends at most 192 fixtures (`MAX_SELECTED` in
+  `scripts/cmre_input_probe.py`). The probe records its `TOOL_VERSION` on every
+  gate result and the lane stores it on the function's best spec. A best spec gated
+  by an older probe is **re-gated** once, with no model call (`regate` event, one
+  in flight, none while `input_lane_workers` is 0): the copy is gated, applied and
+  accepted exactly like a worker's spec, its row lists it under `regates`, and it
+  is not one of the three attempts. A gate error (timeout, crash) is retried up to
+  twice per probe version. A `low-coverage` re-gate above a plateau's coverage
+  clears that plateau (`plateau-cleared`), because workers are seeded from the
+  improved best spec. On 27 Nov the old 48-fixture cap held specs whose
+  fixtures reached 0.91-0.96 of `fn_005576e0`/`fn_00487f60` to the 0.53-0.55 the
+  gate recorded; bump `TOOL_VERSION` whenever a probe change can turn a held spec
+  into a pass.
 - When a worker probe finishes with a pass or mismatch, the lane can collect it
   before the worker exits. It freezes the spec only if its hash and the probe's
   base-hint hash match, then stops the worker and runs its usual independent gate
   on that snapshot. A probe result is not acceptance evidence.
-- Order: nearest the coverage threshold first, then larger. A never-gated
-  function is gated once first, and if that gate passes it is accepted with no
-  model call. Each function gets three attempts per canonical-hint state, one
-  ladder rung each. Each later attempt starts from the best spec so far.
+- Order: nearest the coverage threshold first, then larger. Ordering uses the
+  higher of the candidate's current canonical/screen coverage and, while the
+  canonical hint key is unchanged, the best private spec's coverage. That best
+  coverage is only a scheduling heuristic because the next attempt resumes from
+  that spec; it is not the baseline, prompt coverage, plateau evidence or
+  acceptance evidence. A never-gated function is gated once first, and if that
+  gate passes it is accepted with no model call. Each function gets three
+  attempts per canonical-hint state, one ladder rung each. Each later attempt
+  starts from the best spec so far.
   Only attempts made under the current harness digest (`cmre.recover.harness_digest()`,
   recorded on every attempt) count toward the three and pick the ladder rung, so a
   harness release re-opens exhausted functions, and a `fail`, `error` or
-  `lift-blocked` row set under an older harness is re-screened once. Accepted rows
-  stay done. An idle lane re-scans candidates at most once a minute (at once after a
+  `lift-blocked` row set under an older harness is re-screened once. Rows with no harness
+  digest are legacy evidence and reopen rather than suppressing work forever. Accepted rows
+  stay done. Same-key pass-unaccepted rows are harness-independent because their inputs
+  already passed and acceptance refused for another reason. An idle lane re-scans candidates at most once a minute (at once after a
   gate result or accept); a busy lane every ten minutes.
+- Input plateaus are enforced mechanically: when two consecutive coverage-bearing
+  attempts at the same hint key and harness do not improve on the best coverage
+  reached before them (the pre-attempt coverage first), the function is an input
+  plateau and dispatch stops — the third attempt is not spent on a repeated
+  same-coverage result. The row records the precise obligation: `import-transcript`
+  when both attempts were `no-new-reach` (the uncovered code is unreachable from
+  entry inputs, so no spec can reach it), otherwise `input` with the first
+  uncovered instruction VAs. Error attempts neither count nor reset the run.
+  Comparability is harness-scoped: coverage reached under one harness is no
+  evidence for progress under another, so a harness release resets the baseline
+  and the first attempt under the new harness is the reference — a re-opened
+  function re-plateaus only after two flat attempts following that reference.
+  Historical attempts stay on the row for diagnostics. The
+  plateau holds until the hint key changes (new inputs arrived), the harness
+  digest changes (a release re-opens it), or an expert authors the inputs it names;
+  `py -3.13 scripts/cmre_farm.py input-supply RUN` lists plateaued rows with their
+  obligations.
 - Scheduling: a candidate whose remaining rungs are provider-limited is deferred for
   that scan without spending an attempt so later usable candidates can dispatch;
-  deferral does not change its priority when the cooldown ends.
+  deferral does not change its priority when the cooldown ends. When a provider,
+  tier or model cooldown expires, one post-expiry worker probes that exact pause
+  generation and other workers of the same scope wait; tier probes do not block the
+  provider's other tier. Only a normal zero exit that produced spec bytes or a final
+  worker claim, or a hash-validated terminal-probe receipt, clears that exact expired key.
+  A fresh limit is a new generation, and a nonzero exit, timeout, stall, stop, usage
+  limit or auth/infra error never clears the pause. This serialization is local to
+  one lane process; it does not coordinate independent runs or orphaned workers.
+- Provider errors are classified row by row. One row that is both usage-limit-shaped
+  and auth-shaped remains a timed usage limit; an independent auth/infra row pauses
+  the whole provider beside any usage-limit pause. Auth/infra failures with an
+  unchanged spec do not consume an attempt, while written spec bytes still go through
+  the independent gate.
 - Skipped: hard work holds, blocked records, lift `lift-blocked`, `fail` and
   `error`. A mismatch found with authored inputs is recorded in
   `RUN/input-lane/state.json` for triage and is never reshaped away.
@@ -816,7 +907,8 @@ New lifts reach the C translators on the next frontier rescan.
   `input-lane/STOP` pauses the lane until you delete it.
 - Poor targets: functions whose uncovered code lies behind an import result,
   such as file open or allocation failure. The lane adds no import transcripts,
-  so after three `no-new-reach` attempts it leaves them alone.
+  so when the last two no-progress attempts are `no-new-reach` the input plateau
+  carries an `import-transcript` obligation and dispatch stops.
 - Watch it with `cmre_farm.py status RUN` (`inputs: running N, accepted K fn /
   B`), `scripts/cmre_input_lane.py status RUN`, and `plan RUN --top 20` for the
   next candidates. Events, specs, proposals and worker logs are local evidence

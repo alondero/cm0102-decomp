@@ -123,7 +123,12 @@ Completion: `apply` output with a status for every function. `low-coverage`
 after expansion means the session did not exercise enough of that function:
 record a different activity. `fail` is a lift mismatch on a real input: keep
 the report and triage it through [TRIAGE.md](TRIAGE.md); do not drop the
-capture to make it pass.
+capture to make it pass. The round's value is bytes moved out of `unlifted`,
+not hits or raw `reached_bytes`. When expansion and apply move no bytes, change
+activity once; when the next round also moves none, record the blocker and
+switch lanes. Preserve the recorder summary, expansion output and apply output
+at stable analysis paths, and name those paths in the handoff before cleaning
+scratch.
 
 ## 3. Accept the lifts (parent, serial)
 

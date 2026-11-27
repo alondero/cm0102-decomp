@@ -1,6 +1,7 @@
 import hashlib
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -105,7 +106,7 @@ class Ops:
 
     def gate(self, fn, spec, model):
         self.gates.append((fn, model))
-        return {'proposal': str(spec.with_suffix('.p.json')), 'prior_sha256': 'h' * 64,
+        return {'proposal': str(spec.with_suffix('.p.json')), 'prior_sha256': 'h' * 64, 'tool': probe.TOOL_VERSION,
                 **self.gate_result.get(fn, {'status': 'low-coverage', 'coverage': 0.4})}
 
     def apply(self, fn, expected, proposal, proposal_sha256=None):
@@ -299,6 +300,8 @@ def test_failed_attempts_escalate_and_continue_from_the_best_spec(tmp_path):
 
 def test_attempts_stop_at_the_cap_until_the_hints_change(tmp_path):
     l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1)
+    # The cap, not the plateau: each attempt improves on the best coverage so far.
+    gate_sequence(ops, 'fn_00401000', [0.55, 0.56, 0.57, 0.58])
     for _ in range(10):
         l.tick()
         clock['now'] += 1
@@ -729,6 +732,54 @@ def test_terminal_rows_from_an_older_harness_reopen_but_accepted_rows_stay_done(
     assert sorted(lane.plan(candidates, rows, harness='new')) == ['fn_e', 'fn_f']
 
 
+def test_pass_unaccepted_is_key_aware_and_same_key_rows_are_harness_independent():
+    candidates = {'fn_same': candidate(100, 0.55), 'fn_changed': candidate(100, 0.55, key='new')}
+    rows = {'fn_same': {'key': 'k1', 'status': 'pass-unaccepted'},
+            'fn_changed': {'key': 'old', 'status': 'pass-unaccepted'}}
+    assert lane.plan(candidates, rows, harness='H1') == ['fn_changed']
+    assert lane.plan(candidates, rows, harness='H2') == ['fn_changed']
+
+
+def test_a_legacy_plateau_without_a_harness_digest_does_not_suppress_forever():
+    candidates = {'fn_a': candidate(100, 0.5)}
+    rows = {'fn_a': {'key': 'k1', 'attempts': attempts_under('H1', 2),
+                     'plateau': {'coverage': 0.5, 'obligation': 'input', 'at': 1}}}
+    assert lane.plan(candidates, rows, harness='H1') == ['fn_a']
+
+
+def test_best_spec_coverage_sets_the_priority_band_but_not_the_baseline():
+    candidates = {'fn_big': candidate(22766, 0.1021, key='k1'),
+                  'fn_small': candidate(271, 0.3977, key='k1')}
+    rows = {'fn_big': {'key': 'k1', 'best': {'coverage': 0.5923}}}
+    assert lane.plan(candidates, rows, harness='H') == ['fn_big', 'fn_small']
+
+
+def test_best_spec_coverage_from_other_hint_bytes_does_not_set_priority():
+    candidates = {'fn_big': candidate(22766, 0.1021, key='new'),
+                  'fn_small': candidate(271, 0.3977, key='new')}
+    rows = {'fn_big': {'key': 'old', 'best': {'coverage': 0.5923}}}
+    assert lane.plan(candidates, rows, harness='H') == ['fn_small', 'fn_big']
+
+
+def test_best_spec_priority_does_not_change_dispatch_baseline_or_prompt_coverage(tmp_path):
+    big, small = 'fn_00401000', 'fn_00402000'
+    candidates = {big: candidate(22766, 0.1021), small: candidate(271, 0.3977)}
+    l, _, launcher, _ = make_lane(tmp_path, candidates, workers=1)
+    best = tmp_path / 'best.json'
+    best.write_text('{"fixtures": [{"name": "kept"}]}')
+    l.state['functions'][big] = {'key': 'k1', 'best': {'spec': str(best), 'coverage': 0.5923,
+                                                       'model': 'p/cheap', 'detail': 'gate low-coverage'}}
+    l.tick()
+    assert launcher.started[0][0]['fn'] == big   # the ordering heuristic did fire
+    job, prompt, _ = launcher.started[0]
+    assert job['coverage'] == 0.1021
+    assert l.state['functions'][big]['baseline'] == 0.1021
+    assert 'Current coverage: 0.1021.' in prompt
+    assert 'Current coverage: 0.5923' not in prompt
+    assert 'reached coverage 0.5923' in prompt   # the prior-attempt note may still mention it
+    assert json.loads(Path(job['spec']).read_text()) == {'fixtures': [{'name': 'kept'}]}
+
+
 def test_ladder_position_comes_from_current_harness_attempts_only(tmp_path):
     l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1)
     l.state['functions']['fn_00401000'] = {'key': 'k1', 'attempts': attempts_under('old', 3)}
@@ -753,6 +804,8 @@ def test_new_attempts_still_start_from_the_best_spec_after_a_harness_change(tmp_
 
 def test_a_lane_stops_at_the_cap_per_harness_and_reopens_when_the_harness_changes(tmp_path):
     l, ops, launcher, clock = make_lane(tmp_path, {'fn_00401000': candidate(700)}, workers=1)
+    # The cap, not the plateau: coverage keeps improving across all six attempts.
+    gate_sequence(ops, 'fn_00401000', [0.51, 0.52, 0.53, 0.54, 0.55, 0.56])
     for _ in range(10):
         l.tick()
         clock['now'] += 1
@@ -894,6 +947,491 @@ def test_a_deferred_head_keeps_priority_when_its_provider_cools_down(tmp_path):
         (later, 'p/cheap'), (head, 'q/strong')]
 
 
+# --- input plateaus (2026-11-27) -----------------------------------------------------
+# Run 20261115T1250Z spent repeated model attempts on functions whose coverage never
+# moved (200 rows with no-new-reach attempts). Two consecutive no-progress attempts at
+# the same hint key and harness plateau the function: dispatch stops until the inputs
+# or the harness change, and the row records the precise obligation.
+
+def gate_sequence(ops, fn, coverages, status='low-coverage'):
+    results = iter(coverages)
+
+    def gate(fn_, spec, model):
+        coverage = next(results, coverages[-1])
+        ops.gates.append((fn_, model))
+        return {'status': status, 'coverage': coverage, 'prior_sha256': 'h' * 64,
+                'first_uncovered': ['0x00401aa0'], 'tool': probe.TOOL_VERSION}
+    ops.gate = gate
+
+
+def test_two_attempts_at_the_starting_coverage_plateau_before_the_attempt_cap(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, clock = make_lane(tmp_path, {fn: candidate(700, 0.5)}, workers=1)
+    gate_sequence(ops, fn, [0.5, 0.5, 0.5])
+    for _ in range(8):
+        l.tick()
+        clock['now'] += 1
+    assert len(launcher.started) == 2   # not MAX_ATTEMPTS (3): the plateau stops the third
+    row = l.state['functions'][fn]
+    assert row['plateau']['coverage'] == 0.5 and row['plateau']['harness'] == 'H1'
+    assert row['plateau']['obligation'] == 'input'
+    assert row['plateau']['first_uncovered'] == ['0x00401aa0']
+    names = [json.loads(x)['event'] for x in (l.dir / 'events.jsonl').read_text().splitlines()]
+    assert names.count('input-plateau') == 1
+
+
+def test_a_progress_attempt_resets_the_no_progress_count(tmp_path, monkeypatch):
+    monkeypatch.setattr(lane, 'MAX_ATTEMPTS', 6)
+    fn = 'fn_00401000'
+    l, ops, launcher, clock = make_lane(tmp_path, {fn: candidate(700, 0.5)}, workers=1)
+    gate_sequence(ops, fn, [0.55, 0.55, 0.6, 0.6, 0.6])
+    for _ in range(10):
+        l.tick()
+        clock['now'] += 1
+    # 0.55 over the 0.5 baseline and 0.6 over 0.55 are progress: the flat attempts never
+    # reach two in a row before the last one, so the plateau lands only after the fifth.
+    assert len(launcher.started) == 5
+    assert l.state['functions'][fn]['plateau']['coverage'] == 0.6
+
+
+def test_a_plateaued_function_is_skipped_by_the_plan_until_inputs_or_harness_change():
+    candidates = {'fn_a': candidate(100, 0.5)}
+    plateau = {'harness': 'H1', 'coverage': 0.5, 'obligation': 'input', 'at': 1}
+    rows = {'fn_a': {'key': 'k1', 'attempts': attempts_under('H1', 2), 'plateau': plateau}}
+    assert lane.plan(candidates, rows, harness='H1') == []
+    assert lane.plan(candidates, rows, harness='H2') == ['fn_a']          # harness release reopens
+    rows['fn_a']['key'] = 'k0'                                            # hint key moved on: reopens
+    assert lane.plan(candidates, rows, harness='H1') == ['fn_a']
+
+
+def test_a_plateaued_function_reopens_when_its_hints_change(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, clock = make_lane(tmp_path, {fn: candidate(700, 0.5)}, workers=1)
+    gate_sequence(ops, fn, [0.5, 0.5, 0.5])
+    for _ in range(6):
+        l.tick()
+        clock['now'] += 1
+    assert len(launcher.started) == 2
+    ops._candidates[fn]['key'] = 'k2'
+    clock['now'] += lane.CANDIDATE_REFRESH_SECONDS + 1
+    l.tick()
+    assert len(launcher.started) == 3
+
+
+def test_a_plateaued_function_reopens_on_a_harness_release(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, clock = make_lane(tmp_path, {fn: candidate(700, 0.5)}, workers=1)
+    gate_sequence(ops, fn, [0.5, 0.5, 0.5])
+    for _ in range(6):
+        l.tick()
+        clock['now'] += 1
+    assert len(launcher.started) == 2
+    ops.harness = 'H2'
+    clock['now'] += lane.CANDIDATE_REFRESH_SECONDS + 1
+    for _ in range(8):
+        l.tick()
+        clock['now'] += 1
+    # The harness release reopens the function. Comparability resets with the harness
+    # (2026-11-27 review): the first H2 attempt is the reference, so two further flat
+    # attempts — three H2 dispatches in all — re-plateau it under H2.
+    assert len(launcher.started) == 5
+    assert l.state['functions'][fn]['plateau']['harness'] == 'H2'
+
+
+def test_a_harness_release_resets_baseline_comparability(tmp_path):
+    """Review 2026-11-27: the baseline seeded under H1 must not judge H2 attempts.
+
+    The H1 baseline is higher (0.6) than everything H2 reaches. The first two H2
+    coverages are flat relative to each other (0.4, 0.4) but below it. Cross-harness
+    comparison would call both no-progress and plateau after two; harness-scoped
+    comparability treats the first H2 attempt as the reference, so the plateau
+    comes exactly one flat attempt later."""
+    fn = 'fn_00401000'
+    l, ops, launcher, clock = make_lane(tmp_path, {fn: candidate(700, 0.3)}, workers=1)
+    l.state['functions'][fn] = {
+        'key': 'k1', 'baseline': 0.6, 'baseline_harness': 'H1',
+        'attempts': [{'n': 0, 'model': 'q/strong', 'status': 'low-coverage', 'coverage': 0.6, 'harness': 'H1'}]}
+    ops.harness = 'H2'
+    gate_sequence(ops, fn, [0.4] * 6)
+
+    def h2_attempts():
+        return [a for a in l.state['functions'][fn]['attempts'] if a.get('harness') == 'H2']
+
+    def tick_until(done):
+        for _ in range(20):
+            if done():
+                return
+            l.tick()
+            clock['now'] += 1
+        raise AssertionError('timed out waiting for the lane')
+
+    tick_until(lambda: len(h2_attempts()) == 2)
+    # The H1 baseline must not plateau them: cross-harness comparison would call both
+    # flat attempts no-progress and stop here.
+    assert 'plateau' not in l.state['functions'][fn]
+    tick_until(lambda: len(h2_attempts()) == 3)
+    for _ in range(3):
+        l.tick()
+        clock['now'] += 1
+    # Reference attempt, then two flat no-progress attempts: exactly three H2 dispatches.
+    assert len(launcher.started) == 3
+    row = l.state['functions'][fn]
+    assert row['plateau']['harness'] == 'H2' and row['plateau']['coverage'] == 0.4
+    assert row['attempts'][0]['harness'] == 'H1'   # historical attempts stay for diagnostics
+
+
+def test_a_fresh_row_still_uses_its_candidate_coverage_baseline(tmp_path):
+    """The harness scoping must not defer first-lifecycle plateaus: the candidate scan
+    coverage is current-harness evidence, so two flat attempts plateau as before."""
+    fn = 'fn_00401000'
+    l, ops, launcher, clock = make_lane(tmp_path, {fn: candidate(700, 0.5)}, workers=1)
+    gate_sequence(ops, fn, [0.5, 0.5, 0.5])
+    for _ in range(6):
+        l.tick()
+        clock['now'] += 1
+    assert len(launcher.started) == 2
+    assert l.state['functions'][fn]['plateau']['harness'] == 'H1'
+
+
+def test_two_no_new_reach_attempts_record_an_import_transcript_obligation(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, clock = make_lane(tmp_path, {fn: candidate(700, 0.5)}, workers=1)
+    gate_sequence(ops, fn, [0.5, 0.5], status='no-new-reach')
+    for _ in range(6):
+        l.tick()
+        clock['now'] += 1
+    assert len(launcher.started) == 2
+    assert l.state['functions'][fn]['plateau']['obligation'] == 'import-transcript'
+
+
+def test_error_attempts_do_not_count_toward_the_plateau(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, clock = make_lane(tmp_path, {fn: candidate(700, 0.5)}, workers=1)
+    coverages = iter([0.5, None, 0.5])
+
+    def gate(fn_, spec, model):
+        coverage = next(coverages, 0.5)
+        ops.gates.append((fn_, model))
+        status = 'error' if coverage is None else 'low-coverage'
+        return {'status': status, 'coverage': coverage, 'prior_sha256': 'h' * 64, 'tool': probe.TOOL_VERSION}
+    ops.gate = gate
+    for _ in range(8):
+        l.tick()
+        clock['now'] += 1
+    # flat, error, flat: only one consecutive coverage-bearing no-progress pair is broken
+    # by the error, so no plateau after two attempts; the third attempt still dispatches.
+    assert len(launcher.started) == 3
+
+
+def test_a_plateau_is_recorded_once_not_on_every_tick(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, clock = make_lane(tmp_path, {fn: candidate(700, 0.5)}, workers=1)
+    gate_sequence(ops, fn, [0.5, 0.5, 0.5])
+    for _ in range(10):
+        l.tick()
+        clock['now'] += lane.CANDIDATE_REFRESH_SECONDS + 1
+    names = [json.loads(x)['event'] for x in (l.dir / 'events.jsonl').read_text().splitlines()]
+    assert names.count('input-plateau') == 1
+def test_only_one_worker_probes_a_provider_after_its_cooldown(tmp_path):
+    fns = ['fn_00401000', 'fn_00402000', 'fn_00403000']
+    l, _, launcher, clock = make_lane(
+        tmp_path, {fn: candidate(1000 - i, 0.58) for i, fn in enumerate(fns)}, workers=3)
+    for fn in fns:
+        l.state['functions'][fn] = {'key': 'k1', 'attempts': attempts_under('H1', 2)}
+    l.state['limited']['q'] = clock['now'] - 1
+    l.tick()
+    assert [(job['fn'], job['model']) for job, _, _ in launcher.started] == [(fns[0], 'q/strong')]
+
+
+def test_a_finished_probe_reopens_the_provider_to_normal_concurrency(tmp_path):
+    fns = ['fn_00401000', 'fn_00402000', 'fn_00403000']
+    l, _, launcher, clock = make_lane(
+        tmp_path, {fn: candidate(1000 - i, 0.58) for i, fn in enumerate(fns)}, workers=3)
+    for fn in fns:
+        l.state['functions'][fn] = {'key': 'k1', 'attempts': attempts_under('H1', 2)}
+    l.state['limited']['q'] = clock['now'] - 1
+    l.tick()
+    l.tick()
+    assert [(job['fn'], job['model']) for job, _, _ in launcher.started] == [
+        (fns[0], 'q/strong'), (fns[1], 'q/strong'), (fns[2], 'q/strong')]
+
+
+# --- explicit post-expiry probe identity ----------------------------------------------
+
+class ControlledLauncher(Launcher):
+    """Workers stay running until the test completes their handles."""
+
+    def __init__(self, tmp, **kw):
+        super().__init__(tmp, **kw)
+        self.handles = []
+
+    def start(self, job, prompt, agent):
+        handle = super().start(job, prompt, agent)
+        handle.code = None
+        self.handles.append(handle)
+        return handle
+
+
+class PartialAuthLauncher(WorkingLauncher):
+    """The worker writes real spec bytes, then the provider reports an auth failure."""
+
+    def start(self, job, prompt, agent):
+        handle = super().start(job, prompt, agent)
+        handle.infra_error = lambda: 'This API key has expired. Create a new API key in OpenCode Console'
+        return handle
+
+
+def high_rung_rows(l, fns):
+    for fn in fns:
+        l.state['functions'][fn] = {'key': 'k1', 'attempts': attempts_under('H1', 2)}
+
+
+def write_terminal_probe(job, fn, data=b'{"fixtures":[{"name":"checked"}]}'):
+    spec = Path(job['spec'])
+    spec.write_bytes(data)
+    spec.with_suffix('.probe-result.json').write_text(json.dumps({
+        'fn': fn, 'status': 'pass', 'spec_sha256': hashlib.sha256(data).hexdigest(),
+        'prior_sha256': 'h' * 64,
+    }))
+
+
+def test_a_stale_worker_neither_blocks_nor_clears_a_post_expiry_probe(tmp_path):
+    fns = ['fn_00401000', 'fn_00402000']
+    l, _, _, clock = make_lane(
+        tmp_path, {fn: candidate(1000 - i, 0.58) for i, fn in enumerate(fns)}, workers=1)
+    l.launcher = ControlledLauncher(tmp_path)
+    high_rung_rows(l, fns)
+    l.tick()
+    assert len(l.launcher.started) == 1
+    old_job = l.launcher.started[0][0]
+    assert 'probe_key' not in old_job
+
+    expiry = clock['now'] - 1
+    l.state['limited']['q'] = expiry
+    l.workers = 2
+    l.tick()
+    assert len(l.launcher.started) == 2
+    probe_job = l.launcher.started[1][0]
+    assert (probe_job['probe_key'], probe_job['probe_expiry']) == ('q', expiry)
+
+    l.launcher.handles[0].code = 0       # the older worker finishes first
+    l.tick()
+    assert l.state['limited']['q'] == expiry
+    l.launcher.handles[1].code = 0       # the tagged post-expiry probe validates it
+    l.tick()
+    assert 'q' not in l.state['limited']
+
+
+def test_a_terminal_probe_auth_error_repauses_but_still_gates_the_snapshot(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, _, clock = make_lane(tmp_path, {fn: candidate(1000, 0.58)}, workers=1)
+    l.launcher = ControlledLauncher(tmp_path)
+    high_rung_rows(l, [fn])
+    l.state['limited']['q'] = clock['now'] - 1
+    l.tick()
+    job, handle, _ = l.running[0]
+    write_terminal_probe(job, fn)
+    handle.infra_error = lambda: 'This API key has expired. Create a new API key in OpenCode Console'
+    l.tick()
+    assert l.state['limited']['q'] == pytest.approx(clock['now'] + lane.INFRA_PAUSE_SECONDS)
+    assert ops.gates == [(fn, 'q/strong')]
+
+
+def test_a_terminal_probe_does_not_clear_a_fresh_limit_generation(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, _, clock = make_lane(tmp_path, {fn: candidate(1000, 0.58)}, workers=1)
+    l.launcher = ControlledLauncher(tmp_path)
+    high_rung_rows(l, [fn])
+    expiry = clock['now'] - 1
+    l.state['limited']['q'] = expiry
+    l.tick()
+    job, handle, _ = l.running[0]
+    write_terminal_probe(job, fn)
+    l._pause('q/strong', 'quota', 1000)
+    clock['now'] += 1001
+    l.tick()
+    assert l.state['limited']['q'] == pytest.approx(expiry + 1001)
+    assert ops.gates == [(fn, 'q/strong')]
+
+
+def test_an_auth_error_after_partial_work_repauses_and_still_gates_the_spec(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, _, clock = make_lane(tmp_path, {fn: candidate(700)}, workers=1)
+    l.launcher = PartialAuthLauncher(tmp_path)
+    l.tick()
+    l.tick()
+    assert ops.gates == [(fn, 'p/cheap')]
+    assert l.state['limited']['p'] == pytest.approx(clock['now'] + lane.INFRA_PAUSE_SECONDS)
+
+
+def test_a_probe_completion_does_not_clear_a_fresh_limit_generation(tmp_path):
+    fn = 'fn_00401000'
+    l, _, _, clock = make_lane(tmp_path, {fn: candidate(1000, 0.58)}, workers=1)
+    l.launcher = ControlledLauncher(tmp_path)
+    high_rung_rows(l, [fn])
+    expiry = clock['now'] - 1
+    l.state['limited']['q'] = expiry
+    l.tick()
+    job = l.launcher.started[0][0]
+    assert (job['probe_key'], job['probe_expiry']) == ('q', expiry)
+    events = [json.loads(x) for x in (l.dir / 'events.jsonl').read_text().splitlines()]
+    dispatch = [event for event in events if event['event'] == 'dispatch'][-1]
+    assert (dispatch['probe_key'], dispatch['probe_expiry']) == ('q', expiry)
+
+    l._pause('q/strong', 'quota', 1000)   # a fresh limit replaces the probed generation
+    clock['now'] += 1001                  # even its expiry is now in the past
+    l.launcher.handles[0].code = 0
+    l.tick()
+    assert l.state['limited']['q'] == pytest.approx(expiry + 1001)
+
+
+def test_overlapping_probe_scopes_do_not_clear_each_other(tmp_path):
+    fns = ['fn_00401000', 'fn_00402000']
+    l, _, _, clock = make_lane(
+        tmp_path, {fn: candidate(1000 - i, 0.58) for i, fn in enumerate(fns)}, workers=1)
+    l.launcher = ControlledLauncher(tmp_path)
+    high_rung_rows(l, fns)
+    expiry = clock['now'] - 1
+    l.state['limited']['q'] = expiry
+    l.state['limited']['q/strong'] = expiry
+    l.tick()
+    first = l.launcher.started[0][0]
+    assert (first['probe_key'], first['probe_expiry']) == ('q', expiry)
+
+    l.launcher.handles[0].code = 0
+    l.tick()
+    assert 'q' not in l.state['limited']
+    assert l.state['limited']['q/strong'] == expiry
+    assert len(l.launcher.started) == 2
+    second = l.launcher.started[1][0]
+    assert (second['probe_key'], second['probe_expiry']) == ('q/strong', expiry)
+
+
+def start_tagged_probe(tmp_path):
+    fn = 'fn_00401000'
+    l, _, _, clock = make_lane(tmp_path, {fn: candidate(1000, 0.58)}, workers=1)
+    l.launcher = ControlledLauncher(tmp_path)
+    high_rung_rows(l, [fn])
+    expiry = clock['now'] - 1
+    l.state['limited']['q'] = expiry
+    l.tick()
+    job, handle, _ = l.running[0]
+    assert (job['probe_key'], job['probe_expiry']) == ('q', expiry)
+    return l, clock, job, handle, expiry
+
+
+@pytest.mark.parametrize('mode', ['timeout', 'stall', 'nonzero', 'stop'])
+def test_an_interrupted_probe_never_clears_the_pause(tmp_path, mode):
+    l, clock, _, handle, expiry = start_tagged_probe(tmp_path)
+    if mode == 'timeout':
+        clock['now'] += l.attempt_seconds + 1
+    elif mode == 'stall':
+        handle.last_activity = lambda: time.monotonic() - l.stall_seconds - 1
+    elif mode == 'nonzero':
+        handle.code = 1
+    else:
+        (l.run_dir / 'STOP').write_text('stop')
+    l.tick()
+    assert l.state['limited']['q'] == expiry
+
+
+def test_a_zero_exit_without_work_or_a_claim_does_not_validate_a_probe(tmp_path):
+    l, _, _, handle, expiry = start_tagged_probe(tmp_path)
+    Path(handle.log).write_text('')
+    handle.code = 0
+    l.tick()
+    assert l.state['limited']['q'] == expiry
+
+
+def paid_tier_probe_lane(tmp_path, first, second, key):
+    fns = ['fn_00401000', 'fn_00402000', 'fn_00403000']
+    l, _, _, clock = make_lane(
+        tmp_path, {fn: candidate(1000 - i, 0.58) for i, fn in enumerate(fns)}, workers=3)
+    l.launcher = ControlledLauncher(tmp_path)
+    l.ladder = [first, second]
+    expiry = clock['now'] - 1
+    l.state['limited'][key] = expiry
+    l.tick()
+    return l, [(job['model'], job.get('probe_key')) for job, _, _ in l.launcher.started]
+
+
+def test_a_paid_tier_probe_is_serialized_without_blocking_free_models(tmp_path):
+    _, started = paid_tier_probe_lane(tmp_path, 'p/paid', 'p/hy4-flash-free', 'p:paid')
+    assert started == [('p/paid', 'p:paid'), ('p/hy4-flash-free', None), ('p/hy4-flash-free', None)]
+
+
+def test_a_free_tier_probe_is_serialized_without_blocking_paid_models(tmp_path):
+    _, started = paid_tier_probe_lane(tmp_path, 'p/hy4-flash-free', 'p/paid', 'p:free')
+    assert started == [('p/hy4-flash-free', 'p:free'), ('p/paid', None), ('p/paid', None)]
+
+
+# --- simultaneous provider error rows -------------------------------------------------
+
+def error_row(error):
+    return {'type': 'error', 'error': error}
+
+
+GO_LIMIT_ROW = error_row({
+    'type': 'provider.go-limit', 'status': 429, 'retryAfterMs': 600000, 'message': GO_MONTHLY})
+AUTH_ROW = error_row({
+    'type': 'provider.auth', 'status': 403,
+    'message': 'You have run out of credits or need a Grok subscription.'})
+QUOTA_ROW = error_row({
+    'type': 'provider.quota', 'status': 429, 'retryAfterMs': 900000,
+    'message': 'The Token Plan usage limit has been reached: quota exhausted.'})
+
+
+class JsonLogLauncher(Launcher):
+    """A completed worker whose JSON event log is parsed by the real Opencode handle."""
+
+    def __init__(self, tmp, rows, **kw):
+        super().__init__(tmp, **kw)
+        self.rows = rows
+
+    def start(self, job, prompt, agent):
+        fake = super().start(job, prompt, agent)
+        with Path(fake.log).open('a', encoding='utf-8') as out:
+            out.write('\n')
+            for row in self.rows:
+                out.write(json.dumps(row) + '\n')
+        import cmre_farm
+        handle = cmre_farm.OpencodeHandle(None, fake.log)
+        handle.code = 0
+        handle.poll = lambda: handle.code
+        handle.kill = lambda: setattr(handle, 'killed', True)
+        return handle
+
+
+def test_independent_limit_and_auth_rows_are_classified_separately(tmp_path):
+    import cmre_farm
+    log = tmp_path / 'w.jsonl'
+    log.write_text(json.dumps(GO_LIMIT_ROW) + '\n' + json.dumps(AUTH_ROW) + '\n')
+    limit, infra = cmre_farm.OpencodeHandle(None, log).provider_errors()
+    assert 'usage limit' in limit[0] and limit[1] == 600
+    assert 'run out of credits' in infra
+
+
+def test_one_usage_limit_row_is_not_an_independent_infrastructure_error(tmp_path):
+    import cmre_farm
+    log = tmp_path / 'w.jsonl'
+    log.write_text(json.dumps(QUOTA_ROW) + '\n')
+    limit, infra = cmre_farm.OpencodeHandle(None, log).provider_errors()
+    assert 'Token Plan' in limit[0] and infra is None
+
+
+def test_an_independent_auth_error_pauses_the_provider_beside_a_tier_limit(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, _, clock = make_lane(tmp_path, {fn: candidate(700)}, workers=1)
+    l.launcher = JsonLogLauncher(tmp_path, [GO_LIMIT_ROW, AUTH_ROW])
+    l.tick()
+    l.tick()
+    assert l.state['limited']['p:paid'] == pytest.approx(clock['now'] + 600)
+    assert l.state['limited']['p'] == pytest.approx(clock['now'] + lane.INFRA_PAUSE_SECONDS)
+    assert ops.gates == [] and l.state['functions'][fn].get('attempts', []) == []
+    events = [json.loads(x)['event'] for x in (l.dir / 'events.jsonl').read_text().splitlines()]
+    assert 'model-limited' in events and 'model-unavailable' in events
+
+
 # --- memory bound of a varied spec -------------------------------------------------
 
 class _FakeMachine:
@@ -956,3 +1494,196 @@ def test_a_spec_at_the_expansion_limit_runs_and_one_over_is_refused_with_advice(
         probe.expand({'fixtures': [{'vary': [{'field': 'import_seed', 'range': [0, 25]},
                                              {'field': 'stack.0', 'range': [0, 25]}]}]}, 1,
                      _fake_context(0x100)[3])
+
+
+# --- probe selection cap and model-free re-gates (2026-11-27) ----------------------
+
+def test_a_gate_can_keep_well_over_48_fixtures_that_each_reach_new_code():
+    # 27 Nov: the lane's own best specs reached 0.91-0.96 original-only coverage on
+    # fn_005576e0/fn_00487f60, but 48 greedy picks kept only 0.55/0.53, exactly the
+    # coverage the gate recorded. The cap, not the authoring, was binding.
+    rows = [(f'f{i}', {'i': i}, {i}, 'return') for i in range(150)]
+    assert len(probe.select(rows, baseline=set())) == 150
+    assert probe.MAX_SELECTED >= 150
+    assert probe.TOOL_VERSION != 'input-probe/1'
+
+
+def _regate_lane(tmp_path, fn, gate, attempts=3, plateau=True, **row):
+    l, ops, launcher, clock = make_lane(tmp_path, {fn: candidate(9000, 0.55)}, gate={fn: gate})
+    spec = l.dir / 'specs' / f'{fn}-7.json'
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text('{"fixtures": [{"name": "a"}]}\n')
+    state = {'key': 'k1', 'bytes': 9000,
+             'attempts': [{'n': i, 'model': 'p/cheap', 'status': 'low-coverage', 'coverage': 0.55,
+                           'harness': 'H1'} for i in range(attempts)],
+             'best': {'spec': str(spec), 'coverage': 0.55, 'model': 'q/strong', 'detail': 'gate low-coverage'}}
+    if plateau:
+        state['plateau'] = {'at': 1, 'coverage': 0.55, 'harness': 'H1', 'obligation': 'input'}
+    state.update(row)
+    l.state['functions'][fn] = state
+    return l, ops, launcher, spec
+
+
+def test_a_best_spec_gated_by_an_older_probe_is_regated_without_a_model(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, spec = _regate_lane(tmp_path, fn, {'status': 'pass', 'coverage': 0.83})
+    l.tick()
+    assert launcher.started == []                         # no model time
+    assert ops.gates == [(fn, 'q/strong')]                # provenance keeps the authoring model
+    assert ops.applies == [(fn, 'h' * 64)]
+    row = l.state['functions'][fn]
+    assert row['status'] == 'accepted'
+    assert len(row['attempts']) == 3                      # a re-gate is not a model attempt
+    assert row['regates'][0]['status'] == 'pass' and row['regates'][0]['tool'] == probe.TOOL_VERSION
+    regated = [e for e in lane._events(l.dir / 'events.jsonl') if e['event'] == 'regate']
+    assert regated and regated[0]['fn'] == fn and regated[0]['of'] == str(spec)
+
+
+def test_a_regate_runs_once_per_probe_version_and_is_not_a_model_attempt(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': 'low-coverage', 'coverage': 0.58})
+    l.tick()
+    l.tick()
+    l.refresh(force=True)
+    l.tick()
+    assert ops.gates == [(fn, 'q/strong')]
+    row = l.state['functions'][fn]
+    assert row['best']['coverage'] == 0.58 and row['best']['probe_tool'] == probe.TOOL_VERSION
+    assert len(row['attempts']) == 3
+    assert launcher.started == []                         # attempts exhausted: no model either
+
+
+def test_a_regate_that_does_not_beat_the_plateau_keeps_it(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, spec = _regate_lane(tmp_path, fn, {'status': 'low-coverage', 'coverage': 0.55}, attempts=2)
+    l.tick()
+    l.refresh(force=True)
+    l.tick()
+    row = l.state['functions'][fn]
+    assert row['plateau']['harness'] == 'H1' and launcher.started == []
+    assert row['best']['spec'] == str(spec) and row['best']['probe_tool'] == probe.TOOL_VERSION
+    assert len(ops.gates) == 1
+
+
+@pytest.mark.parametrize('row', [{'status': 'accepted'}, {'status': 'fail', 'harness': 'H1'},
+                                 {'key': 'old'}, {'status': 'pass-unaccepted'}])
+def test_a_regate_skips_settled_or_stale_rows(tmp_path, row):
+    fn = 'fn_00401000'
+    l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': 'pass', 'coverage': 0.9}, **row)
+    l.tick()
+    assert all(model != 'q/strong' for _, model in ops.gates)
+
+
+def test_a_regate_needs_the_spec_file(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, spec = _regate_lane(tmp_path, fn, {'status': 'pass', 'coverage': 0.9})
+    spec.unlink()
+    l.tick()
+    assert ops.gates == []
+
+
+def test_a_regate_that_errors_is_retried_a_bounded_number_of_times(tmp_path):
+    # Review of 9d4ca8a: a timeout or crash marked the best spec as gated by the new probe,
+    # so one transient error lost the re-gate of fn_005576e0/fn_00487f60 for good.
+    fn = 'fn_00401000'
+    l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': 'error', 'error': 'TimeoutExpired'})
+    for _ in range(lane.REGATE_ERRORS + 2):
+        l.tick()
+    assert len(ops.gates) == lane.REGATE_ERRORS
+    row = l.state['functions'][fn]
+    assert [r['status'] for r in row['regates']] == ['error'] * lane.REGATE_ERRORS
+    assert 'status' not in row and len(row['attempts']) == 3
+
+
+@pytest.mark.parametrize('status', ['build-failed', 'nondeterministic', 'lift-blocked'])
+def test_a_regate_with_a_definite_non_pass_outcome_is_not_retried(tmp_path, status):
+    fn = 'fn_00401000'
+    l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': status})
+    l.tick()
+    l.tick()
+    assert len(ops.gates) == 1
+    assert l.state['functions'][fn]['best']['probe_tool'] == probe.TOOL_VERSION
+
+
+def test_a_regate_after_an_error_can_still_pass(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': 'error', 'error': 'MemoryError'})
+    l.tick()
+    ops.gate_result[fn] = {'status': 'pass', 'coverage': 0.83}
+    l.tick()
+    assert l.state['functions'][fn]['status'] == 'accepted' and len(ops.gates) == 2
+
+
+def test_a_function_a_regate_just_accepted_gets_no_model_worker(tmp_path):
+    # Review of 9d4ca8a: refresh queued the row, the re-gate accepted it, and dispatch then
+    # started a model job on an accepted function in the same tick.
+    fn = 'fn_00401000'
+    l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': 'pass', 'coverage': 0.83},
+                                       attempts=1, plateau=False)
+    l.tick()
+    assert l.state['functions'][fn]['status'] == 'accepted'
+    assert launcher.started == []
+
+
+def test_no_regate_runs_while_the_lane_has_no_workers(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': 'pass', 'coverage': 0.83})
+    l.workers = 0
+    l.tick()
+    assert ops.gates == []
+
+
+def test_one_regate_at_a_time_leaves_gate_threads_for_workers(tmp_path):
+    l, ops, launcher, clock = make_lane(tmp_path, {f'fn_0040{i}000': candidate(9000, 0.55) for i in range(1, 4)})
+    for i in range(1, 4):
+        fn = f'fn_0040{i}000'
+        spec = l.dir / 'specs' / f'{fn}-7.json'
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text('{"fixtures": []}\n')
+        l.state['functions'][fn] = {
+            'key': 'k1', 'attempts': [{'n': j, 'status': 'low-coverage', 'coverage': 0.55, 'harness': 'H1'}
+                                      for j in range(3)],
+            'best': {'spec': str(spec), 'coverage': 0.5 + i / 100, 'model': 'q/strong'}}
+    l.refresh(force=True)
+    l.gates = DeferredGates()
+    l.regate()
+    l.regate()
+    assert [job['fn'] for job, *_ in l.gating] == ['fn_00403000']   # best coverage first
+    assert lane.REGATE_JOBS == 1
+
+
+def test_a_regate_that_beats_the_plateau_reopens_model_work_from_the_better_spec(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': 'low-coverage', 'coverage': 0.58}, attempts=2)
+    l.tick()
+    row = l.state['functions'][fn]
+    assert 'plateau' not in row and row['best']['coverage'] == 0.58
+    assert row['baseline'] == 0.58   # a worker returning the seed unchanged is not progress
+    l.refresh(force=True)
+    l.tick()
+    assert len(launcher.started) == 1
+    job = launcher.started[0][0]
+    assert Path(job['spec']).read_bytes() == Path(row['best']['spec']).read_bytes()
+
+
+def test_a_regate_without_a_known_author_records_no_model(tmp_path, monkeypatch):
+    seen = []
+
+    class Done:
+        stdout = '{"status": "low-coverage", "coverage": 0.5}\n'
+
+    monkeypatch.setattr(lane.subprocess, 'run', lambda command, **kw: seen.append(command) or Done())
+    lane.CmreOps(tmp_path).gate('fn_00401000', tmp_path / 's.json', None)
+    assert '--model' not in seen[0]
+    lane.CmreOps(tmp_path).gate('fn_00401000', tmp_path / 's.json', 'p/cheap')
+    assert seen[1][-2:] == ['--model', 'p/cheap']
+
+
+class DeferredGates:
+    """Gates that never finish, to observe how many the lane keeps in flight."""
+
+    def submit(self, fn, *args):
+        class Pending:
+            def done(self):
+                return False
+        return Pending()

@@ -4,7 +4,8 @@ description: Translates assigned CM0102 functions (fn_XXXXXXXX IDs) to plain C w
 tools: Bash, PowerShell, Read, Write, Edit, Grep
 ---
 
-Receive function IDs from the parent. Inherit the parent's preflight. Follow
+Receive function IDs and the parent receipt path from the parent. Inherit the
+parent's preflight; session validation stays with the parent. Follow
 `docs/agent/C.md` for each ID in turn: `py -3.13 -m cmre brief fn_X`, write
 `recovery/c/fn_X.c` from the draft and listing, `py -3.13 -m cmre test fn_X --c`,
 and `py -3.13 -m cmre explain fn_X --c --case N` on a mismatch.

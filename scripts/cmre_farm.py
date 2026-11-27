@@ -854,6 +854,7 @@ class Farm:
             self.state['owner'] = config.owner
         self.state.setdefault('unavailable_models', {})
         self.state.setdefault('limited_providers', {})
+        self.state.setdefault('hint_proposals', {})
         self.deadline = None if config.hours is None else clock() + config.hours * 3600
         self.running = []          # (job, handle, started)
         self.pending = []          # requeued translate/fix jobs, highest priority first
@@ -1094,21 +1095,123 @@ class Farm:
         self.seen.add(job['fn'])
         self._event('acceptance-quarantined', fn=job['fn'], n=job['n'], reason=reason)
 
+    def _terminal_request(self, job, phase):
+        """The only request a terminal journal may remove is a direct RUN/requests child."""
+        if phase not in ('complete', 'failed', 'conflict') or not job.get('_request'):
+            return None
+        raw = job['_request']
+        if not isinstance(raw, str):
+            raise RuntimeError(f'terminal journal request path is not a string: {raw!r}')
+        try:
+            request = Path(raw).resolve()
+            requests = (self.run_dir / 'requests').resolve()
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError(f'terminal journal request path cannot be resolved: {raw!r}') from exc
+        if request.parent != requests:
+            raise RuntimeError(f'terminal journal request path is outside RUN/requests: {raw!r}')
+        return request
+
     def _terminal(self, job, phase):
         if '_transaction' not in job:
             return
+        request = self._terminal_request(job, phase)
         self._transaction(job, phase)
         if job.get('_resume_collect') and phase in ('complete', 'failed'):
             self.state.setdefault('resume_collected', {})[job['fn']] = job['_resume_collect']
-        if job.get('_request') and phase in ('complete', 'failed', 'conflict'):
-            Path(job['_request']).unlink(missing_ok=True)
+        if request is not None:
+            request.unlink(missing_ok=True)
+
+    @staticmethod
+    def _valid_journal_job(job):
+        return (isinstance(job, dict) and isinstance(job.get('fn'), str) and bool(job['fn'])
+                and type(job.get('n')) is int)
+
+    @staticmethod
+    def _terminal_journal_header(path):
+        """Parse only the controller-written header of a sealed terminal journal.
+
+        The machine-written key order is schema, phase, job, prior, candidate,
+        identity.  Nested lookalike keys are data, not evidence; malformed or
+        incomplete headers return None so reconciliation uses the full strict
+        journal parser instead.
+        """
+        with path.open('rb') as stream:
+            raw = stream.read(65536)
+        try:
+            text = raw.decode('utf-8')
+        except UnicodeDecodeError:
+            return None
+        decoder = json.JSONDecoder()
+
+        def skip_ws(pos):
+            while pos < len(text) and text[pos] in ' \t\r\n':
+                pos += 1
+            return pos
+
+        def expect(pos, char):
+            pos = skip_ws(pos)
+            if pos >= len(text) or text[pos] != char:
+                raise ValueError(f'expected {char!r} at journal offset {pos}')
+            return pos + 1
+
+        def value(pos):
+            pos = skip_ws(pos)
+            return decoder.raw_decode(text, pos)
+
+        def key(pos, expected):
+            found, end = value(pos)
+            if not isinstance(found, str) or found != expected:
+                raise ValueError(f'expected journal key {expected!r}')
+            return end
+
+        try:
+            pos = expect(0, '{')
+            pos = key(pos, 'schema')
+            pos = expect(pos, ':')
+            schema, pos = value(pos)
+            pos = expect(pos, ',')
+            pos = key(pos, 'phase')
+            pos = expect(pos, ':')
+            phase, pos = value(pos)
+            pos = expect(pos, ',')
+            pos = key(pos, 'job')
+            pos = expect(pos, ':')
+            job, pos = value(pos)
+            if not isinstance(job, dict):
+                raise ValueError('journal job is not an object')
+            pos = expect(pos, ',')
+            pos = key(pos, 'prior')
+            pos = expect(pos, ':')
+            pos = skip_ws(pos)
+            if pos >= len(text) or text[pos] != '{':
+                raise ValueError('journal prior is not an object')
+        except (ValueError, IndexError):
+            return None
+        if (schema != 'cmre-farm-candidate/1'
+                or phase not in ('complete', 'failed', 'conflict', 'reverify')):
+            return None
+        if not Farm._valid_journal_job(job):
+            return None
+        return phase, job
 
     def _reconcile_transactions(self):
         for path in sorted((self.run_dir / 'transactions').glob('*.json')):
+            terminal = self._terminal_journal_header(path)
+            if terminal is not None:
+                phase, job = terminal
+                request = self._terminal_request(job, phase)
+                self.counter = max(self.counter, job['n'])
+                if job.get('_resume_collect') and phase in ('complete', 'failed'):
+                    self.state.setdefault('resume_collected', {})[job['fn']] = job['_resume_collect']
+                if request is not None:
+                    request.unlink(missing_ok=True)
+                continue
             data = json.loads(path.read_text(encoding='utf-8'))
             if data.get('schema') != 'cmre-farm-candidate/1':
                 raise RuntimeError(f'unsupported candidate journal: {path}')
             job = data['job']
+            if not Farm._valid_journal_job(job):
+                raise RuntimeError(f'invalid candidate journal job header: {path}')
             if _identity(_decode_snapshot(data['candidate'])) != data['identity']:
                 raise RuntimeError(f'candidate journal identity mismatch: {path}')
             self.counter = max(self.counter, job['n'])
@@ -1827,7 +1930,13 @@ class Farm:
         if job['kind'] == 'translate':
             self.state.get('input_needed', {}).pop(fn, None)
         if job.get('_hint_evidence_needed'):
-            self.state.setdefault('hint_proposals', {})[fn] = job['_hint_evidence_needed']
+            # Pending until the inputs move on: the row binds the retained candidate so an
+            # input arrival (applied or superseded) re-gates it without a model call.
+            tested = self._transaction(job)['identity'] if '_transaction' in job else {}
+            self.state.setdefault('hint_proposals', {})[fn] = {
+                'state': 'pending', 'bytes': job.get('bytes', 0), 'source': job.get('source'),
+                'model': job['model'], 'source_sha256': tested.get('c'), 'at': time.time(),
+                **job['_hint_evidence_needed']}
             self._event('hint-evidence-needed', fn=fn, n=job['n'], **job['_hint_evidence_needed'])
             self._park(fn, detail)
             return
@@ -1892,12 +2001,52 @@ class Farm:
         self.frontier, self.last_scan = None, None
         self._event(event_name, fn=fn, **data)
 
+    def _reconcile_hint_proposals(self):
+        """Terminal states for private hint proposals, and input-needed rows for their candidates.
+
+        A proposal is pending while the canonical hints still have the identity it was
+        dispatched with. When the inputs move on — the proposal itself was applied, or
+        anything else replaced them — the proposal is terminal (`applied` / `superseded`),
+        and the input arrival must end in a recheck of the retained candidate or an explicit
+        deferred reason. The recheck reuses the input-needed machinery: the row's tested
+        identity is the dispatch-time hints, so the changed canonical hints are an arrival."""
+        for fn, row in list(self.state.get('hint_proposals', {}).items()):
+            if row.get('state', 'pending') != 'pending':
+                continue
+            if fn in self.state['accepted']:
+                row['state'] = 'accepted'
+                self._event('hint-proposal-closed', fn=fn, state='accepted')
+                continue
+            dispatch_hint = (row.get('dispatch_identity') or {}).get('hint')
+            hint = _read(self.root / 'recovery/hints' / f'{fn}.json')
+            current = _identity({'hint': hint})['hint']
+            if current == dispatch_hint:
+                continue   # no input arrival: the proposal still awaits validation
+            row['state'] = 'applied' if current == row.get('sha256') else 'superseded'
+            self._event('hint-proposal-closed', fn=fn, state=row['state'], hints_sha256=current)
+            if fn not in self.state['parked'] or fn in self.state.get('input_needed', {}):
+                continue
+            source = row.get('source')
+            if not source and (self.run_dir / 'src' / f'{fn}.c').exists():
+                # Rows recorded before the binding existed: the conventional retained candidate.
+                source = str(self.run_dir / 'src' / f'{fn}.c')
+            if source:
+                self.state.setdefault('input_needed', {})[fn] = {
+                    'bytes': row.get('bytes', 0), 'coverage': row.get('coverage'), 'source': source,
+                    'model': row.get('model', 'hand'), 'at': self.clock(), 'hints_sha256': dispatch_hint,
+                    **({'source_sha256': row['source_sha256']} if row.get('source_sha256') else {}),
+                    'from_proposal': row.get('receipt')}
+            else:
+                row['deferred'] = 'no retained-candidate binding; explicit retry required'
+                self._event('input-deferred', fn=fn, reason=row['deferred'])
+
     def _input_arrivals(self):
         """Prioritize rechecking parked candidates when their tested input identity changes."""
         now = self.clock()
         if self.last_input_check is not None and now - self.last_input_check < self.config.rescan_seconds:
             return
         self.last_input_check = now
+        self._reconcile_hint_proposals()
         ready = set()
         for fn, row in self.state.get('input_needed', {}).items():
             if fn in self.state['accepted'] or self._writer_busy(fn):
@@ -1943,6 +2092,42 @@ class Farm:
         self.state['parked'][fn] = {'detail': detail[:600],
                                     'models': [r['model'] for r in self.state['attempts'].get(fn, [])]}
         self.cmre.release(self.config.owner, [fn])
+
+    def _provider_errors(self, handle):
+        """(limit, infra) for a finished worker. Row-aware handles classify independent rows;
+        a method-per-detector double cannot say whether both hits were one row, so it keeps
+        the limit-first overlap rule (as the input lane does, 2026-11-27)."""
+        if hasattr(handle, 'provider_errors'):
+            return handle.provider_errors()
+        limit = getattr(handle, 'limit_error', lambda: None)()
+        if limit:
+            return limit, None
+        return None, getattr(handle, 'infra_error', lambda: None)()
+
+    def _limited_with_infra(self, job, limit, infra):
+        """Simultaneous independent rows: a usage limit and an auth/infra failure in one stream.
+        Both scopes pause — the limited provider/tier and the auth-failed model — but the job
+        spends no attempt and is requeued once, not once per error (2026-11-27 review)."""
+        detail = self._fix_evidence_error(job, before_dispatch=True)
+        if detail:
+            self._invalidate_fix(job, detail)
+        safe = not detail and (job['kind'] == 'audit' or self._running_inputs_match(job))
+        message, seconds = limit
+        provider = _limit_key(job['model'], message)
+        until = time.time() + max(60, seconds)
+        self.state['limited_providers'][provider] = {'until': until, 'message': message[:300]}
+        self._event('model-limited', provider=provider, model=job['model'], until=until,
+                    message=message[:300], fn=job['fn'], n=job['n'])
+        self.state['unavailable_models'][job['model']] = str(infra)[:300]
+        self._event('model-unavailable', model=job['model'], error=str(infra)[:300], fn=job['fn'], n=job['n'])
+        if not safe:
+            return
+        if job['kind'] == 'audit':
+            # The limit rule (requeue unconditionally) rather than the infra rule: dropping
+            # the audit because one of two independent errors had no auditor would lose work.
+            self.audit_queue.insert(0, job['fn'])
+            return
+        self._retry_worker(job)
 
     def _limited(self, job, message, seconds):
         """Provider usage limit: pause the provider, requeue the job, spend no attempt."""
@@ -2281,11 +2466,13 @@ class Farm:
                 continue
             if timed_out or stalled:
                 handle.kill()
-            limit = getattr(handle, 'limit_error', lambda: None)()
+            limit, infra = self._provider_errors(handle)
+            if limit and infra:
+                self._limited_with_infra(job, limit, infra)
+                continue
             if limit:
                 self._limited(job, *limit)
                 continue
-            infra = getattr(handle, 'infra_error', lambda: None)()
             if infra:
                 self._infra(job, infra)
                 continue
@@ -2908,7 +3095,12 @@ def parked_lane(fn, detail, state):
     if detail.startswith('BLOCKER') or detail.startswith('acceptance blocked'):
         return 'safeguard-blocker'
     if detail.startswith('private hint proposal'):
-        return 'hint-evidence'
+        proposal = state.get('hint_proposals', {}).get(fn) or {}
+        if proposal.get('state', 'pending') == 'pending':
+            return 'hint-evidence'
+        # Terminal (applied/superseded): validation is moot. A transformed row already
+        # classified as input-needed above; anything left needs an explicit retry.
+        return 'other'
     if re.match(r'(timeout after|stalled:|worker |mechanical:)', detail):
         return 'worker-failure'
     first = _FIRST.search(detail)
@@ -3908,6 +4100,86 @@ def input_lane_summary(run_dir):
     return {'running': len(running), 'accepted': len(accepted), 'accepted_bytes': accepted_bytes}
 
 
+def input_supply_queue(state, lane_rows=None, hint_identity=None, lane_harness=None, lane_key=None,
+                       lane_max_attempts=3):
+    """One ordered queue of all input-supply work, largest bytes first (2026-11-27).
+
+    Three supplies reconcile here: parked input-needed candidates the farm re-gates when
+    inputs arrive, pending private hint proposals awaiting the parent input lane, and
+    unlifted input-lane rows. Every item carries its disposition: a recheck pending or in
+    progress, or the explicit reason it is deferred. Terminal rows (accepted functions,
+    applied/superseded proposals with their recheck done, terminal lift states) leave the
+    queue. Terminal/plateau harness evidence matches only strict equality with the current
+    digest: legacy rows without a digest are not suppressed forever. A same-key
+    pass-unaccepted row is intentionally harness independent (inputs already passed; the
+    refusal is not input work), while changed inputs reopen it.
+    hint_identity(fn) -> the current canonical hint identity, for arrival detection."""
+    items = []
+    accepted = state.get('accepted', {})
+    parked = state.get('parked', {})
+    for fn, row in sorted(state.get('input_needed', {}).items()):
+        if fn in accepted:
+            continue
+        current = hint_identity(fn) if hint_identity else row.get('hints_sha256')
+        arrived = current != row.get('hints_sha256') or row.get('retry_requested')
+        items.append({'fn': fn, 'bytes': row.get('bytes', 0), 'lane': 'input-needed',
+                      'coverage': row.get('coverage'),
+                      'disposition': 'recheck-pending' if arrived else 'awaiting-inputs',
+                      'reason': ('inputs arrived; the farm re-gates the retained candidate' if arrived
+                                 else f"coverage {row.get('coverage')}; needs evidenced inputs"),
+                      'next': ('the farm re-gates by itself' if arrived
+                               else 'input lane authors inputs (scripts/cmre_input_lane.py)')})
+    for fn, row in sorted(state.get('hint_proposals', {}).items()):
+        if fn in accepted:
+            continue
+        proposal_state = row.get('state', 'pending')
+        if proposal_state == 'pending':
+            items.append({'fn': fn, 'bytes': row.get('bytes', 0), 'lane': 'hint-evidence',
+                          'coverage': None, 'disposition': 'awaiting-validation',
+                          'reason': 'private hint proposal awaits parent validation/application',
+                          'next': f"review {row.get('receipt')}; apply with scripts/cmre_hint_apply.py"})
+        elif row.get('deferred') and fn in parked:
+            items.append({'fn': fn, 'bytes': row.get('bytes', 0), 'lane': 'hint-evidence',
+                          'coverage': None, 'disposition': 'deferred', 'reason': row['deferred'],
+                          'next': f'py -3.13 scripts/cmre_farm.py retry RUN {fn} --reason "<what changed>"'})
+    terminal = ('accepted', 'pass-unaccepted', 'fail', 'lift-blocked', 'error', 'not-unlifted')
+    for fn, row in sorted((lane_rows or {}).items()):
+        if fn in accepted:
+            continue
+        same_key = lane_key(fn) == row.get('key') if lane_key else True
+        status = row.get('status')
+        if status == 'accepted' or (status == 'pass-unaccepted' and same_key):
+            continue
+        if status in terminal and same_key and (
+                lane_harness is None or row.get('harness') == lane_harness):
+            continue   # inputs cannot help this terminal lift state under the current harness
+        plateau = row.get('plateau') if same_key else None
+        if plateau and (lane_harness is None or plateau.get('harness') == lane_harness):
+            obligation = plateau.get('obligation', 'input')
+            uncovered = ', '.join(plateau.get('first_uncovered') or [])
+            items.append({'fn': fn, 'bytes': row.get('bytes', 0), 'lane': 'input-lane',
+                          'coverage': plateau.get('coverage'), 'disposition': 'plateaued',
+                          'reason': f"coverage plateau; {obligation} obligation"
+                                    + (f'; first uncovered {uncovered}' if uncovered else ''),
+                          'next': 'satisfied by new inputs or a harness release; otherwise expert review'})
+            continue
+        current_attempts = [attempt for attempt in row.get('attempts', [])
+                            if lane_harness is None or attempt.get('harness') == lane_harness]
+        coverage = (row.get('best') or {}).get('coverage', row.get('coverage'))
+        if same_key and len(current_attempts) >= lane_max_attempts:
+            items.append({'fn': fn, 'bytes': row.get('bytes', 0), 'lane': 'input-lane',
+                          'coverage': coverage, 'disposition': 'deferred',
+                          'reason': 'input attempts exhausted under the current harness; needs new inputs or a harness release',
+                          'next': 'expert input evidence or the next harness release'})
+        else:
+            reason = ('canonical inputs changed; the lane restarts input authoring' if not same_key
+                      else 'eligible for the input lane')
+            items.append({'fn': fn, 'bytes': row.get('bytes', 0), 'lane': 'input-lane',
+                          'coverage': coverage, 'disposition': 'queued', 'reason': reason,
+                          'next': 'no action; the lane screens or works it'})
+    return sorted(items, key=lambda item: (-item['bytes'], item['fn']))
+
+
 def status_line(s):
     models = ', '.join(f"{m} {v['passes']}/{v['attempts']}" for m, v in s['by_model'].items())
     return (f"accepted {s['accepted_functions']} fn / {s['accepted_bytes']} B in {s['hours']} h "
@@ -4145,6 +4417,52 @@ class OpencodeHandle:
         except OSError:
             return None
 
+    @staticmethod
+    def _error_data(line):
+        """The error object of a top-level OpenCode error row, or None."""
+        if '"type":"error"' not in line.replace(' ', ''):
+            return None
+        try:
+            row = json.loads(line)
+        except ValueError:
+            return None
+        data = row.get('error') if isinstance(row, dict) and row.get('type') == 'error' else None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _limit_error_data(data):
+        """Usage-limit classification for one error object, or None."""
+        message = str(data.get('message') or (data.get('data') or {}).get('message') or '')
+        body = str((data.get('response') or {}).get('body') or '')
+        if NO_ROUTE.search(f"{data.get('type', '')} {message}"):
+            return f"provider.no-route: {message}"[:300], NO_ROUTE_SECONDS
+        if data.get('status') == 429 or LIMIT_ERROR.search(f"{data.get('type', '')} {message}"):
+            if data.get('retryAfterMs'):
+                return message[:300], int(data['retryAfterMs']) // 1000
+            reset = re.search(r'resets in (?:(\d+)h)?\s*(?:(\d+)m)?', f'{message} {body}')
+            seconds = (int(reset.group(1) or 0) * 3600 + int(reset.group(2) or 0) * 60) if reset else 0
+            return message[:300], seconds or DEFAULT_LIMIT_SECONDS
+        return None
+
+    @staticmethod
+    def _infra_error_data(data):
+        """Auth/infrastructure classification for one error object, or None."""
+        message = str(data.get('message') or (data.get('data') or {}).get('message')
+                      or data.get('name') or data.get('type'))
+        nested = data.get('data') if isinstance(data.get('data'), dict) else {}
+        status = data.get('status', data.get('statusCode', nested.get('statusCode')))
+        if (status in (401, 402, 403) or data.get('type') == 'provider.auth'
+                or INFRA_ERROR.search(f"{message} {(data.get('response') or {}).get('body', '')}")):
+            return message
+        return None
+
+    @staticmethod
+    def _retry_limit(text):
+        pending = None
+        for line in text.splitlines():
+            pending = _scan_retry(pending, line)
+        return pending
+
     def limit_error(self):
         """(message, seconds until reset) for a provider usage/rate limit in the stream, or None."""
         try:
@@ -4152,28 +4470,36 @@ class OpencodeHandle:
         except OSError:
             return None
         for line in text.splitlines():
-            if '"type":"error"' not in line.replace(' ', ''):
+            data = self._error_data(line)
+            if data is None:
                 continue
-            try:
-                data = json.loads(line).get('error') or {}
-            except (ValueError, AttributeError):
-                continue
-            if not isinstance(data, dict):
-                continue
-            message = str(data.get('message') or (data.get('data') or {}).get('message') or '')
-            body = str((data.get('response') or {}).get('body') or '')
-            if NO_ROUTE.search(f"{data.get('type', '')} {message}"):
-                return f"provider.no-route: {message}"[:300], NO_ROUTE_SECONDS
-            if data.get('status') == 429 or LIMIT_ERROR.search(f"{data.get('type', '')} {message}"):
-                if data.get('retryAfterMs'):
-                    return message[:300], int(data['retryAfterMs']) // 1000
-                reset = re.search(r'resets in (?:(\d+)h)?\s*(?:(\d+)m)?', f'{message} {body}')
-                seconds = (int(reset.group(1) or 0) * 3600 + int(reset.group(2) or 0) * 60) if reset else 0
-                return message[:300], seconds or DEFAULT_LIMIT_SECONDS
-        pending = None
+            limit = self._limit_error_data(data)
+            if limit:
+                return limit
+        return self._retry_limit(text)
+
+    def provider_errors(self):
+        """(limit, infra), classified row by row.
+
+        One row matching both detectors is a usage limit only; an independent auth/infra
+        row is still returned beside that limit.
+        """
+        try:
+            text = self.log.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            return None, None
+        limit = infra = None
         for line in text.splitlines():
-            pending = _scan_retry(pending, line)
-        return pending
+            data = self._error_data(line)
+            if data is None:
+                continue
+            row_limit = self._limit_error_data(data)
+            row_infra = self._infra_error_data(data)
+            if row_limit and limit is None:
+                limit = row_limit
+            if row_infra and not row_limit and infra is None:
+                infra = row_infra
+        return limit or self._retry_limit(text), infra
 
     def pending_limit(self):
         """A provider limit the running worker is waiting out, or None. Reads only lines added
@@ -4202,22 +4528,12 @@ class OpencodeHandle:
         except OSError:
             return None
         for line in text.splitlines():
-            if '"type":"error"' not in line.replace(' ', ''):
+            data = self._error_data(line)
+            if data is None:
                 continue
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            data = row.get('error') if isinstance(row, dict) and row.get('type') == 'error' else None
-            if not isinstance(data, dict):
-                continue
-            message = str(data.get('message') or (data.get('data') or {}).get('message')
-                          or data.get('name') or data.get('type'))
-            nested = data.get('data') if isinstance(data.get('data'), dict) else {}
-            status = data.get('status', data.get('statusCode', nested.get('statusCode')))
-            if (status in (401, 402, 403) or data.get('type') == 'provider.auth'
-                    or INFRA_ERROR.search(f"{message} {(data.get('response') or {}).get('body', '')}")):
-                return message
+            infra = self._infra_error_data(data)
+            if infra:
+                return infra
         return None
 
     def poll(self):
@@ -4701,6 +5017,11 @@ def build_parser():
     ln.add_argument('--actionable', action='store_true', help='include bounded evidence and fixture-only lift candidates')
     ip = sub.add_parser('inputs', help='parked functions whose candidate ran clean but needs more test inputs')
     ip.add_argument('run_dir')
+    iq = sub.add_parser('input-supply', help='one ordered queue of all input-supply work: input-needed, '
+                                             'hint proposals and unlifted input-lane rows')
+    iq.add_argument('run_dir')
+    iq.add_argument('--json', action='store_true')
+    iq.add_argument('--top', type=int, default=20)
     rt = sub.add_parser('retry', help='return parked functions to the running farm after something changed')
     rt.add_argument('run_dir')
     rt.add_argument('fns', nargs='+', metavar='fn_XXXXXXXX')
@@ -4893,6 +5214,54 @@ def main(argv=None):
         for fn, row in rows:
             if fn in state['parked']:
                 print(f"{fn} {row.get('bytes', 0)}B coverage {row.get('coverage')} candidate {row.get('source')}")
+        return 0
+    if a.action == 'input-supply':
+        state = json.loads((run_dir / 'state.json').read_text(encoding='utf-8'))
+        lane_rows = {}
+        lane_state = run_dir / 'input-lane' / 'state.json'
+        try:
+            lane_rows = json.loads(lane_state.read_text(encoding='utf-8')).get('functions', {})
+        except (OSError, ValueError):
+            pass
+        # Rows recorded before bytes were kept get their size from the lane's dispatch events.
+        sizes = {}
+        for event in _read_events(run_dir / 'input-lane' / 'events.jsonl', 0)[0]:
+            if event.get('fn') and event.get('bytes'):
+                sizes.setdefault(event['fn'], event['bytes'])
+        for fn, row in lane_rows.items():
+            row.setdefault('bytes', sizes.get(fn, 0))
+
+        def hint_identity(fn):
+            return _identity({'hint': _read(ROOT / 'recovery/hints' / f'{fn}.json')})['hint']
+        lane_harness, lane_key, lane_max_attempts = None, None, 3
+        if lane_rows:
+            # A report with no input-lane rows must not depend on loading the full harness.
+            import importlib.util
+            lane_spec = importlib.util.spec_from_file_location(
+                'cmre_input_lane', Path(__file__).resolve().with_name('cmre_input_lane.py'))
+            input_lane = importlib.util.module_from_spec(lane_spec)
+            lane_spec.loader.exec_module(input_lane)
+            from cmre import recover
+
+            def current_lane_key(fn):
+                return input_lane.hint_key(_read(ROOT / 'recovery/hints' / f'{fn}.json'))
+            lane_harness, lane_key = recover.harness_digest(), current_lane_key
+            lane_max_attempts = input_lane.MAX_ATTEMPTS
+        queue = input_supply_queue(state, lane_rows, hint_identity=hint_identity,
+                                   lane_harness=lane_harness, lane_key=lane_key,
+                                   lane_max_attempts=lane_max_attempts)
+        if a.json:
+            print(json.dumps(queue, indent=1))
+            return 0
+        counts = {}
+        for item in queue:
+            counts[item['disposition']] = counts.get(item['disposition'], 0) + 1
+        for item in queue[:a.top]:
+            coverage = f" coverage {item['coverage']}" if item.get('coverage') is not None else ''
+            print(f"{item['fn']} {item['bytes']:>7} B {item['lane']:<13} {item['disposition']}{coverage}: "
+                  f"{item['reason']}")
+        print(f"{len(queue)} functions, {sum(i['bytes'] for i in queue)} B | "
+              + ', '.join(f'{k} {v}' for k, v in sorted(counts.items())))
         return 0
     if a.action == 'review':
         try:

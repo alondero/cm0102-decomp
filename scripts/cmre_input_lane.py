@@ -43,6 +43,9 @@ INFRA_PAUSE_SECONDS = 3600   # auth/key failure: pause the provider, retry hourl
 CANDIDATE_REFRESH_SECONDS = 600
 IDLE_REFRESH_SECONDS = 60     # an idle lane re-scans (about 7 s of CPU) at most this often
 SCREEN_JOBS = 2
+REGATE_JOBS = 1             # model-free re-gates in flight; the gate pool has max(2, workers) threads
+REGATE_ERRORS = 2           # gate errors (timeout, crash) tolerated per function and probe version
+REGATE_TRANSIENT = ('error', None)   # re-gate outcomes retried; any other gate status settles it
 SKIP_STATUSES = ('lift-blocked', 'fail', 'error', 'not-unlifted')
 WORKER_COMMANDS = ('brief', 'test', 'explain', 'show', 'disasm', 'family', 'work show')
 # Narrower than the farm's list: `rg --pre` runs a program and `sed -n` accepts `w FILE`/`-i`.
@@ -101,6 +104,12 @@ def _save(path, state):
     os.replace(tmp, path)
 
 
+def probe_tool():
+    """The input probe's tool version: a best spec gated by an older probe is re-gated once."""
+    import cmre_input_probe
+    return cmre_input_probe.TOOL_VERSION
+
+
 def current_attempts(row, harness):
     """Attempts made under this harness digest. Attempts with no digest predate the field."""
     if harness is None:
@@ -108,14 +117,38 @@ def current_attempts(row, harness):
     return [a for a in row.get('attempts', []) if a.get('harness') == harness]
 
 
+def no_progress_run(row, harness):
+    """Trailing consecutive coverage-bearing attempts that did not improve on the best
+    coverage reached before them (the pre-attempt baseline first). Error attempts have
+    no coverage: they neither count toward a plateau nor reset the run."""
+    baseline = row.get('baseline', row.get('coverage'))
+    best = float(baseline) if isinstance(baseline, (int, float)) and not isinstance(baseline, bool) else -1.0
+    trailing = []
+    for attempt in current_attempts(row, harness):
+        coverage = attempt.get('coverage')
+        if not isinstance(coverage, (int, float)) or isinstance(coverage, bool):
+            continue
+        if coverage > best:
+            best = coverage
+            trailing = []
+        else:
+            trailing.append(attempt)
+    return trailing
+
+
 def plan(candidates, rows, active=(), harness=None):
     """Functions to work, best first: near the coverage threshold, then larger.
 
     candidates: {fn: {'bytes', 'coverage' (None if never gated), 'key', 'status'}}.
     A function is skipped while active, after MAX_ATTEMPTS at its current hint key and
-    harness digest, or when its lifted gate cannot be helped by inputs (blocked lift,
-    mismatch, error). A terminal status set under an older harness reopens (the screen
-    re-runs it once); `accepted` stays done. harness=None ignores digests."""
+    harness digest, while its coverage plateau stands (two consecutive no-progress
+    attempts; FARM.md "Input lane"), or when its lifted gate cannot be helped by inputs
+    (blocked lift, mismatch, error). A terminal status set under an older harness reopens
+    (the screen re-runs it once); rows with no harness digest are legacy and also reopen.
+    `accepted` stays done. A same-key `pass-unaccepted` row is intentionally harness
+    independent: its inputs already passed the gate and acceptance refused for another
+    reason, so more input attempts cannot help; changed inputs reopen it. harness=None
+    ignores digests."""
     todo = []
     for fn, info in candidates.items():
         row = rows.get(fn, {})
@@ -127,10 +160,19 @@ def plan(candidates, rows, active=(), harness=None):
                 continue
             if status in SKIP_STATUSES and (harness is None or row.get('harness') == harness):
                 continue
+            plateau = row.get('plateau')
+            if plateau and (harness is None or plateau.get('harness') == harness):
+                continue
             if len(current_attempts(row, harness)) >= MAX_ATTEMPTS:
                 continue
         coverage = info.get('coverage')
-        band = round(coverage, 1) if coverage is not None else -1.0
+        priority = coverage
+        if row.get('key') == info['key']:
+            best_coverage = (row.get('best') or {}).get('coverage')
+            if (isinstance(best_coverage, (int, float)) and not isinstance(best_coverage, bool)
+                    and (priority is None or best_coverage > priority)):
+                priority = best_coverage   # ordering heuristic only; the prompt/baseline keep canonical coverage
+        band = round(priority, 1) if priority is not None else -1.0
         todo.append((-band, -info['bytes'], fn))
     return [fn for _, _, fn in sorted(todo)]
 
@@ -305,11 +347,43 @@ class Lane:
             key = f'{provider}:paid' if cmre_farm.FREE_EXEMPT.search(message or '') else provider
         self.state['limited'][key] = self.clock() + seconds
 
+    def _limit_keys(self, model):
+        """Provider/tier/model pause keys that apply to this model, broadest first."""
+        import cmre_farm
+        bare = model.split('#', 1)[0]
+        provider = bare.split('/', 1)[0]
+        tier = 'free' if cmre_farm._is_free_model(model) else 'paid'
+        return (provider, f'{provider}:{tier}', bare)
+
+    def _expired_probe(self, model):
+        """(key, expiry) of the broadest expired pause this model must probe, or None."""
+        now = self.clock()
+        for key in self._limit_keys(model):
+            until = self.state['limited'].get(key, 0)
+            if 0 < until <= now:
+                return key, until
+        return None
+
+    def _probe_blocked(self, model):
+        """Only a tagged post-expiry job blocks another probe of the same pause generation."""
+        probe = self._expired_probe(model)
+        return probe is not None and any((job.get('probe_key'), job.get('probe_expiry')) == probe
+                                         for job, _, _ in self.running)
+
+    def _clear_probe(self, job):
+        """Clear only the exact pause generation this tagged post-expiry job probed."""
+        key, expiry = job.get('probe_key'), job.get('probe_expiry')
+        if key is not None and self.state['limited'].get(key) == expiry:
+            self.state['limited'].pop(key, None)
+            return True
+        return False
+
     def _model(self, attempt):
         """The least busy available model of the first rung at or above the attempt that has one;
         a rung is a group `a|b`, a plain model a group of one."""
         for entry in self.ladder[min(attempt, len(self.ladder) - 1):] if self.ladder else []:
-            usable = [m for m in (g.strip() for g in entry.split('|')) if m and self._available(m)]
+            usable = [m for m in (g.strip() for g in entry.split('|'))
+                      if m and self._available(m) and not self._probe_blocked(m)]
             if usable:
                 return min(usable, key=lambda m: sum(1 for job, _, _ in self.running if job['model'] == m))
         return None
@@ -336,6 +410,89 @@ class Lane:
             elif info.get('coverage') is None and row.get('coverage') is not None:
                 info['coverage'] = row['coverage']   # this lane's own screen of the same hints
         self.queue = plan(self.candidates, self.state['functions'], self._busy(), self.harness)
+
+    def regate(self):
+        """Re-gate each function's best spec once per probe tool version, with no model.
+
+        A probe release can turn a spec the lane already holds into a pass: on 27 Nov
+        the 48-fixture cap kept 0.53-0.55 of specs whose fixtures reached 0.91-0.96.
+        A re-gate is not a model attempt. It counts toward neither MAX_ATTEMPTS nor a
+        plateau, and its result is applied exactly like a worker's (FARM.md "Input lane")."""
+        if self.stopping() or self.workers <= 0:
+            return   # workers 0 pauses the lane's gates too, not only its model jobs
+        tool = probe_tool()
+        busy = self._busy()
+        inflight = sum(1 for job, _, _, _ in self.gating if job.get('kind') == 'regate')
+        todo = []
+        for fn, info in self.candidates.items():
+            row = self.state['functions'].get(fn)
+            if (not row or fn in busy or row.get('key') != info['key'] or info.get('status') in SKIP_STATUSES
+                    or row.get('status') in ('accepted', 'pass-unaccepted', *SKIP_STATUSES)
+                    or row.get('pending_apply')):
+                continue
+            best = row.get('best') or {}
+            errors = sum(1 for r in row.get('regates', []) if r.get('tool') == tool
+                         and r.get('status') in REGATE_TRANSIENT)
+            if best.get('spec') and best.get('probe_tool') != tool and errors < REGATE_ERRORS:
+                todo.append((-(best.get('coverage') or 0), -info['bytes'], fn))
+        submitted = False
+        for _, _, fn in sorted(todo):
+            if inflight >= REGATE_JOBS:
+                break
+            info, best = self.candidates[fn], self.state['functions'][fn]['best']
+            try:
+                data = Path(best['spec']).read_bytes()
+            except OSError:
+                continue
+            self.state['counter'] += 1
+            n = self.state['counter']
+            spec = self.dir / 'specs' / f'{fn}-{n}.regate.json'
+            spec.parent.mkdir(parents=True, exist_ok=True)
+            spec.write_bytes(data)
+            job = {'fn': fn, 'n': n, 'kind': 'regate', 'model': best.get('model'),
+                   'bytes': info['bytes'], 'coverage': info.get('coverage'),
+                   'threshold': info.get('threshold', 0.6), 'spec': str(spec),
+                   'hints_sha256': info['hints_sha256'], 'key': info['key'],
+                   'seed_sha256': hashlib.sha256(data).hexdigest(), 'harness': self.harness,
+                   'regate_of': best['spec'], 'tool': tool}
+            self.event('regate', fn=fn, n=n, of=best['spec'], coverage=best.get('coverage'),
+                       bytes=info['bytes'], tool=tool)
+            self._submit_gate(job, '', None)
+            inflight += 1
+            submitted = True
+        if submitted:
+            self.save()
+
+    def _finish_regate(self, job, row, result):
+        fn, status, coverage = job['fn'], result.get('status'), result.get('coverage')
+        row.setdefault('regates', []).append(
+            {'n': job['n'], 'status': status, 'coverage': coverage, 'tool': job['tool'], 'of': job['regate_of'],
+             'at': self.clock(), 'harness': job.get('harness', self.harness)})
+        best = row.get('best') or {}
+        if coverage is not None and status in ('low-coverage', 'pass') and coverage > (best.get('coverage') or 0):
+            best = {**best, 'spec': job['spec'], 'coverage': coverage, 'model': job['model'],
+                    'detail': f"regate {status}; first uncovered {result.get('first_uncovered', [])[:4]}"}
+        if best and status not in REGATE_TRANSIENT:
+            row['best'] = {**best, 'probe_tool': job['tool']}   # an error leaves it for a bounded retry
+        plateau = row.get('plateau')
+        if (plateau and status == 'low-coverage' and isinstance(coverage, (int, float))
+                and coverage > (plateau.get('coverage') or 0)):
+            # Workers are seeded from the best spec, so a better seed is new progress.
+            row.pop('plateau')
+            row['baseline'], row['baseline_harness'] = coverage, job.get('harness', self.harness)
+            self.event('plateau-cleared', fn=fn, coverage=coverage, was=plateau.get('coverage'))
+        self.event('result', fn=fn, n=job['n'], model=job['model'], status=status, coverage=coverage,
+                   kind='regate')
+        if status == 'pass':
+            self._apply(fn, row, {'proposal': result['proposal'], 'expected': job['hints_sha256'],
+                                  'sha256': result.get('proposal_sha256'), 'bytes': job['bytes'],
+                                  'model': job['model'], 'coverage': coverage})
+        elif status == 'fail':
+            row['status'] = 'fail'
+            row['harness'] = job.get('harness', self.harness)
+            row['mismatches'] = result.get('mismatches', [])[:3]
+            self.event('lift-mismatch', fn=fn, mismatches=row['mismatches'])
+        self.save()
 
     def _screen(self, fn):
         """A never-gated function is gated once on its canonical hints before any model time."""
@@ -380,6 +537,12 @@ class Lane:
             if info is None or fn in self._busy():
                 self.queue.pop(0)
                 continue
+            settled = self.state['functions'].get(fn) or {}
+            if settled.get('key') == info['key'] and (
+                    settled.get('status') in ('accepted', 'pass-unaccepted') or settled.get('pending_apply')
+                    or (settled.get('status') in SKIP_STATUSES and settled.get('harness') == self.harness)):
+                self.queue.pop(0)   # settled since the queue was planned (a re-gate in this tick)
+                continue
             if info.get('coverage') is None:
                 if screens >= SCREEN_JOBS:
                     break   # bounded per tick: screens must not starve result handling
@@ -393,6 +556,23 @@ class Lane:
             if row.get('key') != info['key']:
                 row.clear()
                 row['key'] = info['key']
+            # The pre-attempt coverage is the plateau baseline: an attempt that does not
+            # improve on it is a no-progress attempt. Comparability is harness-scoped
+            # (2026-11-27 review): coverage reached under one harness is no evidence for
+            # progress under another, so a harness release resets the baseline and the
+            # first attempt under the new harness becomes the reference. Cleared with the
+            # row on a hint change; historical attempts stay for diagnostics.
+            if 'baseline_harness' not in row:
+                if row.get('attempts'):
+                    # Predates harness-scoped baselines: the seeding harness is unknown.
+                    row.pop('baseline', None)
+                else:
+                    row['baseline'] = info.get('coverage')
+                row['baseline_harness'] = self.harness
+            elif row['baseline_harness'] != self.harness:
+                row.pop('baseline', None)
+                row['baseline_harness'] = self.harness
+            row.setdefault('bytes', info['bytes'])
             attempts = row.setdefault('attempts', [])
             model = self._model(len(current_attempts(row, self.harness)))
             if model is None:
@@ -407,10 +587,13 @@ class Lane:
             seed = Path(best['spec']).read_bytes() if best and Path(best['spec']).exists() else None
             seed = seed or (json.dumps(EMPTY_SPEC, indent=1) + '\n').encode()
             spec.write_bytes(seed)
+            probe = self._expired_probe(model)
             job = {'fn': fn, 'n': n, 'kind': 'inputs', 'model': model, 'bytes': info['bytes'],
                    'coverage': info.get('coverage'), 'threshold': info.get('threshold', 0.6),
                    'spec': str(spec), 'hints_sha256': info['hints_sha256'], 'key': info['key'],
                    'seed_sha256': hashlib.sha256(seed).hexdigest(), 'harness': self.harness}
+            if probe is not None:
+                job['probe_key'], job['probe_expiry'] = probe
             if best:
                 job['prior'] = {'model': best.get('model'), 'coverage': best.get('coverage'),
                                 'detail': best.get('detail', '')}
@@ -421,7 +604,10 @@ class Lane:
                                           'current cases miss; try different record shapes or selectors'}
             handle = self.launcher.start(job, prompt(self.root, job), agent_text(self.root, job))
             self.running.append((job, handle, self.clock()))
-            self.event('dispatch', fn=fn, n=n, model=model, bytes=info['bytes'], coverage=info.get('coverage'))
+            event = {'fn': fn, 'n': n, 'model': model, 'bytes': info['bytes'], 'coverage': info.get('coverage')}
+            if probe is not None:
+                event.update(probe_key=probe[0], probe_expiry=probe[1])
+            self.event('dispatch', **event)
             self.save()
         self.queue = deferred + self.queue
 
@@ -439,7 +625,12 @@ class Lane:
                 if terminal is not None:
                     snapshot, status = terminal
                     handle.kill()
-                    self._record_limit(job, handle)
+                    limit, infra = self._provider_errors(handle)
+                    limited = self._record_limit(job, limit)
+                    if infra:
+                        self._record_infra(job, infra)
+                    if not limited and not infra:
+                        self._clear_probe(job)   # a completed tagged probe used the provider
                     self._submit_gate({**job, 'spec': str(snapshot)}, status, 'probe-complete')
                     continue
                 if hasattr(handle, 'pending_limit') and handle.pending_limit():
@@ -454,7 +645,7 @@ class Lane:
                 else:
                     still.append((job, handle, started))
                 continue
-            self._worker_done(job, handle, None)
+            self._worker_done(job, handle, None, code)
         self.running = still
 
     def _snapshot_terminal_probe(self, job):
@@ -482,8 +673,19 @@ class Lane:
         found = RESULT.findall(text.replace('\\n', '\n'))
         return found[-1] if found else ''
 
-    def _record_limit(self, job, handle):
+    def _provider_errors(self, handle):
+        """(limit, infra); real handles classify overlapping rows, test doubles may not."""
+        if hasattr(handle, 'provider_errors'):
+            return handle.provider_errors()
         limit = handle.limit_error() if hasattr(handle, 'limit_error') else None
+        infra = handle.infra_error() if hasattr(handle, 'infra_error') else None
+        if limit and infra:
+            # A method-per-detector double cannot say whether both hits were one row. Keep the
+            # lane's limit-first overlap rule; independent rows need the row-aware provider_errors API.
+            infra = None
+        return limit, infra
+
+    def _record_limit(self, job, limit):
         if not limit:
             return False
         message, seconds = limit
@@ -502,23 +704,30 @@ class Lane:
         """A key/auth failure covers every model of the provider, free or paid."""
         self.state['limited'][model.split('/', 1)[0]] = self.clock() + seconds
 
-    def _worker_done(self, job, handle, interrupted):
+    def _record_infra(self, job, infra):
+        """Pause the provider for an auth/infrastructure error, whether or not work was written."""
+        self._pause_provider(job['model'], infra, INFRA_PAUSE_SECONDS)
+        self.event('model-unavailable', fn=job['fn'], n=job['n'], model=job['model'],
+                   seconds=INFRA_PAUSE_SECONDS, error=str(infra)[:300])
+        self.save()
+
+    def _worker_done(self, job, handle, interrupted, code=None):
         self.wake = True   # a worker ended: its function may return to the queue on the next refresh
-        # Limits first, as in the farm: a quota limit can also match the infra pattern.
-        if self._record_limit(job, handle):
-            if not self._spec_changed(job):
-                return   # not an attempt: the function returns to the queue on the next refresh
-        else:
-            infra = handle.infra_error() if hasattr(handle, 'infra_error') else None
-            if infra and not self._spec_changed(job):
-                # A provider/auth failure (2026-11-21 23:04: "401 api_key_expired") is not an attempt.
-                self._pause_provider(job['model'], infra, INFRA_PAUSE_SECONDS)
-                self.event('model-unavailable', fn=job['fn'], n=job['n'], model=job['model'],
-                           seconds=INFRA_PAUSE_SECONDS, error=str(infra)[:300])
-                self.save()
-                return
+        limit, infra = self._provider_errors(handle)
+        limited = self._record_limit(job, limit)
+        changed = self._spec_changed(job)
+        if infra:
+            # A provider/auth failure is never proof of recovery, even after partial work.
+            # Written bytes still go through the gate below.
+            self._record_infra(job, infra)
+        if (limited or infra) and not changed:
+            return   # not an attempt: the function returns to the queue on the next refresh
+        claimed = self._worker_line(handle)
+        completed = interrupted is None and code == 0
+        if not limited and not infra and completed and (changed or claimed):
+            self._clear_probe(job)
         # A limit that ends a worker after it wrote a new spec still gates that work.
-        self._submit_gate(job, self._worker_line(handle), interrupted)
+        self._submit_gate(job, claimed, interrupted)
 
     def _submit_gate(self, job, claimed, interrupted):
         future = self.gates.submit(self.ops.gate, job['fn'], Path(job['spec']), job['model'])
@@ -557,6 +766,8 @@ class Lane:
             self.save()
             return
         self.wake = True
+        if job.get('kind') == 'regate':
+            return self._finish_regate(job, row, result)
         attempt = {'n': job['n'], 'model': job['model'], 'status': status, 'coverage': coverage,
                    'claimed': claimed, 'interrupted': interrupted, 'at': self.clock(),
                    'harness': job.get('harness', self.harness)}
@@ -565,9 +776,22 @@ class Lane:
         if coverage is not None and status in ('low-coverage', 'pass') and (
                 best is None or coverage > (best.get('coverage') or 0)):
             row['best'] = {'spec': job['spec'], 'coverage': coverage, 'model': job['model'],
-                           'detail': f"gate {status}; first uncovered {result.get('first_uncovered', [])[:4]}"}
+                           'detail': f"gate {status}; first uncovered {result.get('first_uncovered', [])[:4]}",
+                           'probe_tool': result.get('tool')}
         self.event('result', fn=fn, n=job['n'], model=job['model'], status=status, coverage=coverage,
                    claimed=claimed, interrupted=interrupted)
+        harness = job.get('harness', self.harness)
+        trailing = no_progress_run(row, harness)
+        if len(trailing) >= 2 and row.get('plateau', {}).get('harness') != harness:
+            # Two consecutive no-progress attempts: repeated same-coverage dispatches stop
+            # here instead of spending the rest of the ladder (FARM.md "Input lane").
+            obligation = ('import-transcript' if all(a.get('status') == 'no-new-reach' for a in trailing[-2:])
+                          else 'input')
+            row['plateau'] = {'at': self.clock(), 'coverage': trailing[-1].get('coverage'),
+                              'harness': harness, 'obligation': obligation,
+                              'first_uncovered': result.get('first_uncovered', [])[:4]}
+            self.event('input-plateau', fn=fn, coverage=trailing[-1].get('coverage'),
+                       obligation=obligation, first_uncovered=row['plateau']['first_uncovered'])
         if status == 'pass':
             pending = {'proposal': result['proposal'], 'expected': job['hints_sha256'],
                        'sha256': result.get('proposal_sha256'), 'bytes': job['bytes'], 'model': job['model'],
@@ -611,6 +835,8 @@ class Lane:
         self.retry_applies()
         idle = not self.queue and not self.running and not self.gating
         self.refresh(force=idle and self.wake, idle=idle)
+        self.regate()
+        self.process_gates()
         self.dispatch()
         self.save()
 
@@ -720,7 +946,7 @@ class CmreOps:
     def gate(self, fn, spec, model):
         proposal = spec.with_suffix('.lane-proposal.json')
         command = [sys.executable, str(self.root / 'scripts/cmre_input_probe.py'), 'gate', fn, str(spec),
-                   '--proposal', str(proposal), '--model', model]
+                   '--proposal', str(proposal), *(['--model', model] if model else [])]
         try:
             done = subprocess.run(command, cwd=self.root, env=child_env(), capture_output=True, text=True, encoding='utf-8',
                                   errors='replace', timeout=3600)

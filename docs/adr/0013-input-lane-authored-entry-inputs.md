@@ -49,7 +49,8 @@ disables it; `set` changes it live).
 3. **The lane decides; the worker never does.** After the worker exits, the
    lane re-runs `cmre_input_probe.py gate` itself. That gate runs the spec's
    fixtures on the original side only and keeps those that reach instructions
-   the current cases do not, plus one returning fixture when none returns (at most 48 in all). It
+   the current cases do not, plus one returning fixture when none returns (at most
+   192 in all since amendment 1; originally 48). It
    **appends** them to the current hints in a private proposal and runs the
    unchanged lifted gate on that proposal. A worker's `FARM-RESULT` line is
    only recorded. The gate runs in a small thread pool beside dispatch, so a
@@ -91,8 +92,9 @@ and worker logs stay local under `RUN/input-lane/`.
   1/2 (`difftest.make_case`), so about 300 random cases are replaced and the
   random stream changes. A lift that differed from the original only on a
   dropped random case could therefore pass. This is a property of the existing
-  input design, not something new to the lane. The lane bounds it by adding at
-  most 48 fixtures, chosen because they reach new instructions. The C
+  input design, not something new to the lane. The lane adds only fixtures
+  chosen because they reach new instructions. The fixture count does not change
+  the share of replaced random cases (one half once any fixture exists). The C
   translation of each such lift is gated against the original again, and it is
   audited after acceptance.
 - Synthetic inputs may reach states the game never produces. That is the same
@@ -118,3 +120,30 @@ and worker logs stay local under `RUN/input-lane/`.
 - Measure the lane in bytes moved out of `unlifted` (`cmre pipeline survey`).
   If a model rung's attempts rarely pass, change the ladder with `set`, not the
   gate.
+
+## Amendment 1 (2026-11-27): selection cap 192 and model-free re-gates
+
+The original cap of 48 appended fixtures was binding rather than protective. On
+27 Nov the lane's own best specs for `fn_005576e0` and `fn_00487f60` reached
+0.9583 and 0.9068 of their instructions on the original side, but 48 greedy picks
+kept 0.5509 and 0.5283, the coverage their gates recorded. With 96 picks they
+keep 0.8341 and 0.7142, and with 192 all of it. Across the 102 measurable open
+lane rows, 5 functions (95,827 bytes) clear the threshold at 192 picks against
+3 at 48.
+
+`difftest.make_case` draws a fixture or capture for one half of the cases as soon
+as one exists, whatever the count, so the cap never bounded the replaced share of
+random cases. It only bounds effectiveness: at 192 fixtures each is drawn about
+1.5 times among the ~300 fixture cases. The unchanged lifted gate still decides
+on the cases actually drawn. This is tooling (`scripts/cmre_input_probe.py`),
+not a harness module: the harness digest and existing accepted evidence are
+unchanged.
+
+The probe is now `input-probe/2` and reports its version on every gate. The lane
+re-gates each function's stored best spec once per probe version with no model
+call, one at a time, and applies a pass exactly as it applies a worker's. A
+re-gate is not a model attempt. A gate error is retried at most twice per probe
+version. A re-gate that raises coverage above a plateau clears the plateau,
+because the next worker is seeded from that better spec. Functions whose specs need more than
+192 fixtures (`fn_004b4850`: 427) are limited by the random fixture draw itself;
+running every fixture deterministically would be a harness release under ADR 0007.

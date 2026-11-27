@@ -121,6 +121,12 @@ callees as explicit boundaries. C acceptance does not establish composed executi
      `cmre accept fn_X --c` requires retained evidence that a changed base and
      a changed exponent each produce a mismatch at O0 and O2 for every call.
      If a control survives, add evidenced `c_hints` fixtures that reach it.
+   - Operand-evidence inputs: prove the unmutated candidate passes the same
+     enlarged corpus before using a fixture as mutant evidence. A fixture that
+     makes the baseline fail is translation-defect evidence; keep it local,
+     hold or repair the source, and re-run mutants after that repair. Batch one
+     function's fixture additions into one append-only proposal: acceptance
+     computes every uncached mutant while holding the serial writer lease.
    - A call to `0x00945934` (CRT `exit`) or `0x00945945` (`_exit`) does not return
      ([ADR 0014](../adr/0014-crt-exit-does-not-return.md)): it ends in `ExitProcess`.
      Write `cm_fn_00945934(status);` (or `cm_fn_00945945(status);`) as the last
