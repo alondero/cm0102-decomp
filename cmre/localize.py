@@ -5,7 +5,6 @@ from __future__ import annotations
 from itertools import zip_longest
 import json
 from pathlib import Path
-import random
 import struct
 import tempfile
 
@@ -191,6 +190,23 @@ def _register_names(profile, returns):
     return tuple(name for name in emu.REG_NAMES if name in selected) + ("fpcw", "fp_depth", "st0")
 
 
+def _gate_case(va, opts, original, region, index):
+    """The gate's input for case number `index`, replayed as `difftest.explain` does:
+    a hinted input directly (number >= opts.cases, ADR 0015), or the random stream
+    up to that case with its discovery runs. Leaves `original` armed for that case."""
+    original_image = image.primary()
+    globals_seen = set()
+    for number, case, discovering in difftest.gate_cases(opts, globals_seen, difftest.arena_templates(),
+                                                         only=index):
+        own = difftest._attribute(original, opts, discovering, region)
+        if number == index:
+            return case
+        result = original.run(va, case, opts.budget)
+        if discovering:
+            globals_seen |= difftest._global_reads(result, original_image, own)
+    raise ValueError(f"case {index} is not in this gate")
+
+
 def _replay(va, lifted, built, opts, profile, returns, mismatch):
     original_image = image.primary()
     region = lifted.va, lifted.region_end
@@ -203,18 +219,7 @@ def _replay(va, lifted, built, opts, profile, returns, mismatch):
     if profile == "semantic":
         difftest._stop_indirect(original, recovered, region, built, recover._indirect_calls(lifted))
 
-    rng = random.Random(opts.seed)
-    templates = difftest.arena_templates()
-    globals_seen = set()
-    index = mismatch["case"]
-    for prior in range(index + 1):
-        case = difftest.make_case(rng, opts, sorted(globals_seen), templates)
-        own = difftest._discovery(original, opts, prior, region)
-        if prior == index:
-            break
-        result = original.run(va, case, opts.budget)
-        if prior < opts.discovery:
-            globals_seen |= difftest._global_reads(result, original_image, own)
+    case = _gate_case(va, opts, original, region, mismatch["case"])
 
     entries = difftest._entries()
     registers = ()

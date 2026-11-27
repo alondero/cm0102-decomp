@@ -37,7 +37,8 @@ The gate runs every hinted input once, deterministically, before the random case
 - `difftest.explain` accepts case numbers `0 .. cases + input_cases - 1` and
   refuses others. It replays a hinted input directly, building no other case,
   and a random case exactly as before (`gate_cases(..., only=N)`).
-  `scripts/cmre_page_writes.py` follows the same replay order.
+  `scripts/cmre_page_writes.py` and `cmre localize` (`localize._gate_case`)
+  follow the same replay order, so a hinted mismatch is localized on its own input.
 - A capture missing from the local store now fails every gate of its function,
   not only gates whose random draw picked it.
 - `difftest.gate_cases` is the one generator. `run`, `explain`, the return

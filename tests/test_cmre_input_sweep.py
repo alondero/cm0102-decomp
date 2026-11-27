@@ -179,3 +179,19 @@ def test_replaying_one_case_builds_only_what_it_needs(monkeypatch):
     assert [n for n, _, _ in difftest.gate_cases(opts, set(), templates, only=7)] == [7]
     with pytest.raises(ValueError, match='capture'):
         list(difftest.gate_cases(opts, set(), templates))
+
+
+def test_localize_rebuilds_a_hinted_mismatch_case_not_a_random_one():
+    from cmre import image, localize
+    lifted = lift.discover(LEAP)
+    region = (lifted.va, lifted.region_end)
+    opts = difftest.Options.for_function(LEAP, {'cases': 4})
+    opts.hints = {'fixtures': year_fixtures(3)}
+    original = emu.Machine(image.primary(), watch=region)
+    case = localize._gate_case(LEAP, opts, original, region, 4 + 1)
+    assert case.stack[0] == 1991 and case.import_seed == 2
+    rng = random.Random(opts.seed)
+    expected = [difftest.make_case(rng, opts, [], difftest.arena_templates()) for _ in range(3)][2]
+    assert localize._gate_case(LEAP, opts, original, region, 2).stack == expected.stack
+    with pytest.raises(ValueError, match='case'):
+        localize._gate_case(LEAP, opts, original, region, 4 + 3)
