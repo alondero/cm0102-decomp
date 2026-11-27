@@ -1488,7 +1488,7 @@ def test_a_spec_at_the_expansion_limit_runs_and_one_over_is_refused_with_advice(
     spec = lambda n: {'fixtures': [{'zero': [], 'vary': [{'field': 'import_seed', 'range': [0, n]}]}]}
     out = probe.expand(spec(at), 0, _fake_context(0x100)[3])
     assert len(out) == at
-    with pytest.raises(ValueError, match=f'more than {at} fixtures.*gate'):
+    with pytest.raises(ValueError, match=f'more than {at} fixtures.*narrow the vary ranges'):
         probe.expand(spec(at + 1), 0, _fake_context(0x100)[3])
     with pytest.raises(ValueError, match=f'more than {at} fixtures'):
         probe.expand({'fixtures': [{'vary': [{'field': 'import_seed', 'range': [0, 25]},
