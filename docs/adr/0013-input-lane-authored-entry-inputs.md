@@ -96,7 +96,9 @@ and worker logs stay local under `RUN/input-lane/`.
   chosen because they reach new instructions. The fixture count does not change
   the share of replaced random cases (one half once any fixture exists). The C
   translation of each such lift is gated against the original again, and it is
-  audited after acceptance.
+  audited after acceptance. Since [ADR 0015](0015-hinted-inputs-run-once-per-gate.md)
+  every hinted input also runs once before the random cases; the replaced
+  random cases remain.
 - Synthetic inputs may reach states the game never produces. That is the same
   standing as the random cases and ADR 0008 fixtures: the original's own
   behaviour on that input is the oracle. Coverage measures how much of the
@@ -147,3 +149,6 @@ version. A re-gate that raises coverage above a plateau clears the plateau,
 because the next worker is seeded from that better spec. Functions whose specs need more than
 192 fixtures (`fn_004b4850`: 427) are limited by the random fixture draw itself;
 running every fixture deterministically would be a harness release under ADR 0007.
+[ADR 0015](0015-hinted-inputs-run-once-per-gate.md) is that release: every
+hinted input now runs once, the probe is `input-probe/3`, and the 192 cap bounds
+gate time rather than reach.

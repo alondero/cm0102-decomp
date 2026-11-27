@@ -88,6 +88,17 @@ def _control_cases(identity):
     return cases
 
 
+def _control_case_numbers(identity):
+    """Gate case numbers a witness may name: the pinned random cases, then one per pinned
+    hinted input fixture or capture, which the gate runs as case numbers cases + i."""
+    cases = _control_cases(identity)
+    hints = identity['options'].get('hints', {})
+    inputs = [hints.get(key, []) if isinstance(hints, dict) else None for key in ('fixtures', 'captures')]
+    if any(not isinstance(rows, list) for rows in inputs):
+        raise ValueError('Plan must pin its hinted inputs as lists in its execution identity')
+    return cases + sum(len(rows) for rows in inputs)
+
+
 def _plan(path):
     plan = _json(path)
     _fields(plan, ('schema', 'va', 'source', 'hints', 'identity', 'controls'), 'plan', optional=('required_stages',))
@@ -218,6 +229,7 @@ def _execute_control_stage(va, candidate, directory, gate, retain_build, expecte
 def _validate_control_report(report, va, source_sha256, identity):
     """Validate the existing gate's recorded execution scope without changing it."""
     cases = _control_cases(identity)
+    numbers = _control_case_numbers(identity)
     if (not isinstance(report, dict) or report.get('execution_identity') != identity['execution_identity']
             or report.get('source_sha256') != source_sha256 or report.get('profile') != 'semantic'
             or report.get('va') != f'{va:#010x}' or report.get('tier') != 'c'
@@ -228,7 +240,8 @@ def _validate_control_report(report, va, source_sha256, identity):
     for row in report['builds'].values():
         result = row.get('difftest', {})
         if (row.get('status') not in ('pass', 'fail') or type(result.get('cases')) is not int
-                or result['cases'] != cases or result.get('budget') != identity['options']['budget']
+                or result['cases'] != cases or result.get('input_cases', 0) != numbers - cases
+                or result.get('budget') != identity['options']['budget']
                 or type(result.get('seed')) is not int or result['seed'] != identity['options']['seed']
                 or result.get('inputs', 'v1') != identity['options']['inputs'] or result.get('profile') != 'semantic'
                 or not isinstance(result.get('mismatches'), list)
@@ -321,7 +334,7 @@ def _resume_controls(receipt, plan, texts, output, plan_sha256):
             _validate_control_builds(stage['builds'], directory, stage['source'], plan['identity'])
             if _json(directory / 'builds.json') != stage['builds']:
                 raise ValueError('Retained build report differs')
-            stage.update(_control_outcome(report, row['expect'], _control_cases(plan['identity'])))
+            stage.update(_control_outcome(report, row['expect'], _control_case_numbers(plan['identity'])))
     if 'artifact_index' in receipt:
         index_path = _check_pin(receipt['artifact_index'])
         if (index_path.resolve() != (output / 'artifact-index.json').resolve()
@@ -403,7 +416,7 @@ def run_plan(plan_path, output, *, resume=False, gate=None, identity=None, fence
             try:
                 report, builds = _execute_control_stage(va, candidate, directory, gate or recover.test_c,
                                                         retain_build or _retain_control_build, plan['identity'], check)
-                stage.update(_control_outcome(report, row['expect'], _control_cases(plan['identity'])))
+                stage.update(_control_outcome(report, row['expect'], _control_case_numbers(plan['identity'])))
                 stage.update(outcome='report', report=_pin(directory / 'report.json'), builds=builds)
             except (Exception, SystemExit) as exc:
                 stage.update(outcome='error', classification='unresolved', reason=type(exc).__name__, detail=str(exc), exit_status=2)

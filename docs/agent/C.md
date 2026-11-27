@@ -176,6 +176,8 @@ callees as explicit boundaries. C acceptance does not establish composed executi
      update the linked frame; do not enlarge scratch space to imitate it.
 3. `py -3.13 -m cmre test fn_X --c`. On a mismatch,
    `py -3.13 -m cmre explain fn_X --c --case N` shows that case side by side.
+   Case numbers from `cases` upward are hinted inputs: number `cases + i` is
+   the i-th fixture, then captures, in hint order (ADR 0015).
    Fix the first mismatch; stop after five failed iterations. Successful test
    runs do not consume that failure allowance.
    Count every failed invocation, including build failures. An ABI correction

@@ -42,12 +42,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-TOOL_VERSION = 'input-probe/2'
+TOOL_VERSION = 'input-probe/3'
 PROVENANCE_KIND = 'authored-structured-entry-inputs'
-MAX_EXPANDED = 600      # fixtures one spec may expand to: the gate runs 600 cases (difftest.DEFAULTS['cases'])
-                        # and a fixture is only drawn among them, so more expansions can never run
-MAX_SELECTED = 192      # fixtures one gate adds. Half of the 600 cases draw a fixture or capture whatever
-                        # the count, so the cap only bounds effectiveness: about 1.5 draws each at 192.
+MAX_EXPANDED = 600      # fixtures one spec may expand to; each expansion runs once on the original side
+MAX_SELECTED = 192      # fixtures one gate adds. The gate runs every hinted fixture once before its
+                        # random cases (input-sweep harness), so each pick is one more case in every
+                        # later lifted and C gate of the function: the cap bounds gate time.
                         # At 48 (input-probe/1) specs reaching 0.91-0.96 kept 0.53-0.55 (27 Nov).
 SPEC_KEYS = {'notes', 'base', 'fixtures'}
 FIXTURE_KEYS = {'name', 'regs', 'stack', 'template', 'zero', 'dwords', 'bytes', 'ascii',
@@ -105,8 +105,8 @@ def _set_path(fixture, field, raw):
 
 
 def _too_many(what):
-    return (f'{what} expands to more than {MAX_EXPANDED} fixtures; the gate runs only '
-            f'{MAX_EXPANDED} cases, so narrow the vary ranges (use fewer, more varied fixtures)')
+    return (f'{what} expands to more than {MAX_EXPANDED} fixtures, the most one probe runs; '
+            f'narrow the vary ranges (use fewer, more varied fixtures)')
 
 
 def _variants(compact):
@@ -319,15 +319,13 @@ def _run_rows(va, spec, context=None):
 
 
 def baseline_coverage(va, opts, machine, starts):
-    """Instructions the current gate's own cases reach on the original (same case derivation)."""
-    import random
+    """Instructions the current gate's own cases reach on the original (same case derivation):
+    every current hinted input once, then the random cases."""
     from cmre import difftest, image
-    rng, covered, globals_in = random.Random(opts.seed), set(), set()
-    templates = difftest.arena_templates()
-    for index in range(opts.cases):
-        case = difftest.make_case(rng, opts, sorted(globals_in), templates)
+    covered, globals_in = set(), set()
+    for _, case, discovering in difftest.gate_cases(opts, globals_in, difftest.arena_templates()):
         result = machine.run(va, case, opts.budget)
-        if index < opts.discovery:
+        if discovering:
             globals_in.update(difftest._global_reads(result, image.primary()))
         covered |= result.covered & starts
     return covered

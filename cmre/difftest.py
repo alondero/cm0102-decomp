@@ -12,9 +12,10 @@ Profiles
   ESP, FPU control word/depth, non-stack memory, import calls and a fault's data
   access; never register allocation, the faulting instruction or stack layout.
 
-Cases are derived from Random(seed) only, where seed defaults to the function VA,
-so a run is reproducible bit for bit. Optional hints (recovery/hints/fn_<va>.json)
-shape inputs; they never change what is compared.
+Every hinted input fixture and capture runs once first, as case number cases + i.
+The random cases follow, derived from Random(seed) only, where seed defaults to the
+function VA, so a run is reproducible bit for bit. Optional hints
+(recovery/hints/fn_<va>.json) shape inputs; they never change what is compared.
 """
 from __future__ import annotations
 
@@ -398,18 +399,49 @@ def make_case(rng: random.Random, opts: Options, global_inputs: list[int], templ
     captures = h.get("captures", [])
     if (fixtures or captures) and rng.randrange(2) == 0:
         # Keep random/edge cases alongside original-side selected input fixtures.
-        chosen_input = rng.choice(fixtures + captures)
-        if isinstance(chosen_input, str):
-            case = _capture_case(opts.va, chosen_input, size, opts.arg_count)
-        else:
-            case = _fixture_case(chosen_input,
-                                 [t + bytes(size - len(t)) for t in templates], opts.arg_count)
-    if "import_transcript" in h:
-        case.import_transcript = h["import_transcript"]
+        case = _hinted_case(opts, rng.choice(fixtures + captures), size,
+                            [t + bytes(size - len(t)) for t in templates])
+    return _entry_policy(case, opts)
+
+
+def _hinted_case(opts: Options, chosen, size: int, padded: list[bytes]) -> emu.Case:
+    """A hinted input fixture (dict) or local capture (name), without RNG draws."""
+    if isinstance(chosen, str):
+        return _capture_case(opts.va, chosen, size, opts.arg_count)
+    return _fixture_case(chosen, padded, opts.arg_count)
+
+
+def _entry_policy(case: emu.Case, opts: Options) -> emu.Case:
+    if "import_transcript" in opts.hints:
+        case.import_transcript = opts.hints["import_transcript"]
     if opts.inputs == "v2":
         # Apply the recorded entry policy to either input source, without new draws.
         case.regs["eflags"] &= ~EFLAGS_DF
     return case
+
+
+def hinted_inputs(opts: Options) -> list:
+    """Hinted input fixtures, then captures, in hint order: each is one gate case."""
+    return list(opts.hints.get("fixtures", [])) + list(opts.hints.get("captures", []))
+
+
+def gate_cases(opts: Options, global_inputs: set[int], templates: list[bytes]):
+    """Yield (case number, case, discovering) in gate order.
+
+    Every hinted input runs once first, as case number opts.cases + i, so a fixture's
+    reach never depends on a random draw. Then the opts.cases random cases follow
+    from Random(opts.seed) exactly as before: random case k keeps number k and its
+    input, including its own random fixture draw. Discovery reads `global_inputs`
+    live, so the caller adds the globals its discovery cases read."""
+    if opts.inputs not in INPUT_POLICIES:
+        raise ValueError(f"unknown input policy {opts.inputs!r}")
+    size = emu.arena_capacity(opts.hints.get("arena_size", emu.ARENA_SIZE))
+    padded = [t + bytes(size - len(t)) for t in templates]
+    for i, chosen in enumerate(hinted_inputs(opts)):
+        yield opts.cases + i, _entry_policy(_hinted_case(opts, chosen, size, padded), opts), False
+    rng = random.Random(opts.seed)
+    for index in range(opts.cases):
+        yield index, make_case(rng, opts, sorted(global_inputs), templates), index < opts.discovery
 
 
 def _global_reads(result: emu.Result, img: image.Image, region: tuple[int, int] | None = None) -> set[int]:
@@ -432,7 +464,11 @@ def _global_reads(result: emu.Result, img: image.Image, region: tuple[int, int] 
 
 def _discovery(machine: emu.Machine, opts: Options, index: int, region) -> tuple[int, int] | None:
     """Enable read attribution for a v2 discovery case; returns the region filter."""
-    machine.attribute_reads = opts.inputs == "v2" and index < opts.discovery
+    return _attribute(machine, opts, index < opts.discovery, region)
+
+
+def _attribute(machine: emu.Machine, opts: Options, discovering: bool, region) -> tuple[int, int] | None:
+    machine.attribute_reads = opts.inputs == "v2" and discovering
     return region if machine.attribute_reads else None
 
 
@@ -800,7 +836,6 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
         _stop_indirect(original, recovered, region, built, indirect)
     text = built.image.text
     amap = emu.AddressMap(built.symbols, call_returns, text.va, text.end)
-    rng = random.Random(opts.seed)
     templates = arena_templates()
     outcomes: dict[str, int] = {}
     mismatches = []
@@ -815,9 +850,12 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
     global_inputs: set[int] = set()
     digest = hashlib.sha256()
     compare_fp = bool(getattr(built.image, 'x87_bindings', ()))
-    for index in range(opts.cases):
-        case = make_case(rng, opts, sorted(global_inputs), templates)
-        own = _discovery(original, opts, index, region)
+    input_cases = 0
+    # Limits below keep opts.cases as their denominator: hinted-input cases add to the
+    # counts only, so the gate never accepts what the random cases alone would reject.
+    for index, case, discovering in gate_cases(opts, global_inputs, templates):
+        input_cases += index >= opts.cases
+        own = _attribute(original, opts, discovering, region)
         a = original.run(va, case, opts.budget)
         fp_a = x87_transport.snapshot(original.uc) if compare_fp else None
         sem_a = semantic_fp(original.uc, returns) if profile == "semantic" else ()
@@ -827,7 +865,7 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
         extension_failed = extension_failed or (extended and b.outcome == "budget")
         fp_b = x87_transport.snapshot(recovered.uc) if compare_fp else None
         sem_b = semantic_fp(recovered.uc, returns) if profile == "semantic" else ()
-        if index < opts.discovery:
+        if discovering:
             global_inputs |= _global_reads(a, img, own)
         import_calls += sum(1 for e in a.events if e[0] == "c")
         na = _normalize(a, None, profile, returns, sem_a)
@@ -889,6 +927,7 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
         **({"returns": returns} if profile == "semantic" else {}),
         **({"inputs": opts.inputs} if opts.inputs != "v1" else {}),
         "cases": opts.cases,
+        "input_cases": input_cases,
         "seed": opts.seed,
         "budget": opts.budget,
         **({'budget_policy': 'original-instructions/1',
@@ -937,19 +976,24 @@ def explain(va: int, region, insn_starts, built, call_returns, opts: Options, pr
         _stop_indirect(original, recovered, region, built, indirect)
     text = built.image.text if built else None
     amap = emu.AddressMap(built.symbols, call_returns, text.va, text.end) if built else None
-    rng = random.Random(opts.seed)
     templates = arena_templates()
     global_inputs: set[int] = set()
     stops: dict[str, int] = {}
-    last = case_index if case_index is not None else opts.cases - 1
-    for index in range(last + 1):
-        case = make_case(rng, opts, sorted(global_inputs), templates)
-        own = _discovery(original, opts, index, region)
+    numbers = opts.cases + len(hinted_inputs(opts))
+    if case_index is not None and not (type(case_index) is int and 0 <= case_index < numbers):
+        raise ValueError(f"case {case_index} is not in this gate: random cases are 0..{opts.cases - 1}"
+                         f" and hinted inputs {opts.cases}..{numbers - 1}")
+    for index, case, discovering in gate_cases(opts, global_inputs, templates):
+        if case_index is not None and index != case_index and index >= opts.cases:
+            continue  # hinted inputs never feed later cases; run() resets the machine per case
+        own = _attribute(original, opts, discovering, region)
         if index == case_index:
             original.attribute_reads = True
         a = original.run(va, case, opts.budget)
-        if index < opts.discovery:
+        if discovering:
             global_inputs |= _global_reads(a, img, own)
+        if index == case_index:
+            break
         if case_index is None:
             if a.outcome == "fault":
                 (access, address, _), eip = a.detail

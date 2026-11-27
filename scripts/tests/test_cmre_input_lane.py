@@ -1687,3 +1687,25 @@ class DeferredGates:
             def done(self):
                 return False
         return Pending()
+
+
+def test_probe_baseline_counts_every_current_hinted_input():
+    # Input-sweep harness: the gate runs every hinted fixture once, so the probe's
+    # baseline must too, or it re-picks fixtures the gate already runs.
+    import types
+    from cmre import difftest, emu
+    regs = dict.fromkeys(emu.REG_NAMES, 0)
+    regs['eflags'] = 0x202
+    fixtures = [{'regs': regs, 'stack': [0] * 10, 'arena_template': 0, 'arena_writes': {},
+                 'globals': {}, 'import_seed': 1000 + i} for i in range(30)]
+    opts = difftest.Options.for_function(0x0054CFE0, {'cases': 4})
+    opts.hints = {'fixtures': fixtures}
+
+    class Machine:
+        def run(self, va, case, budget):
+            return types.SimpleNamespace(covered={case.import_seed}, outcome='return', detail='',
+                                         events=[], read_sites={})
+
+    starts = set(range(1000, 1030))
+    assert probe.baseline_coverage(0x0054CFE0, opts, Machine(), starts) == starts
+    assert probe.TOOL_VERSION == 'input-probe/3'
