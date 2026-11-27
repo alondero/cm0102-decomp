@@ -1555,7 +1555,7 @@ def test_a_regate_runs_once_per_probe_version_and_is_not_a_model_attempt(tmp_pat
 
 def test_a_regate_that_does_not_beat_the_plateau_keeps_it(tmp_path):
     fn = 'fn_00401000'
-    l, ops, launcher, spec = _regate_lane(tmp_path, fn, {'status': 'no-new-reach', 'coverage': 0.55}, attempts=2)
+    l, ops, launcher, spec = _regate_lane(tmp_path, fn, {'status': 'low-coverage', 'coverage': 0.55}, attempts=2)
     l.tick()
     l.refresh(force=True)
     l.tick()
@@ -1593,6 +1593,16 @@ def test_a_regate_that_errors_is_retried_a_bounded_number_of_times(tmp_path):
     row = l.state['functions'][fn]
     assert [r['status'] for r in row['regates']] == ['error'] * lane.REGATE_ERRORS
     assert 'status' not in row and len(row['attempts']) == 3
+
+
+@pytest.mark.parametrize('status', ['build-failed', 'nondeterministic', 'lift-blocked'])
+def test_a_regate_with_a_definite_non_pass_outcome_is_not_retried(tmp_path, status):
+    fn = 'fn_00401000'
+    l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': status})
+    l.tick()
+    l.tick()
+    assert len(ops.gates) == 1
+    assert l.state['functions'][fn]['best']['probe_tool'] == probe.TOOL_VERSION
 
 
 def test_a_regate_after_an_error_can_still_pass(tmp_path):
@@ -1648,6 +1658,7 @@ def test_a_regate_that_beats_the_plateau_reopens_model_work_from_the_better_spec
     l.tick()
     row = l.state['functions'][fn]
     assert 'plateau' not in row and row['best']['coverage'] == 0.58
+    assert row['baseline'] == 0.58   # a worker returning the seed unchanged is not progress
     l.refresh(force=True)
     l.tick()
     assert len(launcher.started) == 1

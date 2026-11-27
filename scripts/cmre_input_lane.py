@@ -45,7 +45,7 @@ IDLE_REFRESH_SECONDS = 60     # an idle lane re-scans (about 7 s of CPU) at most
 SCREEN_JOBS = 2
 REGATE_JOBS = 1             # model-free re-gates in flight; the gate pool has max(2, workers) threads
 REGATE_ERRORS = 2           # gate errors (timeout, crash) tolerated per function and probe version
-REGATE_SETTLED = ('pass', 'low-coverage', 'no-new-reach', 'fail')   # outcomes that end a re-gate
+REGATE_TRANSIENT = ('error', None)   # re-gate outcomes retried; any other gate status settles it
 SKIP_STATUSES = ('lift-blocked', 'fail', 'error', 'not-unlifted')
 WORKER_COMMANDS = ('brief', 'test', 'explain', 'show', 'disasm', 'family', 'work show')
 # Narrower than the farm's list: `rg --pre` runs a program and `sed -n` accepts `w FILE`/`-i`.
@@ -432,7 +432,7 @@ class Lane:
                 continue
             best = row.get('best') or {}
             errors = sum(1 for r in row.get('regates', []) if r.get('tool') == tool
-                         and r.get('status') not in REGATE_SETTLED)
+                         and r.get('status') in REGATE_TRANSIENT)
             if best.get('spec') and best.get('probe_tool') != tool and errors < REGATE_ERRORS:
                 todo.append((-(best.get('coverage') or 0), -info['bytes'], fn))
         submitted = False
@@ -472,13 +472,14 @@ class Lane:
         if coverage is not None and status in ('low-coverage', 'pass') and coverage > (best.get('coverage') or 0):
             best = {**best, 'spec': job['spec'], 'coverage': coverage, 'model': job['model'],
                     'detail': f"regate {status}; first uncovered {result.get('first_uncovered', [])[:4]}"}
-        if best and status in REGATE_SETTLED:
+        if best and status not in REGATE_TRANSIENT:
             row['best'] = {**best, 'probe_tool': job['tool']}   # an error leaves it for a bounded retry
         plateau = row.get('plateau')
         if (plateau and status == 'low-coverage' and isinstance(coverage, (int, float))
                 and coverage > (plateau.get('coverage') or 0)):
             # Workers are seeded from the best spec, so a better seed is new progress.
             row.pop('plateau')
+            row['baseline'], row['baseline_harness'] = coverage, job.get('harness', self.harness)
             self.event('plateau-cleared', fn=fn, coverage=coverage, was=plateau.get('coverage'))
         self.event('result', fn=fn, n=job['n'], model=job['model'], status=status, coverage=coverage,
                    kind='regate')
