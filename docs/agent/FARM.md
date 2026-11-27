@@ -833,10 +833,13 @@ New lifts reach the C translators on the next frontier rescan.
 - One gate appends at most 192 fixtures (`MAX_SELECTED` in
   `scripts/cmre_input_probe.py`). The probe records its `TOOL_VERSION` on every
   gate result and the lane stores it on the function's best spec. A best spec gated
-  by an older probe is **re-gated** once, with no model call (`regate` event, up to
-  two in flight): the copy is gated, applied and accepted exactly like a worker's
-  spec, its row lists it under `regates`, and it counts toward neither the three
-  attempts nor a plateau. On 27 Nov the old 48-fixture cap held specs whose
+  by an older probe is **re-gated** once, with no model call (`regate` event, one
+  in flight, none while `input_lane_workers` is 0): the copy is gated, applied and
+  accepted exactly like a worker's spec, its row lists it under `regates`, and it
+  is not one of the three attempts. A gate error (timeout, crash) is retried up to
+  twice per probe version. A `low-coverage` re-gate above a plateau's coverage
+  clears that plateau (`plateau-cleared`), because workers are seeded from the
+  improved best spec. On 27 Nov the old 48-fixture cap held specs whose
   fixtures reached 0.91-0.96 of `fn_005576e0`/`fn_00487f60` to the 0.53-0.55 the
   gate recorded; bump `TOOL_VERSION` whenever a probe change can turn a held spec
   into a pass.

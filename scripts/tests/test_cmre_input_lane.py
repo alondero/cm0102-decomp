@@ -1539,7 +1539,7 @@ def test_a_best_spec_gated_by_an_older_probe_is_regated_without_a_model(tmp_path
     assert regated and regated[0]['fn'] == fn and regated[0]['of'] == str(spec)
 
 
-def test_a_regate_runs_once_per_probe_version_and_leaves_the_plateau(tmp_path):
+def test_a_regate_runs_once_per_probe_version_and_is_not_a_model_attempt(tmp_path):
     fn = 'fn_00401000'
     l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': 'low-coverage', 'coverage': 0.58})
     l.tick()
@@ -1549,8 +1549,20 @@ def test_a_regate_runs_once_per_probe_version_and_leaves_the_plateau(tmp_path):
     assert ops.gates == [(fn, 'q/strong')]
     row = l.state['functions'][fn]
     assert row['best']['coverage'] == 0.58 and row['best']['probe_tool'] == probe.TOOL_VERSION
-    assert row['plateau']['harness'] == 'H1' and len(row['attempts']) == 3
-    assert launcher.started == []                         # still plateaued: no model either
+    assert len(row['attempts']) == 3
+    assert launcher.started == []                         # attempts exhausted: no model either
+
+
+def test_a_regate_that_does_not_beat_the_plateau_keeps_it(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, spec = _regate_lane(tmp_path, fn, {'status': 'no-new-reach', 'coverage': 0.55}, attempts=2)
+    l.tick()
+    l.refresh(force=True)
+    l.tick()
+    row = l.state['functions'][fn]
+    assert row['plateau']['harness'] == 'H1' and launcher.started == []
+    assert row['best']['spec'] == str(spec) and row['best']['probe_tool'] == probe.TOOL_VERSION
+    assert len(ops.gates) == 1
 
 
 @pytest.mark.parametrize('row', [{'status': 'accepted'}, {'status': 'fail', 'harness': 'H1'},
@@ -1568,3 +1580,99 @@ def test_a_regate_needs_the_spec_file(tmp_path):
     spec.unlink()
     l.tick()
     assert ops.gates == []
+
+
+def test_a_regate_that_errors_is_retried_a_bounded_number_of_times(tmp_path):
+    # Review of 9d4ca8a: a timeout or crash marked the best spec as gated by the new probe,
+    # so one transient error lost the re-gate of fn_005576e0/fn_00487f60 for good.
+    fn = 'fn_00401000'
+    l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': 'error', 'error': 'TimeoutExpired'})
+    for _ in range(lane.REGATE_ERRORS + 2):
+        l.tick()
+    assert len(ops.gates) == lane.REGATE_ERRORS
+    row = l.state['functions'][fn]
+    assert [r['status'] for r in row['regates']] == ['error'] * lane.REGATE_ERRORS
+    assert 'status' not in row and len(row['attempts']) == 3
+
+
+def test_a_regate_after_an_error_can_still_pass(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': 'error', 'error': 'MemoryError'})
+    l.tick()
+    ops.gate_result[fn] = {'status': 'pass', 'coverage': 0.83}
+    l.tick()
+    assert l.state['functions'][fn]['status'] == 'accepted' and len(ops.gates) == 2
+
+
+def test_a_function_a_regate_just_accepted_gets_no_model_worker(tmp_path):
+    # Review of 9d4ca8a: refresh queued the row, the re-gate accepted it, and dispatch then
+    # started a model job on an accepted function in the same tick.
+    fn = 'fn_00401000'
+    l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': 'pass', 'coverage': 0.83},
+                                       attempts=1, plateau=False)
+    l.tick()
+    assert l.state['functions'][fn]['status'] == 'accepted'
+    assert launcher.started == []
+
+
+def test_no_regate_runs_while_the_lane_has_no_workers(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': 'pass', 'coverage': 0.83})
+    l.workers = 0
+    l.tick()
+    assert ops.gates == []
+
+
+def test_one_regate_at_a_time_leaves_gate_threads_for_workers(tmp_path):
+    l, ops, launcher, clock = make_lane(tmp_path, {f'fn_0040{i}000': candidate(9000, 0.55) for i in range(1, 4)})
+    for i in range(1, 4):
+        fn = f'fn_0040{i}000'
+        spec = l.dir / 'specs' / f'{fn}-7.json'
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text('{"fixtures": []}\n')
+        l.state['functions'][fn] = {
+            'key': 'k1', 'attempts': [{'n': j, 'status': 'low-coverage', 'coverage': 0.55, 'harness': 'H1'}
+                                      for j in range(3)],
+            'best': {'spec': str(spec), 'coverage': 0.5 + i / 100, 'model': 'q/strong'}}
+    l.refresh(force=True)
+    l.gates = DeferredGates()
+    l.regate()
+    l.regate()
+    assert [job['fn'] for job, *_ in l.gating] == ['fn_00403000']   # best coverage first
+    assert lane.REGATE_JOBS == 1
+
+
+def test_a_regate_that_beats_the_plateau_reopens_model_work_from_the_better_spec(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': 'low-coverage', 'coverage': 0.58}, attempts=2)
+    l.tick()
+    row = l.state['functions'][fn]
+    assert 'plateau' not in row and row['best']['coverage'] == 0.58
+    l.refresh(force=True)
+    l.tick()
+    assert len(launcher.started) == 1
+    job = launcher.started[0][0]
+    assert Path(job['spec']).read_bytes() == Path(row['best']['spec']).read_bytes()
+
+
+def test_a_regate_without_a_known_author_records_no_model(tmp_path, monkeypatch):
+    seen = []
+
+    class Done:
+        stdout = '{"status": "low-coverage", "coverage": 0.5}\n'
+
+    monkeypatch.setattr(lane.subprocess, 'run', lambda command, **kw: seen.append(command) or Done())
+    lane.CmreOps(tmp_path).gate('fn_00401000', tmp_path / 's.json', None)
+    assert '--model' not in seen[0]
+    lane.CmreOps(tmp_path).gate('fn_00401000', tmp_path / 's.json', 'p/cheap')
+    assert seen[1][-2:] == ['--model', 'p/cheap']
+
+
+class DeferredGates:
+    """Gates that never finish, to observe how many the lane keeps in flight."""
+
+    def submit(self, fn, *args):
+        class Pending:
+            def done(self):
+                return False
+        return Pending()

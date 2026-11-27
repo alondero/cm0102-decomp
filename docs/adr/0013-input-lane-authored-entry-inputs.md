@@ -141,7 +141,9 @@ unchanged.
 
 The probe is now `input-probe/2` and reports its version on every gate. The lane
 re-gates each function's stored best spec once per probe version with no model
-call, and applies a pass exactly as it applies a worker's. A re-gate is not a
-model attempt and does not move a plateau. Functions whose specs need more than
+call, one at a time, and applies a pass exactly as it applies a worker's. A
+re-gate is not a model attempt. A gate error is retried at most twice per probe
+version. A re-gate that raises coverage above a plateau clears the plateau,
+because the next worker is seeded from that better spec. Functions whose specs need more than
 192 fixtures (`fn_004b4850`: 427) are limited by the random fixture draw itself;
 running every fixture deterministically would be a harness release under ADR 0007.

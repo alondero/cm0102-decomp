@@ -43,7 +43,9 @@ INFRA_PAUSE_SECONDS = 3600   # auth/key failure: pause the provider, retry hourl
 CANDIDATE_REFRESH_SECONDS = 600
 IDLE_REFRESH_SECONDS = 60     # an idle lane re-scans (about 7 s of CPU) at most this often
 SCREEN_JOBS = 2
-REGATE_JOBS = 2             # model-free re-gates of best specs in flight (each is one full lifted gate)
+REGATE_JOBS = 1             # model-free re-gates in flight; the gate pool has max(2, workers) threads
+REGATE_ERRORS = 2           # gate errors (timeout, crash) tolerated per function and probe version
+REGATE_SETTLED = ('pass', 'low-coverage', 'no-new-reach', 'fail')   # outcomes that end a re-gate
 SKIP_STATUSES = ('lift-blocked', 'fail', 'error', 'not-unlifted')
 WORKER_COMMANDS = ('brief', 'test', 'explain', 'show', 'disasm', 'family', 'work show')
 # Narrower than the farm's list: `rg --pre` runs a program and `sed -n` accepts `w FILE`/`-i`.
@@ -416,8 +418,8 @@ class Lane:
         the 48-fixture cap kept 0.53-0.55 of specs whose fixtures reached 0.91-0.96.
         A re-gate is not a model attempt. It counts toward neither MAX_ATTEMPTS nor a
         plateau, and its result is applied exactly like a worker's (FARM.md "Input lane")."""
-        if self.stopping():
-            return
+        if self.stopping() or self.workers <= 0:
+            return   # workers 0 pauses the lane's gates too, not only its model jobs
         tool = probe_tool()
         busy = self._busy()
         inflight = sum(1 for job, _, _, _ in self.gating if job.get('kind') == 'regate')
@@ -429,7 +431,9 @@ class Lane:
                     or row.get('pending_apply')):
                 continue
             best = row.get('best') or {}
-            if best.get('spec') and best.get('probe_tool') != tool:
+            errors = sum(1 for r in row.get('regates', []) if r.get('tool') == tool
+                         and r.get('status') not in REGATE_SETTLED)
+            if best.get('spec') and best.get('probe_tool') != tool and errors < REGATE_ERRORS:
                 todo.append((-(best.get('coverage') or 0), -info['bytes'], fn))
         submitted = False
         for _, _, fn in sorted(todo):
@@ -445,7 +449,7 @@ class Lane:
             spec = self.dir / 'specs' / f'{fn}-{n}.regate.json'
             spec.parent.mkdir(parents=True, exist_ok=True)
             spec.write_bytes(data)
-            job = {'fn': fn, 'n': n, 'kind': 'regate', 'model': best.get('model') or 'unknown',
+            job = {'fn': fn, 'n': n, 'kind': 'regate', 'model': best.get('model'),
                    'bytes': info['bytes'], 'coverage': info.get('coverage'),
                    'threshold': info.get('threshold', 0.6), 'spec': str(spec),
                    'hints_sha256': info['hints_sha256'], 'key': info['key'],
@@ -468,8 +472,14 @@ class Lane:
         if coverage is not None and status in ('low-coverage', 'pass') and coverage > (best.get('coverage') or 0):
             best = {**best, 'spec': job['spec'], 'coverage': coverage, 'model': job['model'],
                     'detail': f"regate {status}; first uncovered {result.get('first_uncovered', [])[:4]}"}
-        if best:
-            row['best'] = {**best, 'probe_tool': job['tool']}
+        if best and status in REGATE_SETTLED:
+            row['best'] = {**best, 'probe_tool': job['tool']}   # an error leaves it for a bounded retry
+        plateau = row.get('plateau')
+        if (plateau and status == 'low-coverage' and isinstance(coverage, (int, float))
+                and coverage > (plateau.get('coverage') or 0)):
+            # Workers are seeded from the best spec, so a better seed is new progress.
+            row.pop('plateau')
+            self.event('plateau-cleared', fn=fn, coverage=coverage, was=plateau.get('coverage'))
         self.event('result', fn=fn, n=job['n'], model=job['model'], status=status, coverage=coverage,
                    kind='regate')
         if status == 'pass':
@@ -525,6 +535,12 @@ class Lane:
             info = self.candidates.get(fn)
             if info is None or fn in self._busy():
                 self.queue.pop(0)
+                continue
+            settled = self.state['functions'].get(fn) or {}
+            if settled.get('key') == info['key'] and (
+                    settled.get('status') in ('accepted', 'pass-unaccepted') or settled.get('pending_apply')
+                    or (settled.get('status') in SKIP_STATUSES and settled.get('harness') == self.harness)):
+                self.queue.pop(0)   # settled since the queue was planned (a re-gate in this tick)
                 continue
             if info.get('coverage') is None:
                 if screens >= SCREEN_JOBS:
@@ -929,7 +945,7 @@ class CmreOps:
     def gate(self, fn, spec, model):
         proposal = spec.with_suffix('.lane-proposal.json')
         command = [sys.executable, str(self.root / 'scripts/cmre_input_probe.py'), 'gate', fn, str(spec),
-                   '--proposal', str(proposal), '--model', model]
+                   '--proposal', str(proposal), *(['--model', model] if model else [])]
         try:
             done = subprocess.run(command, cwd=self.root, env=child_env(), capture_output=True, text=True, encoding='utf-8',
                                   errors='replace', timeout=3600)
