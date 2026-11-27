@@ -2037,6 +2037,203 @@ def test_corrupt_candidate_identity_stops_reconciliation_without_writes(root):
     assert canonical.read_bytes() == before
 
 
+def test_terminal_journal_reconciles_from_header_without_decoding_candidate(root, monkeypatch):
+    f, cmre, job, canonical = prepared_candidate(root)
+    f._verify(job, False)
+    path = Path(job['_transaction'])
+    data = json.loads(path.read_text())
+    data['phase'] = 'failed'
+    data['job']['_resume_collect'] = 'seed-sha256'
+    request = f.run_dir / 'requests' / 'operator-request.json'
+    request.parent.mkdir(exist_ok=True)
+    request.write_text('{}')
+    data['job']['_request'] = str(request)
+    path.write_text(json.dumps(data))
+    original_loads = json.loads
+
+    def guarded_loads(raw, *args, **kwargs):
+        if isinstance(raw, str) and 'cmre-farm-candidate/1' in raw:
+            raise AssertionError('terminal journal candidate was decoded')
+        return original_loads(raw, *args, **kwargs)
+
+    monkeypatch.setattr(json, 'loads', guarded_loads)
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert resumed.counter >= job['n']
+    assert resumed.state['resume_collected'][job['fn']] == 'seed-sha256'
+    assert not request.exists()
+    assert canonical.read_text() == GOOD
+
+
+def terminal_journal_fixture(root, phase='failed', large=False):
+    """A machine-shaped terminal journal with a direct RUN/requests request."""
+    f, cmre, job, canonical = prepared_candidate(root)
+    f._verify(job, False)
+    path = Path(job['_transaction'])
+    data = json.loads(path.read_text(encoding='utf-8'))
+    data['phase'] = phase
+    data['job']['_resume_collect'] = 'seed-sha256'
+    request = f.run_dir / 'requests' / f"{job['n']:08d}-request.json"
+    request.parent.mkdir(parents=True, exist_ok=True)
+    request.write_text('{}')
+    data['job']['_request'] = str(request)
+    if large:
+        candidate = farm._decode_snapshot(data['candidate'])
+        candidate['c'] += bytes(40000)
+        data['candidate'] = farm._encode_snapshot(candidate)
+        data['identity'] = farm._identity(candidate)
+    path.write_text(json.dumps(data, indent=1), encoding='utf-8')
+    return f, cmre, job, canonical, path, request
+
+
+def reject_full_journal_decode(monkeypatch):
+    original_loads = json.loads
+
+    def guarded_loads(raw, *args, **kwargs):
+        if isinstance(raw, str) and 'cmre-farm-candidate/1' in raw:
+            raise AssertionError('terminal journal candidate was decoded')
+        return original_loads(raw, *args, **kwargs)
+
+    monkeypatch.setattr(json, 'loads', guarded_loads)
+
+
+@pytest.mark.parametrize('phase', ['complete', 'failed'])
+def test_complete_and_failed_terminal_headers_collect_resume_and_unlink_request(root, monkeypatch, phase):
+    f, cmre, job, _, path, request = terminal_journal_fixture(root, phase)
+    journal = path.read_bytes()
+    reject_full_journal_decode(monkeypatch)
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert resumed.counter >= job['n']
+    assert resumed.state['resume_collected'][job['fn']] == 'seed-sha256'
+    assert not request.exists()
+    assert path.read_bytes() == journal
+
+
+def test_conflict_terminal_header_unlinks_without_collecting_resume(root, monkeypatch):
+    f, cmre, job, _, path, request = terminal_journal_fixture(root, 'conflict')
+    journal = path.read_bytes()
+    reject_full_journal_decode(monkeypatch)
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert job['fn'] not in resumed.state.get('resume_collected', {})
+    assert not request.exists()
+    assert path.read_bytes() == journal
+
+
+def test_reverify_terminal_header_neither_collects_nor_unlinks(root, monkeypatch):
+    f, cmre, job, _, path, request = terminal_journal_fixture(root, 'reverify')
+    journal = path.read_bytes()
+    reject_full_journal_decode(monkeypatch)
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert job['fn'] not in resumed.state.get('resume_collected', {})
+    assert request.exists()
+    assert path.read_bytes() == journal
+
+
+def test_truncated_terminal_header_fails_closed_without_unlinking_request(root):
+    f, cmre, job, _, path, request = terminal_journal_fixture(root, 'failed')
+    raw = path.read_bytes()
+    path.write_bytes(raw[:raw.index(b'\n "prior"')])
+    with pytest.raises(ValueError):
+        farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert request.exists()
+
+
+def test_malformed_terminal_header_fails_closed_without_unlinking_request(root):
+    f, cmre, _, _, path, request = terminal_journal_fixture(root, 'failed')
+    raw = path.read_bytes()
+    path.write_bytes(raw.replace(b'\n "prior"', b' garbage\n "prior"', 1))
+    with pytest.raises(ValueError):
+        farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert request.exists()
+
+
+def test_nested_spoofed_phase_header_does_not_unlink_request(root):
+    f, cmre, job, canonical, path, request = terminal_journal_fixture(root, 'prepared')
+    data = json.loads(path.read_text(encoding='utf-8'))
+    data['job']['nested'] = {'phase': 'failed'}
+    reordered = {key: data[key] for key in ('schema', 'job', 'phase', 'prior', 'candidate', 'identity')}
+    path.write_text(json.dumps(reordered, indent=1), encoding='utf-8')
+    canonical.write_bytes(bytes.fromhex(data['prior']['c']))
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert request.exists()
+    assert job['fn'] not in resumed.state.get('resume_collected', {})
+
+
+@pytest.mark.parametrize('field,bad', [
+    ('fn', None), ('fn', 123), ('n', '1'), ('n', True),
+])
+def test_terminal_header_requires_fn_string_and_n_integer(root, field, bad):
+    f, cmre, _, _, path, request = terminal_journal_fixture(root, 'failed')
+    data = json.loads(path.read_text(encoding='utf-8'))
+    data['job'][field] = bad
+    path.write_text(json.dumps(data, indent=1), encoding='utf-8')
+    assert farm.Farm._terminal_journal_header(path) is None
+    with pytest.raises(RuntimeError, match='job header'):
+        farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert request.exists()
+
+
+def test_invalid_utf8_terminal_header_fails_closed_without_unlinking_request(root):
+    f, cmre, _, _, path, request = terminal_journal_fixture(root, 'failed')
+    raw = path.read_bytes()
+    at = raw.index(b'"candidate"') + len(b'"candidate": "')
+    path.write_bytes(raw[:at] + b'\xff' + raw[at + 1:])
+    with pytest.raises(UnicodeDecodeError):
+        farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert request.exists()
+
+
+def test_terminal_request_outside_requests_fails_closed(root):
+    f, cmre, _, _, path, _ = terminal_journal_fixture(root, 'failed')
+    outside = f.run_dir / 'operator-request.json'
+    outside.write_text('{}')
+    data = json.loads(path.read_text(encoding='utf-8'))
+    data['job']['_request'] = str(outside)
+    path.write_text(json.dumps(data, indent=1), encoding='utf-8')
+    with pytest.raises(RuntimeError, match='request path'):
+        farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert outside.exists()
+
+
+def test_production_shaped_large_terminal_journal_uses_header_without_decode_or_rewrite(root, monkeypatch):
+    f, cmre, job, _, path, request = terminal_journal_fixture(root, 'complete', large=True)
+    assert path.stat().st_size > 65536
+    journal = path.read_bytes()
+    reject_full_journal_decode(monkeypatch)
+    monkeypatch.setattr(farm, '_decode_snapshot',
+                        lambda snapshot: pytest.fail('terminal journal candidate snapshot was decoded'))
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert resumed.state['resume_collected'][job['fn']] == 'seed-sha256'
+    assert not request.exists()
+    assert path.read_bytes() == journal
+
+
+def test_quarantined_journal_restart_uses_full_transaction_path(root, monkeypatch):
+    f, cmre, job, _, path, request = terminal_journal_fixture(root, 'quarantined')
+    data = json.loads(path.read_text(encoding='utf-8'))
+    data['quarantine_reason'] = 'acceptance unresolved in test'
+    path.write_text(json.dumps(data, indent=1), encoding='utf-8')
+    original_loads = json.loads
+    full_decodes = []
+
+    def noticed_loads(raw, *args, **kwargs):
+        if isinstance(raw, str) and 'cmre-farm-candidate/1' in raw:
+            full_decodes.append(len(raw))
+        return original_loads(raw, *args, **kwargs)
+
+    monkeypatch.setattr(json, 'loads', noticed_loads)
+    original_decode = farm._decode_snapshot
+    snapshots = []
+    def noticed_decode(snapshot):
+        snapshots.append(tuple(snapshot))
+        return original_decode(snapshot)
+    monkeypatch.setattr(farm, '_decode_snapshot', noticed_decode)
+    resumed = farm.Farm(f.run_dir, root, cmre, None, f.config)
+    assert full_decodes
+    assert snapshots
+    assert resumed.state['quarantined'][job['fn']]['reason'] == 'acceptance unresolved in test'
+    assert request.exists()
+
+
 @pytest.mark.parametrize("include_held", [False, True])
 def test_real_adapter_forwards_explicit_held_claim_option(monkeypatch, tmp_path, include_held):
     from cmre import work
@@ -4042,6 +4239,67 @@ def test_the_farm_stops_a_worker_waiting_out_a_limit_at_once(root, monkeypatch):
     assert 'fn_00401000' not in f.state['attempts'] and not f.state['parked']
     limited = [e for e in events(f.run_dir) if e['event'] == 'model-limited']
     assert limited and limited[0]['until'] == pytest.approx(1000.0 + 32932)
+
+
+def test_simultaneous_limit_and_auth_rows_pause_both_scopes_in_reaping(root, monkeypatch):
+    """Review 2026-11-27: an independent auth/infra row must survive beside a usage-limit
+    row in ordinary farm reaping; the job is still requeued once and spends no attempt."""
+    now = [1000.0]
+    monkeypatch.setattr(farm.time, 'time', lambda: now[0])
+
+    retries = []
+    real_retry = farm.Farm._retry_worker
+
+    def counting(self, job):
+        retries.append(job['fn'])
+        return real_retry(self, job)
+    monkeypatch.setattr(farm.Farm, '_retry_worker', counting)
+
+    def plan(job):
+        if job['model'] == 'zz/b':
+            return ScriptedHandle(code=None)               # the survivor keeps running
+        log = root / 'run' / 'worker.jsonl'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        rows = [
+            {'type': 'error', 'error': {
+                'type': 'provider.go-limit', 'status': 429, 'retryAfterMs': 600000,
+                'message': 'OpenCode Go usage limit reached.'}},
+            {'type': 'error', 'error': {
+                'type': 'provider.auth', 'status': 403,
+                'message': 'You have run out of credits or need a Grok subscription.'}}]
+        log.write_text(''.join(json.dumps(row) + chr(10) for row in rows))
+        h = ScriptedHandle(code=1)
+        h.provider_errors = farm.OpencodeHandle(None, log).provider_errors
+        return h
+
+    f, cmre, launcher = scripted_farm(root, plan, lambda: 0.0, ladder=['go/a', 'zz/b'])
+    f.tick()
+    f.tick()
+    names = [e['event'] for e in events(f.run_dir)]
+    assert 'model-limited' in names and 'model-unavailable' in names
+    assert 'go' in f.state['limited_providers']            # the usage-limit scope is paused
+    assert 'run out of credits' in f.state['unavailable_models'].get('go/a', '')
+    assert retries == ['fn_00401000']                      # requeued once, not once per error
+    assert 'fn_00401000' not in f.state['attempts']
+    assert [j['model'] for j, _, _ in launcher.started] == ['go/a', 'zz/b']
+
+
+def test_a_method_per_detector_double_keeps_the_limit_first_overlap_rule(root, monkeypatch):
+    """A double that cannot say whether both hits were one row keeps limit-first suppression;
+    row-aware independence needs the provider_errors API."""
+    now = [1000.0]
+    monkeypatch.setattr(farm.time, 'time', lambda: now[0])
+
+    def plan(job):
+        h = limited_handle()
+        h.infra_error = lambda: 'You have run out of credits'
+        return h
+
+    f, cmre, launcher = scripted_farm(root, plan, lambda: 0.0, ladder=['go/a'])
+    f.tick()
+    f.tick()
+    names = [e['event'] for e in events(f.run_dir)]
+    assert 'model-limited' in names and 'model-unavailable' not in names
 
 
 def test_a_limited_translation_keeps_its_written_draft_for_the_retry(root, monkeypatch):
@@ -6733,3 +6991,234 @@ def test_devin_launcher_routing_config_report_and_resume(root, monkeypatch):
 
     pcmd = farm.probe_command('v2', 'devin/swe-2-1-high')
     assert '--model' in pcmd and pcmd[pcmd.index('--model') + 1] == 'swe-2-1-high'
+
+
+# --- hint proposal terminal states and input-supply reconciliation (2026-11-27) -----
+# Run 20261115T1250Z held 54 hint_proposals rows with no terminal state: 5 were already
+# accepted and others had their inputs applied or superseded, yet they still listed as
+# hint-evidence work. An applied proposal never re-gated the retained candidate either.
+
+def park_hint_proposal(root):
+    """A translation worker whose private hint proposal parks its function for the parent."""
+    hint = root / 'recovery/hints/fn_00401000.json'
+    shared = {'arg_count': 2, 'fixtures': [hint_fixture(7)]}
+    hint.write_text(json.dumps(shared))
+    proposal = {**shared, 'c_hints': {'fixtures': [hint_fixture(9)]}}
+
+    def behaviour(job, r):
+        Path(job['hint_source']).write_text(json.dumps(proposal))
+        writes(GOOD)(job, r)
+
+    f, cmre, launcher = make(root, [item('fn_00401000')], behaviour, workers=1,
+                             continuous=True, rescan_seconds=0)
+    drain(f)
+    assert 'fn_00401000' in f.state['hint_proposals']
+    assert 'fn_00401000' in f.state['parked']
+    assert cmre.accepted == []
+    return f, cmre, launcher, shared, proposal
+
+
+def test_a_new_hint_proposal_is_pending_and_carries_its_recheck_binding(root):
+    f, cmre, launcher, shared, proposal = park_hint_proposal(root)
+    row = f.state['hint_proposals']['fn_00401000']
+    assert row['state'] == 'pending'
+    assert row['source'].endswith('fn_00401000.c') and row['source_sha256']
+    assert row['bytes'] == 200 and row['model'] == 'm/cheap'
+
+
+def test_unchanged_hints_leave_a_hint_proposal_pending_without_a_recheck(root):
+    f, cmre, launcher, shared, proposal = park_hint_proposal(root)
+    tests = len(cmre.tests)
+    drain(f)
+    assert f.state['hint_proposals']['fn_00401000']['state'] == 'pending'
+    assert len(cmre.tests) == tests and cmre.accepted == []
+    assert not [e for e in events(f.run_dir) if e['event'] == 'recheck']
+
+
+def test_applying_a_hint_proposal_closes_it_and_regates_the_retained_candidate(root):
+    f, cmre, launcher, shared, proposal = park_hint_proposal(root)
+    started = len(launcher.started)
+    (root / 'recovery/hints/fn_00401000.json').write_text(json.dumps(proposal))
+    drain(f)
+    assert f.state['hint_proposals']['fn_00401000']['state'] == 'applied'
+    assert cmre.accepted == ['fn_00401000']
+    assert len(launcher.started) == started       # the re-gate cost no model attempt
+    names = [e['event'] for e in events(f.run_dir)]
+    assert names.count('input-arrived') == 1 and names.count('recheck') == 1
+
+
+def test_inputs_other_than_the_proposal_close_it_superseded_and_still_regate(root):
+    f, cmre, launcher, shared, proposal = park_hint_proposal(root)
+    other = {**shared, 'fixtures': [hint_fixture(7), hint_fixture(3)]}
+    (root / 'recovery/hints/fn_00401000.json').write_text(json.dumps(other))
+    drain(f)
+    assert f.state['hint_proposals']['fn_00401000']['state'] == 'superseded'
+    assert cmre.accepted == ['fn_00401000']
+
+
+def test_an_accepted_function_closes_its_hint_proposal_without_a_recheck(root):
+    f, cmre, launcher, shared, proposal = park_hint_proposal(root)
+    tests = len(cmre.tests)
+    f.state['accepted']['fn_00401000'] = {'bytes': 200}
+    drain(f, 3)
+    assert f.state['hint_proposals']['fn_00401000']['state'] == 'accepted'
+    assert len(cmre.tests) == tests
+    assert 'fn_00401000' not in f.state.get('input_needed', {})
+
+
+def test_a_legacy_proposal_without_a_retained_candidate_defers_with_a_reason(root):
+    f, cmre, launcher = make(root, [], writes(GOOD), workers=0, continuous=True, rescan_seconds=0)
+    hint = root / 'recovery/hints/fn_00401000.json'
+    hint.write_text(json.dumps({'arg_count': 2}))
+    dispatch = hashlib.sha256(hint.read_bytes()).hexdigest()
+    f.state['parked']['fn_00401000'] = {'detail': 'private hint proposal requires parent validation',
+                                        'models': ['m/cheap']}
+    f.state['hint_proposals']['fn_00401000'] = {
+        'receipt': 'x.json', 'dispatch_identity': {'c': None, 'hint': dispatch}, 'sha256': '1' * 64}
+    f.save()
+    hint.write_text(json.dumps({'arg_count': 2, 'fixtures': []}))
+    drain(f, 3)
+    row = f.state['hint_proposals']['fn_00401000']
+    assert row['state'] == 'superseded'
+    assert 'fn_00401000' not in f.state.get('input_needed', {})
+    assert row['deferred']
+
+
+def test_a_legacy_proposal_binds_the_conventional_retained_candidate(root):
+    f, cmre, launcher = make(root, [item('fn_00401000')], writes(GOOD), workers=1, continuous=True, rescan_seconds=0)
+    hint = root / 'recovery/hints/fn_00401000.json'
+    hint.write_text(json.dumps({'arg_count': 2}))
+    dispatch = hashlib.sha256(hint.read_bytes()).hexdigest()
+    f.state['parked']['fn_00401000'] = {'detail': 'private hint proposal requires parent validation',
+                                        'models': ['m/cheap']}
+    f.state['hint_proposals']['fn_00401000'] = {
+        'receipt': 'x.json', 'dispatch_identity': {'c': None, 'hint': dispatch}, 'sha256': '1' * 64}
+    f.seen.add('fn_00401000')
+    (f.run_dir / 'src').mkdir(exist_ok=True)
+    (f.run_dir / 'src' / 'fn_00401000.c').write_text(GOOD)
+    f.save()
+    hint.write_text(json.dumps({'arg_count': 2, 'fixtures': []}))
+    drain(f)
+    assert cmre.accepted == ['fn_00401000']
+    assert [e['event'] for e in events(f.run_dir)].count('recheck') == 1
+
+
+def test_a_terminal_proposal_leaves_the_hint_evidence_lane(root):
+    f, cmre, launcher, shared, proposal = park_hint_proposal(root)
+    (root / 'recovery/hints/fn_00401000.json').write_text(json.dumps(proposal))
+    drain(f)
+    detail = f.state['parked'].get('fn_00401000', {}).get('detail', '')
+    assert farm.parked_lane('fn_00401000', detail, f.state) != 'hint-evidence'
+
+
+def test_input_supply_queue_orders_three_sources_by_bytes_and_shows_dispositions():
+    state = {
+        'accepted': {'fn_gone': {'bytes': 100}},
+        'parked': {'fn_a': {}, 'fn_b': {}, 'fn_gone': {}},
+        'input_needed': {'fn_a': {'bytes': 500, 'coverage': 0.4, 'hints_sha256': 'same'},
+                         'fn_gone': {'bytes': 100, 'coverage': 0.3, 'hints_sha256': 'same'}},
+        'hint_proposals': {'fn_b': {'bytes': 900, 'state': 'pending', 'receipt': 'r.json'},
+                           'fn_done': {'bytes': 400, 'state': 'applied', 'receipt': 'r2.json'}},
+    }
+    lane_rows = {'fn_c': {'bytes': 700, 'attempts': [{}],
+                          'plateau': {'obligation': 'import-transcript', 'coverage': 0.5}},
+                 'fn_d': {'bytes': 300, 'attempts': [{}]},
+                 'fn_acc': {'bytes': 9999, 'status': 'accepted'}}
+    queue = farm.input_supply_queue(state, lane_rows, hint_identity=lambda fn: 'same')
+    by_fn = {i['fn']: i for i in queue}
+    assert 'fn_done' not in by_fn and 'fn_acc' not in by_fn and 'fn_gone' not in by_fn
+    assert [i['fn'] for i in queue] == ['fn_b', 'fn_c', 'fn_a', 'fn_d']
+    assert by_fn['fn_b']['disposition'] == 'awaiting-validation'
+    assert by_fn['fn_c']['disposition'] == 'plateaued'
+    assert 'import-transcript' in by_fn['fn_c']['reason']
+    assert by_fn['fn_a']['disposition'] == 'awaiting-inputs'
+    assert by_fn['fn_d']['disposition'] == 'queued'
+
+
+def test_input_supply_queue_classifies_lane_rows_by_current_harness_and_key():
+    state = {'accepted': {}, 'parked': {}}
+    lane_rows = {
+        'fn_reopened': {'bytes': 100, 'key': 'k', 'attempts': [{'harness': 'old'}] * 3},
+        'fn_capped': {'bytes': 200, 'key': 'k', 'attempts': [{'harness': 'H'}] * 3},
+        'fn_new_inputs': {'bytes': 300, 'key': 'old-key', 'attempts': [{'harness': 'H'}] * 3},
+        'fn_old_plateau': {'bytes': 400, 'key': 'k',
+                           'plateau': {'harness': 'old', 'coverage': 0.4, 'obligation': 'input'}},
+        'fn_legacy_plateau': {'bytes': 450, 'key': 'k',
+                              'plateau': {'coverage': 0.4, 'obligation': 'input'}},
+        'fn_current_plateau': {'bytes': 475, 'key': 'k',
+                               'plateau': {'harness': 'H', 'coverage': 0.4, 'obligation': 'input'}},
+        'fn_partial': {'bytes': 500, 'key': 'k', 'attempts': [{'harness': 'H'}]},
+        'fn_terminal_missing_harness': {'bytes': 600, 'key': 'k', 'status': 'fail'},
+        'fn_terminal_current_harness': {'bytes': 700, 'key': 'k', 'status': 'fail', 'harness': 'H'},
+        'fn_terminal_old_harness': {'bytes': 800, 'key': 'k', 'status': 'error', 'harness': 'old'},
+        'fn_terminal_changed_key': {'bytes': 850, 'key': 'old-key', 'status': 'fail', 'harness': 'H'},
+        'fn_pass_changed_key': {'bytes': 900, 'key': 'old-key', 'status': 'pass-unaccepted'},
+        'fn_pass_same_key': {'bytes': 1000, 'key': 'k', 'status': 'pass-unaccepted'},
+    }
+    queue = farm.input_supply_queue(state, lane_rows, lane_harness='H', lane_key=lambda fn: 'k')
+    by_fn = {item['fn']: item for item in queue}
+    assert by_fn['fn_reopened']['disposition'] == 'queued'
+    assert by_fn['fn_new_inputs']['disposition'] == 'queued'
+    assert by_fn['fn_old_plateau']['disposition'] == 'queued'
+    assert by_fn['fn_legacy_plateau']['disposition'] == 'queued'
+    assert by_fn['fn_current_plateau']['disposition'] == 'plateaued'
+    assert by_fn['fn_partial']['disposition'] == 'queued'
+    assert by_fn['fn_capped']['disposition'] == 'deferred'
+    assert 'new inputs or a harness release' in by_fn['fn_capped']['reason']
+    assert by_fn['fn_terminal_missing_harness']['disposition'] == 'queued'
+    assert by_fn['fn_terminal_old_harness']['disposition'] == 'queued'
+    assert by_fn['fn_terminal_changed_key']['disposition'] == 'queued'
+    assert by_fn['fn_pass_changed_key']['disposition'] == 'queued'
+    assert 'fn_terminal_current_harness' not in by_fn
+    assert 'fn_pass_same_key' not in by_fn
+
+
+def test_input_supply_pass_unaccepted_is_key_aware_and_same_key_is_harness_independent():
+    rows = {'fn_same': {'bytes': 100, 'key': 'k', 'status': 'pass-unaccepted', 'harness': 'H1'},
+            'fn_changed': {'bytes': 200, 'key': 'old', 'status': 'pass-unaccepted', 'harness': 'H1'}}
+    for digest in ('H1', 'H2'):
+        queue = farm.input_supply_queue({'accepted': {}, 'parked': {}}, rows,
+                                        lane_harness=digest, lane_key=lambda fn: 'k')
+        by_fn = {item['fn']: item for item in queue}
+        assert 'fn_same' not in by_fn
+        assert by_fn['fn_changed']['disposition'] == 'queued'
+
+
+def test_input_supply_queue_marks_arrived_inputs_recheck_pending():
+    state = {'accepted': {}, 'parked': {'fn_a': {}},
+             'input_needed': {'fn_a': {'bytes': 500, 'coverage': 0.4, 'hints_sha256': 'old'}}}
+    queue = farm.input_supply_queue(state, {}, hint_identity=lambda fn: 'new')
+    assert queue[0]['disposition'] == 'recheck-pending'
+
+
+def test_input_supply_queue_surfaces_explicit_deferred_reasons():
+    state = {'accepted': {}, 'parked': {'fn_b': {}},
+             'hint_proposals': {'fn_b': {'bytes': 900, 'state': 'superseded', 'receipt': 'r',
+                                         'deferred': 'no retained-candidate binding; explicit retry required'}}}
+    queue = farm.input_supply_queue(state, {})
+    assert queue[0]['disposition'] == 'deferred' and 'retry' in queue[0]['reason']
+
+
+def test_input_supply_cli_prints_the_ordered_queue(root, capsys):
+    f, cmre, launcher, shared, proposal = park_hint_proposal(root)
+    assert farm.main(['input-supply', str(f.run_dir)]) == 0
+    out = capsys.readouterr().out
+    assert 'fn_00401000' in out and 'awaiting-validation' in out
+
+
+def test_input_supply_report_without_lane_rows_does_not_import_the_harness(root, monkeypatch, capsys):
+    run = root / 'run-report'
+    run.mkdir()
+    (run / 'state.json').write_text(json.dumps({'accepted': {}, 'parked': {}}))
+    monkeypatch.setattr(farm, 'ROOT', root)
+    import builtins
+    real_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == 'cmre' and 'recover' in (fromlist or ()):
+            raise AssertionError('report-only input-supply imported cmre.recover')
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, '__import__', guarded_import)
+    assert farm.main(['input-supply', str(run)]) == 0
+    assert '0 functions, 0 B' in capsys.readouterr().out

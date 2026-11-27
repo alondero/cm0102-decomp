@@ -8,7 +8,10 @@ the selected workflow holds its procedure. Acceptance policy:
 ## 1. Preflight
 
 Run `py -3.13 scripts/cmre_session.py start` once per parent session (doctor,
-status, full pytest or exact-input receipt reuse; prints a receipt path). Workers inherit it. If pytest fails,
+status, full pytest or exact-input receipt reuse; prints a receipt path).
+Every child agent, expert lane or delegated worker is a worker: the parent
+supplies the receipt path and the worker inherits it. Child preflights hold the
+writer lease for a full pytest run and block acceptance. If pytest fails,
 record the failing node IDs: a recovery continuation starts with that defect;
 an explicitly requested docs/tooling task may proceed and report it. Note
 existing `git status --short` changes and leave unrelated work alone.
