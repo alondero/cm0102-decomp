@@ -32,8 +32,8 @@ The gate runs every hinted input once, deterministically, before the random case
   code-as-data at most 2%, stack-layout waivers at most 2%. Hinted-input cases
   add to the counts only.
 - Each stream keeps its own five-entry mismatch report allowance (hinted, then
-  random). The random cases therefore report exactly the entries they reported
-  before, so a witness a mutation proof read is still in the report.
+  random). The random cases therefore report the entries they reported before,
+  so a witness a mutation proof read is still in the report.
 - `difftest.explain` accepts case numbers `0 .. cases + input_cases - 1` and
   refuses others. It replays a hinted input directly, building no other case,
   and a random case exactly as before (`gate_cases(..., only=N)`).
@@ -78,7 +78,14 @@ hinted input.
 Operand and `__ftol` mutation kills are preserved for the same reason: a mutant
 killed on a random case still mismatches on that same case number, and the
 separate report allowance keeps that witness in the report
-(`test_hinted_mismatches_cannot_crowd_out_random_case_witnesses`).
+(`test_hinted_mismatches_cannot_crowd_out_random_case_witnesses`). Two outcomes
+can still turn a former kill into `unresolved`, which fails safe: a mutant that
+also exhausts the budget on a hinted input (`mutate.classify_control` treats any
+budget-asymmetry entry as unresolved), and a mutant whose hinted inputs add
+inconclusive cases beyond its passing baseline's (`operand_evidence`). The
+random-case report entries are the previous ones, except that hinted
+stack-layout cases can push the total over the 2% limit and add
+stack-layout-excess entries, which again only makes the gate stricter.
 
 Measured on real functions (lifted `exact` gate, identical hints on both sides):
 the per-case normalized result digest of all random cases was byte-identical
@@ -153,6 +160,18 @@ measured about 3.5 h of wall time at eight workers for 11,265 tiers; there are
 now 13,519). That runs at a batch boundary
 under the writer lease. Any tier that fails is named in the release record and
 resolved through `cmre` (retract, repair or re-hint), never hidden.
+
+## Review
+
+Independent review (2026-11-27, `cm-evidence-reviewer`) approved the release
+with six non-blocking findings. It reproduced the failing test on the old
+harness (5 of 40 fixtures ran; the fixture-only mutant passed) and checked the
+digests, the random-case identity and the measurement table. Fixed before
+merge: separate report allowances, single-case replay (`only=`), the
+`cmre_page_writes.py` replay order, the paired-diagnostics wording, and this
+record's coverage wording, invalidation list and counts. A re-review approved
+the fixes; its two wording nits are folded into the sections above. Not
+re-checked: that a composition re-run reproduces its previous result.
 
 ## Consequences
 
