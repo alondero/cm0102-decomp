@@ -87,6 +87,43 @@ Keep the normal acceptance budget and coverage threshold. A short original-only
 probe is input exploration, not acceptance evidence; run the full `cmre accept`
 gate before reporting recovery.
 
+
+## Localize a C gate mismatch
+
+Use the retained report from the failed C gate and the exact source it built.
+
+```powershell
+py -3.13 -m cmre localize fn_005c8a00 --report PATH/report.json --source PATH/candidate.c
+```
+
+With only the function ID, the command uses the canonical C file and looks up
+its latest retained failing gate. It prefers an O2 run with mismatches, then
+O0. Use `--opt=-O0` to select a build explicitly. To test a draft with no
+retained gate, run the usual `cmre test FN --c --source PATH --profile semantic`
+first.
+
+The command checks the gate's source, execution identity and effective C
+options. It regenerates the corpus through its first retained mismatching case
+and checks that the mismatch recurs at the gate's budget. The JSON report in
+`CM0102/Analysis/cmre/scratch/localize-*/report.json` links the gate and source
+hashes to observed addresses, the ordered import comparison, differing final
+memory bytes and their write sites, and the stop or return state. Where
+applicable it also shows caller-stack writes and the last observed changes to
+disagreeing registers. External helper transfers provide context.
+Compiler-local instruction streams have no general alignment.
+
+`candidate-source-defect` marks a reproduced observable difference to
+investigate. `harness-boundary` identifies a stop or dependency on an execution
+boundary such as a budget without a comparable event, dead stack contents,
+or import transport. `input-gap` means the selected run had only a coverage
+failure. The report can remain unclassified when there is no comparable
+witness. A localized point identifies a visible effect or its last writer.
+The source of the value can be earlier in the execution.
+
+The archived `fn_005c8a00` regression runs when `CMRE_LOCALIZE_REPRO` points to
+a local directory containing `gate.json`, the SHA-matched `fn_005c8a00.c`,
+and the gate's snapshot at `hints/fn_005c8a00.json`.
+
 ## Input-family loop
 
 Use this loop for a named input gap or several consumers of the same layout.

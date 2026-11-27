@@ -1012,6 +1012,8 @@ def main(argv=None) -> int:
     screen.add_commands(sub)
     from . import retract
     retract.add_commands(sub)
+    from . import localize
+    localize.add_commands(sub, _va)
     a = p.parse_args(argv)
     from .coordination import BusyError, writer
     try:
