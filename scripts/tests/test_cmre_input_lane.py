@@ -106,7 +106,7 @@ class Ops:
 
     def gate(self, fn, spec, model):
         self.gates.append((fn, model))
-        return {'proposal': str(spec.with_suffix('.p.json')), 'prior_sha256': 'h' * 64,
+        return {'proposal': str(spec.with_suffix('.p.json')), 'prior_sha256': 'h' * 64, 'tool': probe.TOOL_VERSION,
                 **self.gate_result.get(fn, {'status': 'low-coverage', 'coverage': 0.4})}
 
     def apply(self, fn, expected, proposal, proposal_sha256=None):
@@ -960,7 +960,7 @@ def gate_sequence(ops, fn, coverages, status='low-coverage'):
         coverage = next(results, coverages[-1])
         ops.gates.append((fn_, model))
         return {'status': status, 'coverage': coverage, 'prior_sha256': 'h' * 64,
-                'first_uncovered': ['0x00401aa0']}
+                'first_uncovered': ['0x00401aa0'], 'tool': probe.TOOL_VERSION}
     ops.gate = gate
 
 
@@ -1113,7 +1113,7 @@ def test_error_attempts_do_not_count_toward_the_plateau(tmp_path):
         coverage = next(coverages, 0.5)
         ops.gates.append((fn_, model))
         status = 'error' if coverage is None else 'low-coverage'
-        return {'status': status, 'coverage': coverage, 'prior_sha256': 'h' * 64}
+        return {'status': status, 'coverage': coverage, 'prior_sha256': 'h' * 64, 'tool': probe.TOOL_VERSION}
     ops.gate = gate
     for _ in range(8):
         l.tick()
@@ -1494,3 +1494,77 @@ def test_a_spec_at_the_expansion_limit_runs_and_one_over_is_refused_with_advice(
         probe.expand({'fixtures': [{'vary': [{'field': 'import_seed', 'range': [0, 25]},
                                              {'field': 'stack.0', 'range': [0, 25]}]}]}, 1,
                      _fake_context(0x100)[3])
+
+
+# --- probe selection cap and model-free re-gates (2026-11-27) ----------------------
+
+def test_a_gate_can_keep_well_over_48_fixtures_that_each_reach_new_code():
+    # 27 Nov: the lane's own best specs reached 0.91-0.96 original-only coverage on
+    # fn_005576e0/fn_00487f60, but 48 greedy picks kept only 0.55/0.53, exactly the
+    # coverage the gate recorded. The cap, not the authoring, was binding.
+    rows = [(f'f{i}', {'i': i}, {i}, 'return') for i in range(150)]
+    assert len(probe.select(rows, baseline=set())) == 150
+    assert probe.MAX_SELECTED >= 150
+    assert probe.TOOL_VERSION != 'input-probe/1'
+
+
+def _regate_lane(tmp_path, fn, gate, attempts=3, plateau=True, **row):
+    l, ops, launcher, clock = make_lane(tmp_path, {fn: candidate(9000, 0.55)}, gate={fn: gate})
+    spec = l.dir / 'specs' / f'{fn}-7.json'
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text('{"fixtures": [{"name": "a"}]}\n')
+    state = {'key': 'k1', 'bytes': 9000,
+             'attempts': [{'n': i, 'model': 'p/cheap', 'status': 'low-coverage', 'coverage': 0.55,
+                           'harness': 'H1'} for i in range(attempts)],
+             'best': {'spec': str(spec), 'coverage': 0.55, 'model': 'q/strong', 'detail': 'gate low-coverage'}}
+    if plateau:
+        state['plateau'] = {'at': 1, 'coverage': 0.55, 'harness': 'H1', 'obligation': 'input'}
+    state.update(row)
+    l.state['functions'][fn] = state
+    return l, ops, launcher, spec
+
+
+def test_a_best_spec_gated_by_an_older_probe_is_regated_without_a_model(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, spec = _regate_lane(tmp_path, fn, {'status': 'pass', 'coverage': 0.83})
+    l.tick()
+    assert launcher.started == []                         # no model time
+    assert ops.gates == [(fn, 'q/strong')]                # provenance keeps the authoring model
+    assert ops.applies == [(fn, 'h' * 64)]
+    row = l.state['functions'][fn]
+    assert row['status'] == 'accepted'
+    assert len(row['attempts']) == 3                      # a re-gate is not a model attempt
+    assert row['regates'][0]['status'] == 'pass' and row['regates'][0]['tool'] == probe.TOOL_VERSION
+    regated = [e for e in lane._events(l.dir / 'events.jsonl') if e['event'] == 'regate']
+    assert regated and regated[0]['fn'] == fn and regated[0]['of'] == str(spec)
+
+
+def test_a_regate_runs_once_per_probe_version_and_leaves_the_plateau(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': 'low-coverage', 'coverage': 0.58})
+    l.tick()
+    l.tick()
+    l.refresh(force=True)
+    l.tick()
+    assert ops.gates == [(fn, 'q/strong')]
+    row = l.state['functions'][fn]
+    assert row['best']['coverage'] == 0.58 and row['best']['probe_tool'] == probe.TOOL_VERSION
+    assert row['plateau']['harness'] == 'H1' and len(row['attempts']) == 3
+    assert launcher.started == []                         # still plateaued: no model either
+
+
+@pytest.mark.parametrize('row', [{'status': 'accepted'}, {'status': 'fail', 'harness': 'H1'},
+                                 {'key': 'old'}, {'status': 'pass-unaccepted'}])
+def test_a_regate_skips_settled_or_stale_rows(tmp_path, row):
+    fn = 'fn_00401000'
+    l, ops, launcher, _ = _regate_lane(tmp_path, fn, {'status': 'pass', 'coverage': 0.9}, **row)
+    l.tick()
+    assert all(model != 'q/strong' for _, model in ops.gates)
+
+
+def test_a_regate_needs_the_spec_file(tmp_path):
+    fn = 'fn_00401000'
+    l, ops, launcher, spec = _regate_lane(tmp_path, fn, {'status': 'pass', 'coverage': 0.9})
+    spec.unlink()
+    l.tick()
+    assert ops.gates == []

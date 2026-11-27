@@ -42,11 +42,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-TOOL_VERSION = 'input-probe/1'
+TOOL_VERSION = 'input-probe/2'
 PROVENANCE_KIND = 'authored-structured-entry-inputs'
 MAX_EXPANDED = 600      # fixtures one spec may expand to: the gate runs 600 cases (difftest.DEFAULTS['cases'])
                         # and a fixture is only drawn among them, so more expansions can never run
-MAX_SELECTED = 48       # fixtures one gate adds: each must still be drawn among ~300 fixture cases
+MAX_SELECTED = 192      # fixtures one gate adds. Half of the 600 cases draw a fixture or capture whatever
+                        # the count, so the cap only bounds effectiveness: about 1.5 draws each at 192.
+                        # At 48 (input-probe/1) specs reaching 0.91-0.96 kept 0.53-0.55 (27 Nov).
 SPEC_KEYS = {'notes', 'base', 'fixtures'}
 FIXTURE_KEYS = {'name', 'regs', 'stack', 'template', 'zero', 'dwords', 'bytes', 'ascii',
                 'globals', 'import_seed', 'fpcw', 'vary'}
@@ -371,7 +373,7 @@ def gate_spec(va, spec, spec_bytes, proposal_path, model=None):
         raise ValueError('proposal would change existing hints; only appended fixtures are allowed')
     encoded = (json.dumps(proposal, indent=1) + '\n').encode('utf-8')
     Path(proposal_path).write_bytes(encoded)
-    result = {'fn': f'fn_{va:08x}', 'expanded': len(rows), 'selected': len(picked),
+    result = {'fn': f'fn_{va:08x}', 'tool': TOOL_VERSION, 'expanded': len(rows), 'selected': len(picked),
               'baseline_coverage': round(len(baseline) / len(starts), 4) if starts else 0.0,
               'proposal': str(proposal_path), 'proposal_sha256': hashlib.sha256(encoded).hexdigest(),
               'prior_sha256': hashlib.sha256(raw).hexdigest() if raw is not None else None}

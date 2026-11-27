@@ -830,6 +830,16 @@ the fixtures that reach new instructions to the canonical hints under the writer
 lease, and runs `cmre accept`. A refused accept restores the previous hints.
 New lifts reach the C translators on the next frontier rescan.
 
+- One gate appends at most 192 fixtures (`MAX_SELECTED` in
+  `scripts/cmre_input_probe.py`). The probe records its `TOOL_VERSION` on every
+  gate result and the lane stores it on the function's best spec. A best spec gated
+  by an older probe is **re-gated** once, with no model call (`regate` event, up to
+  two in flight): the copy is gated, applied and accepted exactly like a worker's
+  spec, its row lists it under `regates`, and it counts toward neither the three
+  attempts nor a plateau. On 27 Nov the old 48-fixture cap held specs whose
+  fixtures reached 0.91-0.96 of `fn_005576e0`/`fn_00487f60` to the 0.53-0.55 the
+  gate recorded; bump `TOOL_VERSION` whenever a probe change can turn a held spec
+  into a pass.
 - When a worker probe finishes with a pass or mismatch, the lane can collect it
   before the worker exits. It freezes the spec only if its hash and the probe's
   base-hint hash match, then stops the worker and runs its usual independent gate

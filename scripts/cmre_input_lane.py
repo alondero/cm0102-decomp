@@ -43,6 +43,7 @@ INFRA_PAUSE_SECONDS = 3600   # auth/key failure: pause the provider, retry hourl
 CANDIDATE_REFRESH_SECONDS = 600
 IDLE_REFRESH_SECONDS = 60     # an idle lane re-scans (about 7 s of CPU) at most this often
 SCREEN_JOBS = 2
+REGATE_JOBS = 2             # model-free re-gates of best specs in flight (each is one full lifted gate)
 SKIP_STATUSES = ('lift-blocked', 'fail', 'error', 'not-unlifted')
 WORKER_COMMANDS = ('brief', 'test', 'explain', 'show', 'disasm', 'family', 'work show')
 # Narrower than the farm's list: `rg --pre` runs a program and `sed -n` accepts `w FILE`/`-i`.
@@ -99,6 +100,12 @@ def _save(path, state):
     tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(state, indent=1, sort_keys=True) + '\n', encoding='utf-8')
     os.replace(tmp, path)
+
+
+def probe_tool():
+    """The input probe's tool version: a best spec gated by an older probe is re-gated once."""
+    import cmre_input_probe
+    return cmre_input_probe.TOOL_VERSION
 
 
 def current_attempts(row, harness):
@@ -402,6 +409,80 @@ class Lane:
                 info['coverage'] = row['coverage']   # this lane's own screen of the same hints
         self.queue = plan(self.candidates, self.state['functions'], self._busy(), self.harness)
 
+    def regate(self):
+        """Re-gate each function's best spec once per probe tool version, with no model.
+
+        A probe release can turn a spec the lane already holds into a pass: on 27 Nov
+        the 48-fixture cap kept 0.53-0.55 of specs whose fixtures reached 0.91-0.96.
+        A re-gate is not a model attempt. It counts toward neither MAX_ATTEMPTS nor a
+        plateau, and its result is applied exactly like a worker's (FARM.md "Input lane")."""
+        if self.stopping():
+            return
+        tool = probe_tool()
+        busy = self._busy()
+        inflight = sum(1 for job, _, _, _ in self.gating if job.get('kind') == 'regate')
+        todo = []
+        for fn, info in self.candidates.items():
+            row = self.state['functions'].get(fn)
+            if (not row or fn in busy or row.get('key') != info['key'] or info.get('status') in SKIP_STATUSES
+                    or row.get('status') in ('accepted', 'pass-unaccepted', *SKIP_STATUSES)
+                    or row.get('pending_apply')):
+                continue
+            best = row.get('best') or {}
+            if best.get('spec') and best.get('probe_tool') != tool:
+                todo.append((-(best.get('coverage') or 0), -info['bytes'], fn))
+        submitted = False
+        for _, _, fn in sorted(todo):
+            if inflight >= REGATE_JOBS:
+                break
+            info, best = self.candidates[fn], self.state['functions'][fn]['best']
+            try:
+                data = Path(best['spec']).read_bytes()
+            except OSError:
+                continue
+            self.state['counter'] += 1
+            n = self.state['counter']
+            spec = self.dir / 'specs' / f'{fn}-{n}.regate.json'
+            spec.parent.mkdir(parents=True, exist_ok=True)
+            spec.write_bytes(data)
+            job = {'fn': fn, 'n': n, 'kind': 'regate', 'model': best.get('model') or 'unknown',
+                   'bytes': info['bytes'], 'coverage': info.get('coverage'),
+                   'threshold': info.get('threshold', 0.6), 'spec': str(spec),
+                   'hints_sha256': info['hints_sha256'], 'key': info['key'],
+                   'seed_sha256': hashlib.sha256(data).hexdigest(), 'harness': self.harness,
+                   'regate_of': best['spec'], 'tool': tool}
+            self.event('regate', fn=fn, n=n, of=best['spec'], coverage=best.get('coverage'),
+                       bytes=info['bytes'], tool=tool)
+            self._submit_gate(job, '', None)
+            inflight += 1
+            submitted = True
+        if submitted:
+            self.save()
+
+    def _finish_regate(self, job, row, result):
+        fn, status, coverage = job['fn'], result.get('status'), result.get('coverage')
+        row.setdefault('regates', []).append(
+            {'n': job['n'], 'status': status, 'coverage': coverage, 'tool': job['tool'], 'of': job['regate_of'],
+             'at': self.clock(), 'harness': job.get('harness', self.harness)})
+        best = row.get('best') or {}
+        if coverage is not None and status in ('low-coverage', 'pass') and coverage > (best.get('coverage') or 0):
+            best = {**best, 'spec': job['spec'], 'coverage': coverage, 'model': job['model'],
+                    'detail': f"regate {status}; first uncovered {result.get('first_uncovered', [])[:4]}"}
+        if best:
+            row['best'] = {**best, 'probe_tool': job['tool']}
+        self.event('result', fn=fn, n=job['n'], model=job['model'], status=status, coverage=coverage,
+                   kind='regate')
+        if status == 'pass':
+            self._apply(fn, row, {'proposal': result['proposal'], 'expected': job['hints_sha256'],
+                                  'sha256': result.get('proposal_sha256'), 'bytes': job['bytes'],
+                                  'model': job['model'], 'coverage': coverage})
+        elif status == 'fail':
+            row['status'] = 'fail'
+            row['harness'] = job.get('harness', self.harness)
+            row['mismatches'] = result.get('mismatches', [])[:3]
+            self.event('lift-mismatch', fn=fn, mismatches=row['mismatches'])
+        self.save()
+
     def _screen(self, fn):
         """A never-gated function is gated once on its canonical hints before any model time."""
         info = self.candidates[fn]
@@ -668,6 +749,8 @@ class Lane:
             self.save()
             return
         self.wake = True
+        if job.get('kind') == 'regate':
+            return self._finish_regate(job, row, result)
         attempt = {'n': job['n'], 'model': job['model'], 'status': status, 'coverage': coverage,
                    'claimed': claimed, 'interrupted': interrupted, 'at': self.clock(),
                    'harness': job.get('harness', self.harness)}
@@ -676,7 +759,8 @@ class Lane:
         if coverage is not None and status in ('low-coverage', 'pass') and (
                 best is None or coverage > (best.get('coverage') or 0)):
             row['best'] = {'spec': job['spec'], 'coverage': coverage, 'model': job['model'],
-                           'detail': f"gate {status}; first uncovered {result.get('first_uncovered', [])[:4]}"}
+                           'detail': f"gate {status}; first uncovered {result.get('first_uncovered', [])[:4]}",
+                           'probe_tool': result.get('tool')}
         self.event('result', fn=fn, n=job['n'], model=job['model'], status=status, coverage=coverage,
                    claimed=claimed, interrupted=interrupted)
         harness = job.get('harness', self.harness)
@@ -734,6 +818,8 @@ class Lane:
         self.retry_applies()
         idle = not self.queue and not self.running and not self.gating
         self.refresh(force=idle and self.wake, idle=idle)
+        self.regate()
+        self.process_gates()
         self.dispatch()
         self.save()
 
