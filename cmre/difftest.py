@@ -425,22 +425,27 @@ def hinted_inputs(opts: Options) -> list:
     return list(opts.hints.get("fixtures", [])) + list(opts.hints.get("captures", []))
 
 
-def gate_cases(opts: Options, global_inputs: set[int], templates: list[bytes]):
+def gate_cases(opts: Options, global_inputs: set[int], templates: list[bytes], *, only: int | None = None):
     """Yield (case number, case, discovering) in gate order.
 
     Every hinted input runs once first, as case number opts.cases + i, so a fixture's
     reach never depends on a random draw. Then the opts.cases random cases follow
     from Random(opts.seed) exactly as before: random case k keeps number k and its
     input, including its own random fixture draw. Discovery reads `global_inputs`
-    live, so the caller adds the globals its discovery cases read."""
+    live, so the caller adds the globals its discovery cases read. With `only` (a case
+    number), yield just the cases that replaying that one case needs: the hinted input
+    itself, or the random stream up to that random case."""
     if opts.inputs not in INPUT_POLICIES:
         raise ValueError(f"unknown input policy {opts.inputs!r}")
     size = emu.arena_capacity(opts.hints.get("arena_size", emu.ARENA_SIZE))
     padded = [t + bytes(size - len(t)) for t in templates]
     for i, chosen in enumerate(hinted_inputs(opts)):
-        yield opts.cases + i, _entry_policy(_hinted_case(opts, chosen, size, padded), opts), False
+        if only is None or only == opts.cases + i:
+            yield opts.cases + i, _entry_policy(_hinted_case(opts, chosen, size, padded), opts), False
+    if only is not None and only >= opts.cases:
+        return
     rng = random.Random(opts.seed)
-    for index in range(opts.cases):
+    for index in range(opts.cases if only is None else only + 1):
         yield index, make_case(rng, opts, sorted(global_inputs), templates), index < opts.discovery
 
 
@@ -838,7 +843,9 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
     amap = emu.AddressMap(built.symbols, call_returns, text.va, text.end)
     templates = arena_templates()
     outcomes: dict[str, int] = {}
-    mismatches = []
+    # Hinted inputs run first, so each stream keeps its own five-entry report allowance:
+    # the random cases report exactly the entries they reported before ADR 0015.
+    reported: dict[bool, list] = {True: [], False: []}
     inconclusive = 0
     extended_cases = 0
     extension_failed = False
@@ -852,9 +859,12 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
     compare_fp = bool(getattr(built.image, 'x87_bindings', ()))
     input_cases = 0
     # Limits below keep opts.cases as their denominator: hinted-input cases add to the
-    # counts only, so the gate never accepts what the random cases alone would reject.
+    # counts only, so every mismatch, inconclusive, code-as-data or stack-layout rejection
+    # of the random cases still holds. Hinted cases add coverage exactly as random cases do.
     for index, case, discovering in gate_cases(opts, global_inputs, templates):
-        input_cases += index >= opts.cases
+        hinted = index >= opts.cases
+        input_cases += hinted
+        mismatches = reported[hinted]
         own = _attribute(original, opts, discovering, region)
         a = original.run(va, case, opts.budget)
         fp_a = x87_transport.snapshot(original.uc) if compare_fp else None
@@ -917,8 +927,10 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
     excess_layout = len(stack_layout) > STACK_LAYOUT_LIMIT * opts.cases
     if excess_layout:
         # Too many cases lean on dead stack to call them hazards: they stay mismatches.
-        for index, difference in stack_layout[:max(0, 5 - len(mismatches))]:
-            mismatches.append({"case": index, "kind": "stack-layout-excess", **difference})
+        for hinted, mismatches in reported.items():
+            rows = [(i, d) for i, d in stack_layout if (i >= opts.cases) == hinted]
+            for index, difference in rows[:max(0, 5 - len(mismatches))]:
+                mismatches.append({"case": index, "kind": "stack-layout-excess", **difference})
     else:
         inconclusive += len(stack_layout)
     coverage = len(covered & insn_starts) / len(insn_starts) if insn_starts else 0.0
@@ -937,7 +949,7 @@ def run(va: int, region: tuple[int, int], insn_starts: set[int], built, call_ret
         "inconclusive": inconclusive,
         **({"recovered_budget_factor": RECOVERED_BUDGET_FACTOR, "recovered_budget_extended": extended_cases}
            if extended_cases else {}),
-        "mismatches": mismatches,
+        "mismatches": reported[True] + reported[False],
         "coverage": round(coverage, 4),
         "uncovered": sorted(f"{x:#010x}" for x in insn_starts - covered)[:40],
         "global_inputs": len(global_inputs),
@@ -983,17 +995,15 @@ def explain(va: int, region, insn_starts, built, call_returns, opts: Options, pr
     if case_index is not None and not (type(case_index) is int and 0 <= case_index < numbers):
         raise ValueError(f"case {case_index} is not in this gate: random cases are 0..{opts.cases - 1}"
                          f" and hinted inputs {opts.cases}..{numbers - 1}")
-    for index, case, discovering in gate_cases(opts, global_inputs, templates):
-        if case_index is not None and index != case_index and index >= opts.cases:
-            continue  # hinted inputs never feed later cases; run() resets the machine per case
+    # Hinted inputs never feed later cases and run() resets the machine per case, so a
+    # single case replays without the hinted inputs before it.
+    for index, case, discovering in gate_cases(opts, global_inputs, templates, only=case_index):
         own = _attribute(original, opts, discovering, region)
         if index == case_index:
             original.attribute_reads = True
         a = original.run(va, case, opts.budget)
         if discovering:
             global_inputs |= _global_reads(a, img, own)
-        if index == case_index:
-            break
         if case_index is None:
             if a.outcome == "fault":
                 (access, address, _), eip = a.detail

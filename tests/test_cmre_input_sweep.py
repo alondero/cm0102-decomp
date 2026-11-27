@@ -152,3 +152,30 @@ def test_control_report_must_run_every_pinned_hinted_input(ran, valid):
     else:
         with pytest.raises(ValueError, match='options differ'):
             mutate._validate_control_report(report, LEAP, 's', identity)
+
+
+def test_hinted_mismatches_cannot_crowd_out_random_case_witnesses(tmp_path):
+    # Mutation proofs read witnesses from the reported mismatches; hinted inputs
+    # run first, so they get their own report allowance.
+    text = lift.render(lift.discover(LEAP))
+    assert '    jns v_0054cff8' in text
+    altered = text.replace('    jns v_0054cff8', '    js v_0054cff8', 1)
+    fixtures = [year_fixture(1991 + 2 * i, i + 1) for i in range(6)]
+    _, args = gate(tmp_path, altered, {'fixtures': fixtures}, cases=40)
+    result = difftest.run(*args)
+    numbered = [m['case'] for m in result['mismatches'] if 'note' not in m]
+    assert [n for n in numbered if n >= 40][:5] == [40, 41, 42, 43, 44]
+    assert len([n for n in numbered if n < 40]) == 5, result['mismatches']
+
+
+def test_replaying_one_case_builds_only_what_it_needs(monkeypatch):
+    def unavailable(*args):
+        raise ValueError('capture unavailable')
+    monkeypatch.setattr(difftest, '_capture_case', unavailable)
+    opts = difftest.Options.for_function(0x00450A70, {'cases': 6})
+    opts.hints = {'fixtures': year_fixtures(3), 'captures': ['a' * 64]}
+    templates = difftest.arena_templates()
+    assert [n for n, _, _ in difftest.gate_cases(opts, set(), templates, only=2)] == [0, 1, 2]
+    assert [n for n, _, _ in difftest.gate_cases(opts, set(), templates, only=7)] == [7]
+    with pytest.raises(ValueError, match='capture'):
+        list(difftest.gate_cases(opts, set(), templates))

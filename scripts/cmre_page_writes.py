@@ -40,7 +40,7 @@ def _run_on_page(run, machine, entry, case, budget, page, limit):
 def replay(va, case_index, page, *, c=False, source=None, opt="-O2", limit=256,
            cases=None, budget=None, profile=None, window=6):
     """Run a single-threaded diagnostic replay, keeping only the final retry."""
-    from cmre import emu, recover
+    from cmre import difftest, emu, recover
     from cmre.cli import _diagnostic_source
 
     if type(case_index) is not int or case_index < 0:
@@ -52,6 +52,10 @@ def replay(va, case_index, page, *, c=False, source=None, opt="-O2", limit=256,
     if not c and (source is not None or profile is not None):
         raise ValueError("--source and --profile require --c")
     overrides = {key: val for key, val in (("cases", cases), ("budget", budget)) if val is not None}
+    # explain runs a random case k as original run k and a hinted input (number >= cases,
+    # ADR 0015) directly as its first original run.
+    random_cases = difftest.Options.for_function(va, overrides, tier="c" if c else "lifted").cases
+    position = case_index if case_index < random_cases else 0
 
     base_run = emu.Machine.run
     original_index = 0
@@ -63,9 +67,9 @@ def replay(va, case_index, page, *, c=False, source=None, opt="-O2", limit=256,
         if side == "original":
             index = original_index
             original_index += 1
-            if index != case_index:
+            if index != position:
                 return base_run(machine, entry, case, budget)
-        elif original_index != case_index + 1:
+        elif original_index != position + 1:
             raise RuntimeError("unexpected recovered replay order")
         result, traces[side] = _run_on_page(base_run, machine, entry, case, budget, page, limit)
         return result
@@ -77,7 +81,7 @@ def replay(va, case_index, page, *, c=False, source=None, opt="-O2", limit=256,
                   else recover.explain(va, case_index, overrides, window=window))
     if report.get("case") == case_index:
         expected = {side for side in ("original", "recovered") if side in report}
-        if original_index != case_index + 1 or set(traces) != expected:
+        if original_index != position + 1 or set(traces) != expected:
             raise RuntimeError("explain replay does not match the observed run sequence")
         report["page_writes"] = {
             "page": f"{page:#010x}",
