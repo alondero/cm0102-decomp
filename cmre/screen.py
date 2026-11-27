@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import random
 import time
 
 from . import acceptance_request, coordination, difftest, emu, env, image, lift, recover, tasks
@@ -31,16 +30,16 @@ def observe(va: int, lifted, opts) -> dict:
     machine = emu.Machine(img, watch=region,
                           arena_size=opts.hints.get('arena_size', emu.ARENA_SIZE))
     difftest._stop_indirect(machine, None, region, None, recover._indirect_calls(lifted))
-    rng = random.Random(opts.seed)
     templates = difftest.arena_templates()
     globals_in, covered = set(), set()
     outcomes, stops = {}, {}
     first_return = None
-    for index in range(opts.cases):
-        case = difftest.make_case(rng, opts, sorted(globals_in), templates)
-        own = difftest._discovery(machine, opts, index, region)
+    input_cases = 0
+    for index, case, discovering in difftest.gate_cases(opts, globals_in, templates):
+        input_cases += index >= opts.cases
+        own = difftest._attribute(machine, opts, discovering, region)
         result = machine.run(va, case, opts.budget)
-        if index < opts.discovery:
+        if discovering:
             globals_in |= difftest._global_reads(result, img, own)
         covered |= result.covered
         outcomes[result.outcome] = outcomes.get(result.outcome, 0) + 1
@@ -52,7 +51,7 @@ def observe(va: int, lifted, opts) -> dict:
             location = 'function' if region[0] <= eip < region[1] else 'callee'
             stop = f'fault in {location} eip={eip:#010x} {difftest.ACCESS.get(access, access)}'
         stops[stop] = stops.get(stop, 0) + 1
-    return {'cases': opts.cases, 'outcomes': dict(sorted(outcomes.items())),
+    return {'cases': opts.cases, 'input_cases': input_cases, 'outcomes': dict(sorted(outcomes.items())),
             'stops': dict(sorted(stops.items())), 'first_return_case': first_return,
             'coverage': len(covered & set(lifted.insns)) / len(lifted.insns) if lifted.insns else 0.0,
             'uncovered': [f'{x:#010x}' for x in sorted(set(lifted.insns) - covered)],
@@ -108,7 +107,8 @@ def require_promotion(va: int, gate: dict, binding: dict | None) -> None:
     elif (not original_returns or not all(returns)
           or screened.get('status') != 'return-observed'
           or type(screened.get('first_return_case')) is not int
-          or not 0 <= screened['first_return_case'] < screened['cases']):
+          or not 0 <= screened['first_return_case']
+              < screened['cases'] + screened.get('input_cases', 0)):
         raise ValueError('Worktree promotion needs a top-level return in the screen and both C builds')
 
 

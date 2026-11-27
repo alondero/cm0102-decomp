@@ -831,7 +831,9 @@ lease, and runs `cmre accept`. A refused accept restores the previous hints.
 New lifts reach the C translators on the next frontier rescan.
 
 - One gate appends at most 192 fixtures (`MAX_SELECTED` in
-  `scripts/cmre_input_probe.py`). The probe records its `TOOL_VERSION` on every
+  `scripts/cmre_input_probe.py`). Every hinted fixture and capture runs once in
+  each gate ([ADR 0015](../adr/0015-hinted-inputs-run-once-per-gate.md)), so the
+  cap bounds gate time, not reach. The probe records its `TOOL_VERSION` on every
   gate result and the lane stores it on the function's best spec. A best spec gated
   by an older probe is **re-gated** once, with no model call (`regate` event, one
   in flight, none while `input_lane_workers` is 0): the copy is gated, applied and

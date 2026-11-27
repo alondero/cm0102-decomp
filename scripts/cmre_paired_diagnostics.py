@@ -287,7 +287,7 @@ def collect(report_path, entry, through, shape_path, output):
                'elapsed_seconds':time.monotonic()-monotonic,'corpus_indices':list(range(through+1)),
                'entry':f'fn_{entry:08x}','builds':builds,'rows':rows,'canonical_pins_unchanged':True,
                'gate_status':'unchanged; no acceptance or composition gate executed',
-               'limitations':(['Bounded prefix only; remaining cases are unclassified.'] if through+1<opts.cases else ['All entry corpus cases observed; other selected entry corpora are outside this run.'])+[
+               'limitations':(['Bounded prefix only; remaining cases are unclassified.'] if through+1<opts.cases else ['All random entry corpus cases observed; other selected entry corpora are outside this run.'])+(['Hinted input cases (numbers from cases upward, ADR 0015) are outside this run.'] if difftest.hinted_inputs(opts) else [])+[
                               'Retained generated PEs are diagnostic rebuilds, not historical gate PEs.',
                               'Physical arguments are limited to explicitly evidenced shapes.',
                               'Semantic comparisons are supplemental; ABI differences remain obligations.']}

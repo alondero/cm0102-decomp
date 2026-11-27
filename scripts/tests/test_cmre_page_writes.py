@@ -116,3 +116,36 @@ def test_page_trace_enforces_explain_source_fence(monkeypatch, tmp_path):
     monkeypatch.setattr(recover, "explain_c", no_build)
     with pytest.raises(ValueError, match="live claim"):
         cmre_page_writes.replay(0x401000, 0, 0x3000, c=True, source=tmp_path)
+
+
+def test_page_trace_follows_a_hinted_input_case_replayed_first(monkeypatch):
+    # ADR 0015: case number cases + i is hinted input i; explain runs it directly,
+    # so the chosen original run is the first one, not run number case_index.
+    from cmre import emu, recover
+    from scripts import cmre_page_writes
+
+    class Machine:
+        def __init__(self, recovered):
+            self.recovered = recovered
+            self.uc = Guest()
+
+        def run(self, entry, case, budget):
+            for params in case:
+                self.uc.write(*params)
+            return (entry, budget)
+
+    monkeypatch.setattr(emu, "Machine", Machine)
+    va = 0x401000
+
+    def explain(fn, case_index, overrides, *, source, profile, opt, window):
+        assert (case_index, overrides) == (5, {"cases": 4})
+        a, b = emu.Machine(None), emu.Machine(object())
+        write = [(0x1007, 0x3008, 4, 0x55)]
+        a.run(va, write, 10)
+        b.run(0x6000, write, 10)
+        return {"case": 5, "original": {}, "recovered": {}}
+
+    monkeypatch.setattr(recover, "explain_c", explain)
+    result = cmre_page_writes.replay(va, 5, 0x3000, c=True, cases=4)
+    assert result["page_writes"]["original"]["observed"] == 1
+    assert result["page_writes"]["recovered"]["observed"] == 1

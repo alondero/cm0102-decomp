@@ -193,7 +193,8 @@ def test_screen_executes_full_fixture_corpus_with_effective_c_arena(tmp_path, mo
     result = screen.observe(VA, lifted, opts)
     fixture_runs = [(case, outcome) for case, outcome, _ in runs if case.regs['ecx'] == pointer]
     random_runs = [(case, outcome) for case, outcome, _ in runs if case.regs['ecx'] != pointer]
-    assert len(runs) == opts.cases == result['cases']
+    assert len(runs) == opts.cases + 1 and result['cases'] == opts.cases and result['input_cases'] == 1
+    assert runs[0][0].regs['ecx'] == pointer  # the hinted fixture runs once, first
     assert fixture_runs and random_runs
     assert all(len(case.arena) == size for case, _, _ in runs)
     assert all(case.arena[offset:offset + 4] == bytes.fromhex('78563412')
@@ -202,9 +203,8 @@ def test_screen_executes_full_fixture_corpus_with_effective_c_arena(tmp_path, mo
     assert all(outcome.outcome == 'fault' for _, outcome in random_runs)
     assert result['outcomes'] == {'fault': len(random_runs), 'return': len(fixture_runs)}
     assert result['status'] == 'return-observed' and result['coverage'] == 1.0
-    assert result['first_return_case'] == next(i for i, (_, outcome, _) in enumerate(runs)
-                                              if outcome.outcome == 'return')
-    assert [attributed for _, _, attributed in runs] == [i < opts.discovery for i in range(opts.cases)]
+    assert result['first_return_case'] == opts.cases  # case number of hinted input 0
+    assert [attributed for _, _, attributed in runs] == [False] + [i < opts.discovery for i in range(opts.cases)]
     # A C-only expansion does not change the lifted lane's effective inputs.
     assert 'arena_size' not in difftest.Options.for_function(VA).hints
 
